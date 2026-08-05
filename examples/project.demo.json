@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "execution": {
+    "mode": "free",
+    "skill_id": "",
+    "contract_file": "analysis_contract.json"
+  },
+  "project": {
+    "id": "rnaseq_demo_001",
+    "title": "RNA-seq demo",
+    "owner": "local_user"
+  },
+  "server": {
+    "profile": "sysu_hpc",
+    "host": "your.server.edu",
+    "user": "username",
+    "remote_base_dir": "/data/users/username/rnaseq_projects",
+    "remote_workdir": "/data/users/username/rnaseq_projects/rnaseq_demo_001",
+    "scheduler": "slurm",
+    "threads": 16,
+    "memory_gb": 64,
+    "shell": "bash",
+    "init_commands": []
+  },
+  "reference": {
+    "name": "GENCODE_R47_GRCh38p14_ALL",
+    "species": "human",
+    "release": "GENCODE v47",
+    "assembly": "GRCh38.p14",
+    "regions": "ALL",
+    "gtf_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_47/gencode.v47.chr_patch_hapl_scaff.annotation.gtf.gz",
+    "genome_fasta_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_47/GRCh38.p14.genome.fa.gz",
+    "remote_ref_dir": "/data/ref/gencode/human/release_47_all",
+    "remote_gtf_path": "/data/ref/gencode/human/release_47_all/gencode.v47.chr_patch_hapl_scaff.annotation.gtf",
+    "remote_genome_fasta_path": "/data/ref/gencode/human/release_47_all/GRCh38.p14.genome.fa",
+    "star_index_dir": "/data/ref/gencode/human/release_47_all/star_2.7.11b",
+    "rsem_index_prefix": "/data/ref/gencode/human/release_47_all/rsem/rsem_gencode_v47",
+    "arriba_blacklist_path": "",
+    "arriba_known_fusions_path": ""
+  },
+  "container": {
+    "enabled": true,
+    "engine": "apptainer",
+    "image_path": "/data/containers/rnaseq-agent-star-rsem.sif",
+    "bind_paths": []
+  },
+  "sequencing": {
+    "layout": "paired",
+    "reads_per_sample_million": 40,
+    "strandedness": "auto"
+  },
+  "samples": {
+    "source": "local_upload",
+    "local_data_dir": "D:/data/rnaseq/raw_fastq",
+    "remote_data_dir": "/data/users/username/rnaseq_projects/rnaseq_demo_001/raw",
+    "items": [
+      {
+        "sample_id": "Ctrl_1",
+        "condition": "control",
+        "fastq_1": "Ctrl_1_R1.fastq.gz",
+        "fastq_2": "Ctrl_1_R2.fastq.gz"
+      },
+      {
+        "sample_id": "Treat_1",
+        "condition": "treatment",
+        "fastq_1": "Treat_1_R1.fastq.gz",
+        "fastq_2": "Treat_1_R2.fastq.gz"
+      }
+    ]
+  },
+  "pipeline": {
+    "fastp": {
+      "enabled": true,
+      "version": "0.24.1"
+    },
+    "star": {
+      "enabled": true,
+      "version": "2.7.11b"
+    },
+    "arriba": {
+      "enabled": true,
+      "version": "2.5.0"
+    },
+    "featurecounts": {
+      "enabled": true,
+      "version": "Subread 2.1.1"
+    },
+    "rsem": {
+      "enabled": true,
+      "version": "1.2.28"
+    }
+  },
+  "notification": {
+    "email_enabled": true,
+    "recipient": "user@example.com",
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 587,
+    "smtp_user": "user@example.com",
+    "password_env": "RNASEQ_AGENT_SMTP_PASSWORD",
+    "notify_on": [
+      "completed",
+      "failed"
+    ]
+  },
+  "polling": {
+    "interval_seconds": 300,
+    "timeout_hours": 168
+  }
+}

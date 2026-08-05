@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch",
+      "WebFetch(domain:docs.dify.ai)",
+      "WebFetch(domain:docs.flowiseai.com)",
+      "WebFetch(domain:docs.n8n.io)",
+      "WebFetch(domain:github.com)",
+      "Bash(python -m rnaseq_agent report examples/project.demo.json --output runs/report_demo.md)",
+      "Bash(python -m rnaseq_agent report --help)",
+      "Bash(PYTHONPATH=src python -m rnaseq_agent report --help)",
+      "Bash(PYTHONPATH=src python -m rnaseq_agent report examples/project.demo.json --output runs/report_demo.md)",
+      "Bash(command -v prefetch)",
+      "Bash(command -v parallel-fastq-dump)",
+      "Bash(command -v fastq-dump)",
+      "Bash(command -v fasterq-dump)",
+      "Bash(command -v conda)",
+      "Bash(conda --version)",
+      "Bash(command -v mamba)",
+      "Bash(mamba --version)",
+      "Read(//c/Users/12249/**)",
+      "Read(//c/ProgramData/**)",
+      "Bash(ls \"/c/Users/12249\" | grep -i \"conda\\\\|mini\"; ls \"/c/Users/12249/AppData/Local\" | grep -i \"conda\\\\|mini\"; ls \"/c/Users/12249/AppData/Roaming\" | grep -i \"conda\\\\|mini\")",
+      "Read(//c/Users/12249/AppData/Local/**)",
+      "Read(//c/Users/12249/AppData/Roaming/**)",
+      "Bash(PYTHONPATH=src python -m rnaseq_agent validate-local examples/project.demo.json)",
+      "Bash(PYTHONPATH=src python -)",
+      "Bash(PYTHONPATH=src python -m rnaseq_agent status examples/project.demo.json)",
+      "Bash(PYTHONPATH=src python -m rnaseq_agent status --cached examples/project.demo.json)"
+    ]
+  }
+}

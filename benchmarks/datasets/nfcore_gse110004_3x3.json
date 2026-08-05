@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "dataset_id": "nfcore_gse110004_yeast_3x3_v1",
+  "title": "GSE110004 wild type vs Rap1-AID 30-minute induction, nf-core miniature reads",
+  "organism": "Saccharomyces cerevisiae",
+  "layout": "paired",
+  "strandedness": "reverse",
+  "design": {
+    "control": ["SRR6357070", "SRR6357071", "SRR6357072"],
+    "treatment": ["SRR6357076", "SRR6357077", "SRR6357078"]
+  },
+  "provenance": {
+    "geo": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE110004",
+    "paper_doi": "10.1016/j.molcel.2018.10.018",
+    "test_dataset_repository": "https://github.com/nf-core/test-datasets",
+    "git_commit": "626c8fab639062eade4b10747e919341cbf9b41a",
+    "note": "FASTQ files are small nf-core pipeline-test derivatives of public SRA runs, not full-depth archives."
+  },
+  "files": [
+    {"path": "fastq/SRR6357070_1.fastq.gz", "size_bytes": 2239317, "sha256": "3f50541fa9cf2bedc87e7b682ada0fccfdfcd6d27b9bb81f17be230ff140ebe7", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357070_1.fastq.gz"},
+    {"path": "fastq/SRR6357070_2.fastq.gz", "size_bytes": 2232117, "sha256": "8590e1e01e568fba256aa7dced40519604cbb111ee44ab106a3dcb869660aaf4", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357070_2.fastq.gz"},
+    {"path": "fastq/SRR6357071_1.fastq.gz", "size_bytes": 2189243, "sha256": "06951c97884df8975d5419a2f0d03d435b9da722564000536524b01926970c93", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357071_1.fastq.gz"},
+    {"path": "fastq/SRR6357071_2.fastq.gz", "size_bytes": 2183711, "sha256": "00bbbf100ee90c5f681c3b4814637283732cd06e620171bd48718aa02de3a91d", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357071_2.fastq.gz"},
+    {"path": "fastq/SRR6357072_1.fastq.gz", "size_bytes": 2148269, "sha256": "6c92efe43dc8145951c4131cd30e3e169f9877f041fcf20c2577eeeb7ec2b6ed", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357072_1.fastq.gz"},
+    {"path": "fastq/SRR6357072_2.fastq.gz", "size_bytes": 2167239, "sha256": "4501eb0062d4005cc1a4c836a86c036c15d3c38d685138d02675c5ecef84c0a3", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357072_2.fastq.gz"},
+    {"path": "fastq/SRR6357076_1.fastq.gz", "size_bytes": 2268588, "sha256": "1ba6b60cd24c8abf1db57dec5a13b23eeb35beece6193af8ce6f9bac4fd4546f", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357076_1.fastq.gz"},
+    {"path": "fastq/SRR6357076_2.fastq.gz", "size_bytes": 2250281, "sha256": "4a04e6de648091eb42d703f67489d87e929544af478ce5e28b0c790f79a82a5d", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357076_2.fastq.gz"},
+    {"path": "fastq/SRR6357077_1.fastq.gz", "size_bytes": 2193777, "sha256": "0c347027e547a4dc823e367f5474c8c9d71e19d2a6f258056c1b60bbb18c8074", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357077_1.fastq.gz"},
+    {"path": "fastq/SRR6357077_2.fastq.gz", "size_bytes": 2194219, "sha256": "30732b850d29ea3ffcfc8bd25d1dc312ba68452e17778e66bc57515baebbda00", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357077_2.fastq.gz"},
+    {"path": "fastq/SRR6357078_1.fastq.gz", "size_bytes": 2208999, "sha256": "dbcdc552d470f9aa49fab697615cb6be9b223ad0c21ef5f65bd9e0d1b4f7f29f", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357078_1.fastq.gz"},
+    {"path": "fastq/SRR6357078_2.fastq.gz", "size_bytes": 2221027, "sha256": "2afebab71ed1642f468230c677d7cc2b62c34646144c8b20f7b4a0da86b94432", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/testdata/GSE110004/SRR6357078_2.fastq.gz"},
+    {"path": "reference/genome.fasta", "size_bytes": 234058, "sha256": "df70973809f672aa58a414fef3f01e0e465bf26f10159174a616b0dee2d458e1", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/reference/genome.fasta"},
+    {"path": "reference/genes.gtf.gz", "size_bytes": 10466, "sha256": "913092a6524a7de2a95c3a1695d0dfc8143f047f4c9c9bc7b206719a7388242a", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/reference/genes_with_empty_tid.gtf.gz"},
+    {"path": "reference/star.tar.gz", "size_bytes": 38288711, "sha256": "fea10cbd6d6a27abeea1ccc382d55a9a1dc33e02ac29013b726a71dedce7af7c", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/reference/star.tar.gz"},
+    {"path": "reference/rsem.tar.gz", "size_bytes": 38480406, "sha256": "3a8c8fa33a196f0b15d9fa0f3f2163f7478bba24144907216b51ced653fed70c", "url": "https://raw.githubusercontent.com/nf-core/test-datasets/626c8fab639062eade4b10747e919341cbf9b41a/reference/rsem.tar.gz"}
+  ]
+}

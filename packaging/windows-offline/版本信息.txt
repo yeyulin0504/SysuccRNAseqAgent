@@ -1,0 +1,18 @@
+SYSU RNA-seq Agent 离线测试包
+版本：0.2.0
+打包日期：2026-08-03
+目标系统：Windows 10/11 64 位
+目标 Python：CPython 3.13 64 位
+
+本包包含：
+- SYSU RNA-seq Agent 0.2.0
+- Paramiko 4.0.0
+- SSH/SFTP 所需的 Windows 离线依赖
+- 一键安装和启动脚本
+- 独立的“仅上传 FASTQ”功能（不提交 Slurm 任务）
+
+本包不包含：
+- FASTQ 或其他实验数据
+- runs 运行结果
+- SSH 密码、API Key 或其他凭证
+- 本机 Codex/ChatGPT 登录状态
