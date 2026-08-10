@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from .configuration import normalize_config
-from .pipeline import render_env_setup_script, render_remote_pipeline_script, render_submit_script
+from .downstream_artifacts import downstream_gmt_source, downstream_script_artifacts
+from .downstream_inputs import StandaloneInputError, standalone_input_paths
+from .pipeline import (
+    render_env_setup_script,
+    render_remote_downstream_script,
+    render_remote_pipeline_script,
+    render_submit_script,
+)
 from .storage import load_json, save_json
 from .validation import validate_local_fastqs
 from .workflow_profiles import workflow_profile_errors
@@ -292,10 +299,37 @@ def _workflow_snapshot(config: dict[str, Any]) -> dict[str, Any]:
             "items": sample_items,
         },
         "pipeline": deepcopy(config.get("pipeline", {})),
+        "downstream": deepcopy(config.get("downstream", {})),
     }
 
 
 def _input_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
+    downstream = config.get("downstream", {})
+    if (
+        downstream.get("enabled", False)
+        and downstream.get("source_mode") == "standalone_count_matrix"
+    ):
+        artifacts = _standalone_downstream_artifacts(config)
+    else:
+        artifacts = _fastq_input_artifacts(config)
+    if gmt_source := downstream_gmt_source(config):
+        source_path, source_filename = gmt_source
+        path = Path(source_path).expanduser().resolve()
+        if not path.is_file() or path.name != source_filename or path.suffix != ".gmt":
+            raise ContractError("Downstream GMT input is missing or invalid while building contract.")
+        artifacts.append(
+            {
+                "sample_id": "",
+                "role": "downstream_gmt",
+                "logical_name": f"scripts/{source_filename}",
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return artifacts
+
+
+def _fastq_input_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
     samples = config.get("samples", {})
     root = Path(str(samples.get("local_data_dir", ""))).resolve()
     paired = config.get("sequencing", {}).get("layout", "paired") == "paired"
@@ -323,13 +357,49 @@ def _input_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
     return artifacts
 
 
+def _standalone_downstream_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        count_path, metadata_path = standalone_input_paths(config)
+    except (OSError, StandaloneInputError) as exc:
+        raise ContractError(f"Standalone downstream inputs are invalid: {exc}") from exc
+    return [
+        {
+            "sample_id": "",
+            "role": "downstream_counts",
+            "logical_name": "inputs/counts.tsv",
+            "source_schema": "standalone_count_matrix_tsv_v1",
+            "size_bytes": count_path.stat().st_size,
+            "sha256": sha256_file(count_path),
+        },
+        {
+            "sample_id": "",
+            "role": "downstream_metadata",
+            "logical_name": "inputs/metadata.tsv",
+            "source_schema": "standalone_metadata_tsv_v1",
+            "size_bytes": metadata_path.stat().st_size,
+            "sha256": sha256_file(metadata_path),
+        },
+    ]
+
+
 def _script_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
     scheduler = config.get("server", {}).get("scheduler", "local")
     submit_name = "submit.sbatch" if scheduler == "slurm" else "submit.pbs" if scheduler == "pbs" else "submit.sh"
+    standalone = (
+        config.get("downstream", {}).get("enabled", False)
+        and config["downstream"].get("source_mode") == "standalone_count_matrix"
+    )
+    run_name = "run_downstream.sh" if standalone else "run_pipeline.sh"
+    run_content = (
+        render_remote_downstream_script(config)
+        if standalone
+        else render_remote_pipeline_script(config)
+    )
     rendered = {
         "env_setup.sh": render_env_setup_script(config),
-        "run_pipeline.sh": render_remote_pipeline_script(config),
+        run_name: run_content,
         submit_name: render_submit_script(config),
+        **downstream_script_artifacts(config),
     }
     return [
         {

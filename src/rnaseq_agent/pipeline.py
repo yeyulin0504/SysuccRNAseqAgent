@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .container import wrap_command
+from .downstream_artifacts import render_downstream_command
 from .shell import shell_quote
 from .safety import identifier_error, relative_filename_error
 
@@ -181,6 +182,13 @@ mkdir -p featurecounts
 {chr(10).join(featurecounts_lines)}
 """.strip()
 
+    downstream_block = ""
+    if config.get("downstream", {}).get("enabled", False):
+        downstream_block = f"""
+mkdir -p downstream
+{render_downstream_command(config)}
+""".strip()
+
     sample_section = "\n\n".join(sample_blocks)
     env_setup_line = "source scripts/env_setup.sh" if server.get("init_commands") else ""
     prefix = f"{env_setup_line}\n\n" if env_setup_line else ""
@@ -210,11 +218,45 @@ date -Is > status/started_at.txt
 
 {featurecounts_block}
 
+{downstream_block}
+
 echo "completed" > status/state.txt
 date -Is > status/ended_at.txt
 touch status/completed.flag
 """
     return script
+
+
+def render_remote_downstream_script(config: dict[str, Any]) -> str:
+    server = config["server"]
+    env_setup_line = "source scripts/env_setup.sh" if server.get("init_commands") else ""
+    prefix = f"{env_setup_line}\n\n" if env_setup_line else ""
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+WORKDIR="${{RNASEQ_RUN_WORKDIR:-$PWD}}"
+mkdir -p "$WORKDIR"/{{logs,scripts,status,inputs,downstream}}
+chmod 700 "$WORKDIR" "$WORKDIR"/{{logs,scripts,status,inputs,downstream}}
+cd "$WORKDIR"
+
+rm -f status/completed.flag status/failed.flag
+cleanup_failure() {{
+  echo "failed" > status/state.txt
+  date -Is > status/ended_at.txt
+  touch status/failed.flag
+}}
+trap cleanup_failure ERR
+
+echo "running" > status/state.txt
+date -Is > status/started_at.txt
+
+{prefix}{render_downstream_command(config)}
+
+echo "completed" > status/state.txt
+date -Is > status/ended_at.txt
+touch status/completed.flag
+"""
 
 
 def render_submit_script(config: dict[str, Any]) -> str:
@@ -226,6 +268,11 @@ def render_submit_script(config: dict[str, Any]) -> str:
     if project_id_error:
         raise ValueError(project_id_error)
 
+    run_script = (
+        "run_downstream.sh"
+        if config.get("downstream", {}).get("source_mode") == "standalone_count_matrix"
+        else "run_pipeline.sh"
+    )
     if scheduler == "slurm":
         return f"""#!/usr/bin/env bash
 #SBATCH -J {project_id}
@@ -234,7 +281,7 @@ def render_submit_script(config: dict[str, Any]) -> str:
 #SBATCH -o logs/slurm-%j.out
 #SBATCH -e logs/slurm-%j.err
 
-bash scripts/run_pipeline.sh
+bash scripts/{run_script}
 """
     if scheduler == "pbs":
         return f"""#!/usr/bin/env bash
@@ -244,11 +291,11 @@ bash scripts/run_pipeline.sh
 #PBS -e logs/pbs.err
 
 cd "$PBS_O_WORKDIR"
-bash scripts/run_pipeline.sh
+bash scripts/{run_script}
 """
     if scheduler == "local":
-        return """#!/usr/bin/env bash
-bash scripts/run_pipeline.sh
+        return f"""#!/usr/bin/env bash
+bash scripts/{run_script}
 """
     raise ValueError(f"Unsupported scheduler: {scheduler}")
 

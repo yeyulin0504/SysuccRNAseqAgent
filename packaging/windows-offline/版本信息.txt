@@ -1,18 +1,33 @@
-SYSU RNA-seq Agent 离线测试包
-版本：0.2.0
-打包日期：2026-08-03
-目标系统：Windows 10/11 64 位
-目标 Python：CPython 3.13 64 位
+SYSU RNA-seq Agent offline test package
+Version: 0.3.3 standalone count-matrix downstream execution (2026-08-06)
+Package date: 2026-08-06
+Target system: Windows 10/11 64-bit
+Required Python: CPython 3.13 64-bit
 
-本包包含：
-- SYSU RNA-seq Agent 0.2.0
+This package contains:
+- SYSU RNA-seq Agent 0.3.2
 - Paramiko 4.0.0
-- SSH/SFTP 所需的 Windows 离线依赖
-- 一键安装和启动脚本
-- 独立的“仅上传 FASTQ”功能（不提交 Slurm 任务）
+- Bundled Windows SSH/SFTP offline dependencies
+- One-click installer and GUI launcher
+- Standalone count-matrix downstream mode: strictly validated local TSV count matrix and metadata, immutable input/script contracts, isolated attempts, protected input staging, and scheduler-only fixed Apptainer/R execution
+- GUI chat startup repair: restores the missing chat-send callback so the interface opens
+- Footer accessibility repair: status text wraps above a stable two-row action area, keeping save/upload/run controls available after warnings
+- Guided onboarding accepts common Chinese/English sequencing-layout answers and supports local skip-without-writing
+- Separate FASTQ upload-only action (does not submit a Slurm job)
+- Parameter-free model contract submission request, local verification,
+  explicit confirmation, and one submission guard per contract
+- Open existing project.json and restore saved non-secret form settings
+- Visible downstream analysis form for featureCounts raw counts: sample metadata,
+  condition/batch design, DESeq2 QC and differential expression, GO/KEGG ORA,
+  GSEA, optional local text-only GMT, and immutable Apptainer runtime review
+- Downstream R runs only after featureCounts in the same confirmed Slurm/PBS job;
+  it never runs directly on a login node or as a nested job
+- SSH passwords remain session-only and must be entered again after reopening
+- Associate later upload/run/status actions with the exact opened project file
+- ASCII-only CRLF batch scripts for Windows CMD compatibility
 
-本包不包含：
-- FASTQ 或其他实验数据
-- runs 运行结果
-- SSH 密码、API Key 或其他凭证
-- 本机 Codex/ChatGPT 登录状态
+This package does not contain:
+- FASTQ or other experimental data
+- runs outputs
+- SSH passwords, API keys, or other credentials
+- Local Codex/ChatGPT login state

@@ -24,6 +24,7 @@ def generate_report(config_path: Path, output_path: Path | None = None) -> Path:
     events, bad_event_lines = _load_jsonl(events_path)
     commands, bad_command_lines = _load_jsonl(commands_path)
     files = _collect_files(extracted_dir)
+    downstream_summary = _load_downstream_summary(extracted_dir / "downstream" / "summary.json")
 
     report = _render_report(
         config=config,
@@ -33,6 +34,7 @@ def generate_report(config_path: Path, output_path: Path | None = None) -> Path:
         events=events,
         commands=commands,
         files=files,
+        downstream_summary=downstream_summary,
         bad_event_lines=bad_event_lines,
         bad_command_lines=bad_command_lines,
         has_extracted=extracted_dir.exists(),
@@ -75,6 +77,16 @@ def _collect_files(root: Path) -> list[str]:
     )
 
 
+def _load_downstream_summary(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = load_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _render_report(
     *,
     config: dict[str, Any],
@@ -84,6 +96,7 @@ def _render_report(
     events: list[dict[str, Any]],
     commands: list[dict[str, Any]],
     files: list[str],
+    downstream_summary: dict[str, Any] | None,
     bad_event_lines: int,
     bad_command_lines: int,
     has_extracted: bool,
@@ -184,6 +197,26 @@ def _render_report(
         )
     lines.append("")
 
+    lines.append("## Downstream analysis")
+    lines.append("")
+    downstream = config.get("downstream", {})
+    if not downstream.get("enabled", False):
+        lines.append("- Not enabled for this run.")
+    else:
+        lines.append(f"- Profile: {downstream.get('profile_id', 'unknown')}")
+        lines.append(f"- Design: {downstream.get('design', {}).get('formula', 'unknown')}")
+        lines.append(f"- Contrasts: {', '.join(str(item.get('id', '')) for item in downstream.get('contrasts', [])) or 'none'}")
+        lines.append(f"- Filter: count ≥ {downstream.get('filtering', {}).get('min_count', 'unknown')} in at least {downstream.get('filtering', {}).get('min_samples', 'unknown')} samples.")
+        lines.append(f"- DE threshold: adjusted P ≤ {downstream.get('differential_expression', {}).get('padj_threshold', 'unknown')}; |log2FC| ≥ {downstream.get('differential_expression', {}).get('abs_log2_fold_change', 'unknown')}.")
+        lines.append(f"- Immutable runtime image SHA-256: {downstream.get('runtime', {}).get('image_sha256', 'unknown')}")
+        if downstream_summary:
+            lines.append(f"- Completed design: {downstream_summary.get('design', 'unknown')}")
+            for contrast_id, result in downstream_summary.get("contrasts", {}).items():
+                lines.append(f"- {contrast_id}: {result.get('significant_gene_count', 'unknown')} genes met the configured DE threshold; results at {result.get('result_table', 'unknown')}.")
+        else:
+            lines.append("- No downloaded downstream summary was available.")
+    lines.append("")
+
     lines.append("## Run timeline")
     lines.append("")
     if events:
@@ -235,6 +268,7 @@ def _render_report(
     lines.append("- fastp: quality control and trimming reports.")
     lines.append("- star: alignment logs and mapping-related outputs.")
     lines.append("- featurecounts: gene-level count matrix for downstream differential expression.")
+    lines.append("- downstream: VST quality control, differential-expression tables, and configured enrichment outputs.")
     lines.append("- rsem: gene and transcript expression quantification results.")
     lines.append("- arriba: candidate fusion calls when this step is enabled.")
     lines.append("- status/logs: execution state and audit trail for this run.")
@@ -244,6 +278,8 @@ def _render_report(
     lines.append("")
     lines.append("- This report summarizes run configuration, logs, and output artifacts.")
     lines.append("- It does not provide biological conclusions or replace manual expert review.")
+    if downstream.get("enabled", False):
+        lines.append("- Downstream statistics and enrichment require biological and statistical interpretation; they are not automated biological conclusions.")
     if not events:
         lines.append("- Event timeline is incomplete because no event log was found.")
     if not commands:

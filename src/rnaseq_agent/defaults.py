@@ -22,8 +22,43 @@ DEFAULT_PIPELINE = {
     "star": {"enabled": True, "version": "2.7.11b"},
     "arriba": {"enabled": True, "version": "2.5.0"},
     "featurecounts": {"enabled": True, "version": "Subread 2.1.1"},
-    "rsem": {"enabled": True, "version": "1.2.28"},
+    "rsem": {"enabled": False, "version": "1.2.28"},
 }
+
+DEFAULT_DOWNSTREAM = {
+    "enabled": False,
+    "profile_id": "bulk_rnaseq_deseq2_v1",
+    "source_mode": "pipeline_featurecounts",
+    "input_root": "",
+    "input": {
+        "kind": "featurecounts_raw_counts",
+        "path": "featurecounts/gene_counts.txt",
+        "source_filename": "",
+        "source_path": "",
+    },
+    "metadata_input": {"source_filename": "", "source_path": ""},
+    "metadata": {"samples": []},
+    "design": {"condition_column": "condition", "batch_column": "", "formula": "~ condition"},
+    "contrasts": [],
+    "filtering": {"min_count": 10, "min_samples": 2},
+    "differential_expression": {"padj_threshold": 0.05, "abs_log2_fold_change": 1.0},
+    "enrichment": {
+        "enabled": True,
+        "go_ora": True,
+        "kegg_ora": True,
+        "gsea": True,
+        "id_type": "ENSEMBL",
+        "organism": "",
+        "gmt": {"enabled": False, "source_filename": "", "source_path": "", "sha256": ""},
+    },
+    "runtime": {
+        "environment_kind": "apptainer",
+        "image_path": "",
+        "image_sha256": "",
+        "rscript_path": "Rscript",
+    },
+}
+
 
 DEFAULT_CONTAINER = {
     "enabled": True,

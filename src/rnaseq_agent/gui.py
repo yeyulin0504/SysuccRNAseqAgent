@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, Text, Tk, filedialog, messagebox, simpledialog
@@ -12,16 +14,28 @@ from .configuration import normalize_config
 from .actions import (
     explain_project,
     generate_project_report,
+    load_project_config,
     status_summary,
     summarize_project,
     validation_summary,
 )
 from .defaults import DEFAULT_PIPELINE, DEFAULT_REFERENCE
+from .downstream import downstream_errors
 from .estimate import estimate_runtime
+from .reference_catalog import (
+    ReferenceCandidate,
+    candidates_for_species,
+    catalog_reference_fields,
+    has_unsupported_assembly,
+    infer_reference_candidates,
+    normalize_explicit_species,
+)
+from .text_attachment import AttachmentError, TextAttachment, load_text_attachment
 from .llm import (
     CodexCLIClient,
     LLMDecision,
     LLMError,
+    OnboardingDecision,
     OpenAICompatibleClient,
     codex_home_path,
     codex_login_status,
@@ -29,6 +43,13 @@ from .llm import (
     launch_codex_device_login,
     load_llm_client_from_env,
 )
+from .llm_policy import (
+    ConfigPatch,
+    OnboardingPatch,
+    apply_onboarding_proposals,
+    apply_proposals,
+)
+from .llm_submission import inspect_llm_submission, submit_llm_contract
 from .remote import project_remote_workdir
 from .remote_transport import probe_server_environment, test_server_connection
 from .run_agent import refresh_status, run_project, upload_project_fastqs
@@ -38,10 +59,20 @@ from .ssh_auth import (
     set_ssh_credential,
 )
 from .storage import load_defaults, save_defaults, save_json
-from .validation import validate_local_fastqs
+from .validation import ValidationResult, validate_local_fastqs
 
 
 class ConfigApp(Tk):
+    ONBOARDING_FIELDS = (
+        ("project.id", "请先给这个分析项目取一个简短的英文项目 ID，例如 rnaseq_lung_001。"),
+        ("project.title", "这个项目的显示名称是什么？可以用中文。"),
+        ("server.host", "请填写集群服务器地址（host，不含 ssh://）。"),
+        ("server.user", "请填写你的集群用户名。"),
+        ("server.remote_base_dir", "请填写服务器上存放项目的根目录。"),
+        ("sequencing.layout", "你的测序数据是双端 paired 还是单端 single？"),
+        ("samples.local_data_dir", "请填写本机存放 FASTQ 文件的文件夹路径。不会读取或上传文件。"),
+    )
+
     def __init__(self, output_dir: Path) -> None:
         super().__init__()
         self.output_dir = output_dir
@@ -49,20 +80,34 @@ class ConfigApp(Tk):
         self.geometry("1040x740")
         self.minsize(920, 640)
         self.running = False
+        self.validation_in_progress = False
         self.current_config_path: Path | None = None
+        self.loaded_config: dict[str, Any] | None = None
+        self.pending_proposals: tuple[ConfigPatch, ...] = ()
+        self.pending_onboarding_proposals: tuple[OnboardingPatch, ...] = ()
+        self.onboarding_active = False
+        self.onboarding_field_index = 0
+        self.onboarding_turn = 0
+        self.notebook: ttk.Notebook | None = None
+        self.text_attachment: TextAttachment | None = None
+        self.pending_reference_candidates: tuple[ReferenceCandidate, ...] = ()
+        self.awaiting_species_answer = False
+        self.reference_index_state = "unconfigured"
+        self.reference_candidate_text: Text | None = None
+        self.attachment_status = StringVar(value="尚未添加本地文本元数据。")
 
         saved = load_defaults() or {}
-        self.reference_defaults = saved.get("reference", DEFAULT_REFERENCE.copy())
+        self.reference_defaults = saved.get("reference", {})
         saved_llm = saved.get("llm", {})
 
-        self.project_id = StringVar(value=f"rnaseq_{datetime.now():%Y%m%d_%H%M%S}")
-        self.project_title = StringVar(value=self.project_id.get())
-        self.owner = StringVar(value="local_user")
+        self.project_id = StringVar()
+        self.project_title = StringVar()
+        self.owner = StringVar()
 
-        self.server_profile = StringVar(value="sysu_hpc")
-        self.server_host = StringVar(value="your.server.edu")
-        self.server_user = StringVar(value="username")
-        self.remote_base_dir = StringVar(value="/data/users/username/rnaseq_projects")
+        self.server_profile = StringVar()
+        self.server_host = StringVar()
+        self.server_user = StringVar()
+        self.remote_base_dir = StringVar()
         self.scheduler = StringVar(value="slurm")
         self.threads = StringVar(value="16")
         self.memory_gb = StringVar(value="64")
@@ -73,22 +118,50 @@ class ConfigApp(Tk):
         self.layout = StringVar(value="paired")
         self.reads_per_sample_million = StringVar(value="40")
         self.strandedness = StringVar(value="auto")
-        self.local_data_dir = StringVar(value="D:/data/rnaseq/raw_fastq")
+        self.local_data_dir = StringVar()
         self.remote_data_dir = StringVar(value="AUTO")
 
-        self.ref_vars = {key: StringVar(value=str(value)) for key, value in self.reference_defaults.items()}
+        reference_keys = (
+            *DEFAULT_REFERENCE,
+            "provider",
+            "catalog_id",
+            "catalog_manifest_sha256",
+            "index_state",
+        )
+        self.ref_vars = {
+            key: StringVar(value=str(self.reference_defaults.get(key, "")))
+            for key in reference_keys
+        }
         self.pipeline_vars = {
             step: BooleanVar(value=bool(config["enabled"])) for step, config in DEFAULT_PIPELINE.items()
         }
+        self.downstream_enabled = BooleanVar(value=False)
+        self.downstream_use_batch = BooleanVar(value=False)
+        self.downstream_min_count = StringVar(value="10")
+        self.downstream_min_samples = StringVar(value="2")
+        self.downstream_padj = StringVar(value="0.05")
+        self.downstream_abs_log2fc = StringVar(value="1.0")
+        self.downstream_go_ora = BooleanVar(value=True)
+        self.downstream_kegg_ora = BooleanVar(value=True)
+        self.downstream_gsea = BooleanVar(value=True)
+        self.downstream_organism = StringVar()
+        self.downstream_gmt_enabled = BooleanVar(value=False)
+        self.downstream_gmt_path = StringVar()
+        self.downstream_gmt_sha256 = StringVar()
+        self.downstream_runtime_image = StringVar()
+        self.downstream_runtime_sha256 = StringVar()
+        self.downstream_metadata_text: Text
+        self.downstream_contrasts_text: Text
+        self.downstream_summary: Text
 
         self.poll_interval = StringVar(value="300")
         self.poll_timeout = StringVar(value="168")
 
-        self.email_enabled = BooleanVar(value=True)
-        self.recipient = StringVar(value="user@example.com")
-        self.smtp_host = StringVar(value="smtp.example.com")
+        self.email_enabled = BooleanVar(value=False)
+        self.recipient = StringVar()
+        self.smtp_host = StringVar()
         self.smtp_port = StringVar(value="587")
-        self.smtp_user = StringVar(value="user@example.com")
+        self.smtp_user = StringVar()
         self.smtp_password_env = StringVar(value="RNASEQ_AGENT_SMTP_PASSWORD")
 
         self.llm_backend = StringVar(
@@ -135,49 +208,124 @@ class ConfigApp(Tk):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
+        self._configure_theme()
+        root = ttk.Frame(self, style="App.TFrame", padding=12)
         root.pack(fill="both", expand=True)
 
+        header = ttk.Frame(root, style="Header.TFrame", padding=(16, 10))
+        header.pack(fill="x", pady=(0, 10))
         ttk.Label(
-            root,
-            text="填写 RNA-seq 分析配置。保存后会生成 project.json，也可以直接点击“保存并运行”。",
-        ).pack(anchor="w", pady=(0, 8))
+            header,
+            text="SYSU RNA-seq Agent",
+            style="Header.TLabel",
+        ).pack(side="left")
+        ttk.Label(
+            header,
+            text="本地表单与确认优先；远程操作必须逐次确认",
+            style="Muted.TLabel",
+        ).pack(side="right")
 
-        notebook = ttk.Notebook(root)
-        notebook.pack(fill="both", expand=True)
-        notebook.add(self._project_tab(notebook), text="项目")
-        notebook.add(self._server_tab(notebook), text="服务器")
-        notebook.add(self._reference_tab(notebook), text="参考")
-        notebook.add(self._samples_tab(notebook), text="样本")
-        notebook.add(self._pipeline_tab(notebook), text="流程")
-        notebook.add(self._notification_tab(notebook), text="通知")
-        notebook.add(self._model_tab(notebook), text="模型")
-        notebook.add(self._chat_tab(notebook), text="对话助手")
+        workspace = ttk.Frame(root, style="App.TFrame")
+        workspace.pack(fill="both", expand=True)
+        sidebar = ttk.Frame(workspace, style="Sidebar.TFrame", padding=10)
+        sidebar.pack(side="left", fill="y", padx=(0, 10))
+        content = ttk.Frame(workspace, style="App.TFrame")
+        content.pack(side="left", fill="both", expand=True)
+        self.pages: dict[str, ttk.Frame] = {}
+        page_specs = (
+            ("model", "模型设置", self._model_tab),
+            ("agent", "SYSU_Agent", self._chat_tab),
+            ("project", "项目", self._project_tab),
+            ("server", "服务器", self._server_tab),
+            ("reference", "参考", self._reference_tab),
+            ("samples", "样本", self._samples_tab),
+            ("pipeline", "流程", self._pipeline_tab),
+            ("downstream", "下游分析", self._downstream_tab),
+            ("notification", "通知", self._notification_tab),
+        )
+        for page_name, label, builder in page_specs:
+            ttk.Button(
+                sidebar,
+                text=label,
+                style="Nav.TButton",
+                command=lambda name=page_name: self._show_page(name),
+            ).pack(fill="x", pady=2)
+            self.pages[page_name] = builder(content)
+        self._show_page("model")
 
-        footer = ttk.Frame(root)
+        footer = ttk.Frame(root, style="Header.TFrame", padding=(10, 8))
         footer.pack(fill="x", pady=(10, 0))
-        ttk.Label(footer, textvariable=self.status_text).pack(side="left", fill="x", expand=True)
-        ttk.Button(footer, text="刷新状态", command=self.refresh_project_status).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="仅提交", command=lambda: self.start_run(wait=False)).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="保存并运行", command=lambda: self.start_run(wait=True)).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="仅上传 FASTQ", command=self.start_upload).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="估算耗时", command=self.show_estimate).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="校验配置", command=self.validate_form).pack(side="right", padx=(6, 0))
-        ttk.Button(footer, text="保存配置", command=self.save_config).pack(side="right", padx=(6, 0))
+        status_row = ttk.Frame(footer, style="Header.TFrame")
+        status_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(
+            status_row,
+            textvariable=self.status_text,
+            style="Muted.TLabel",
+            wraplength=880,
+            justify="left",
+        ).pack(fill="x")
 
-    def _project_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+        action_row = ttk.Frame(footer, style="Header.TFrame")
+        action_row.pack(fill="x")
+        actions = (
+            ("保存配置", "TButton", self.save_config),
+            ("校验配置", "TButton", self.validate_form),
+            ("估算耗时", "TButton", self.show_estimate),
+            ("仅上传 FASTQ", "Remote.TButton", self.start_upload),
+            ("保存并运行", "Remote.TButton", lambda: self.start_run(wait=True)),
+            ("仅提交", "Remote.TButton", lambda: self.start_run(wait=False)),
+            ("打开项目", "TButton", self.open_project_config),
+            ("刷新状态", "TButton", self.refresh_project_status),
+        )
+        for index, (label, style, command) in enumerate(actions):
+            row, column = divmod(index, 4)
+            ttk.Button(action_row, text=label, style=style, command=command).grid(
+                row=row,
+                column=column,
+                padx=(0, 6) if column < 3 else 0,
+                pady=(0, 4) if row == 0 else 0,
+                sticky="ew",
+            )
+        for column in range(4):
+            action_row.columnconfigure(column, weight=1)
+
+    def _configure_theme(self) -> None:
+        self.configure(background="#111827")
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("App.TFrame", background="#111827")
+        style.configure("Header.TFrame", background="#1f2937")
+        style.configure("Sidebar.TFrame", background="#172033")
+        style.configure("TLabel", background="#111827", foreground="#e5e7eb")
+        style.configure("Header.TLabel", background="#1f2937", foreground="#f9fafb", font=("TkDefaultFont", 14, "bold"))
+        style.configure("Muted.TLabel", background="#1f2937", foreground="#aab5c5")
+        style.configure("TButton", background="#334155", foreground="#f8fafc", padding=(10, 6))
+        style.map("TButton", background=[("active", "#475569")])
+        style.configure("Nav.TButton", background="#172033", anchor="w", padding=(12, 8))
+        style.map("Nav.TButton", background=[("active", "#334155")])
+        style.configure("Remote.TButton", background="#9f1239", foreground="#fff1f2")
+        style.map("Remote.TButton", background=[("active", "#be123c")])
+        style.configure("TEntry", fieldbackground="#0f172a", foreground="#f8fafc")
+        style.configure("TCombobox", fieldbackground="#0f172a", foreground="#f8fafc")
+
+    def _show_page(self, page_name: str) -> None:
+        for page in self.pages.values():
+            page.pack_forget()
+        self.pages[page_name].pack(fill="both", expand=True)
+
+    def _project_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
-        self._entry(frame, "项目 ID", self.project_id, 0, "例如 rnaseq_lung_cancer_001")
-        self._entry(frame, "项目名称", self.project_title, 1)
-        self._entry(frame, "负责人/用户", self.owner, 2)
+        self._entry(frame, "项目 ID", self.project_id, 0, "必填，如 rnaseq_lung_cancer_001")
+        self._entry(frame, "项目名称", self.project_title, 1, "选填，如 小鼠肺组织 RNA-seq")
+        self._entry(frame, "负责人/用户", self.owner, 2, "选填，如 your_name")
         return frame
 
-    def _server_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _server_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
-        self._entry(frame, "服务器配置名", self.server_profile, 0)
-        self._entry(frame, "服务器地址 host", self.server_host, 1, "例如 hpc.example.edu")
-        self._entry(frame, "服务器用户名", self.server_user, 2)
-        self._entry(frame, "服务器项目根目录", self.remote_base_dir, 3)
+        self._entry(frame, "服务器配置名", self.server_profile, 0, "选填，如 sysu_hpc")
+        self._entry(frame, "服务器地址 host", self.server_host, 1, "必填，如 hpc.example.edu")
+        self._entry(frame, "服务器用户名", self.server_user, 2, "必填，如 your_username")
+        self._entry(frame, "服务器项目根目录", self.remote_base_dir, 3, "必填，如 /data/users/your_username/rnaseq_projects")
         self._combo(frame, "调度器", self.scheduler, ["slurm", "pbs", "local"], 4)
         self._entry(frame, "线程数", self.threads, 5)
         self._entry(frame, "内存 GB", self.memory_gb, 6)
@@ -223,8 +371,52 @@ class ConfigApp(Tk):
         frame.columnconfigure(1, weight=1)
         return frame
 
-    def _reference_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _reference_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
+        ttk.Label(
+            frame,
+            text=(
+                "本地文本元数据只用于本机物种推断，不会发送给模型、保存到项目、"
+                "上传或触发远程操作。"
+            ),
+            wraplength=820,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        attachment_row = ttk.Frame(frame)
+        attachment_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        ttk.Button(
+            attachment_row,
+            text="添加本地文本元数据",
+            command=self.choose_text_attachment,
+        ).pack(side="left")
+        ttk.Button(
+            attachment_row,
+            text="移除元数据",
+            command=self.remove_text_attachment,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            attachment_row,
+            textvariable=self.attachment_status,
+            wraplength=620,
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Label(frame, text="待确认参考候选").grid(
+            row=2, column=0, sticky="nw", pady=(0, 5)
+        )
+        self.reference_candidate_text = Text(frame, height=5, width=76, state="disabled")
+        self.reference_candidate_text.grid(
+            row=2, column=1, columnspan=2, sticky="ew", pady=(0, 5)
+        )
+        ttk.Button(
+            frame,
+            text="应用待确认参考",
+            command=self.apply_pending_reference_catalog,
+        ).grid(row=3, column=1, sticky="w", pady=(0, 5))
+        ttk.Button(
+            frame,
+            text="配置参考索引",
+            command=self.configure_reference_index,
+        ).grid(row=3, column=2, sticky="w", pady=(0, 5))
+
         fields = [
             ("参考配置名", "name"),
             ("服务器 GTF 路径", "remote_gtf_path"),
@@ -234,19 +426,20 @@ class ConfigApp(Tk):
             ("Arriba blacklist 路径", "arriba_blacklist_path"),
             ("Arriba known fusions 路径", "arriba_known_fusions_path"),
         ]
-        for row, (label, key) in enumerate(fields):
-            self._entry(frame, label, self.ref_vars[key], row)
+        for row, (label, key) in enumerate(fields, start=4):
+            self._entry(frame, label, self.ref_vars[key], row, "选填，如由已批准参考目录填入")
         ttk.Button(frame, text="保存为默认参考配置", command=self.save_reference_defaults).grid(
-            row=len(fields), column=1, sticky="e", pady=(10, 0)
+            row=len(fields) + 4, column=1, sticky="e", pady=(10, 0)
         )
+        frame.columnconfigure(1, weight=1)
         return frame
 
-    def _samples_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _samples_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
         self._combo(frame, "测序类型", self.layout, ["paired", "single"], 0)
         self._entry(frame, "reads/样本，单位 M", self.reads_per_sample_million, 1)
         self._combo(frame, "链特异性", self.strandedness, ["auto", "unstranded", "forward", "reverse"], 2)
-        self._entry(frame, "本地 FASTQ 目录", self.local_data_dir, 3)
+        self._entry(frame, "本地 FASTQ 目录", self.local_data_dir, 3, "必填，如 D:/data/rnaseq/raw_fastq")
         ttk.Button(frame, text="选择目录", command=self.choose_fastq_dir).grid(row=3, column=2, padx=(6, 0))
         self._entry(frame, "服务器接收 FASTQ 目录", self.remote_data_dir, 4, "填 AUTO 则使用 <项目目录>/raw")
 
@@ -255,16 +448,11 @@ class ConfigApp(Tk):
         )
         self.sample_text = Text(frame, height=12, width=90)
         self.sample_text.grid(row=6, column=0, columnspan=3, sticky="nsew")
-        self.sample_text.insert(
-            "1.0",
-            "Ctrl_1,control,Ctrl_1_R1.fastq.gz,Ctrl_1_R2.fastq.gz\n"
-            "Treat_1,treatment,Treat_1_R1.fastq.gz,Treat_1_R2.fastq.gz\n",
-        )
         frame.columnconfigure(1, weight=1)
         frame.rowconfigure(6, weight=1)
         return frame
 
-    def _pipeline_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _pipeline_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
         for row, (step, config) in enumerate(DEFAULT_PIPELINE.items()):
             ttk.Checkbutton(frame, text=f"{step} ({config['version']})", variable=self.pipeline_vars[step]).grid(
@@ -274,7 +462,68 @@ class ConfigApp(Tk):
         self._entry(frame, "最长等待小时数", self.poll_timeout, len(DEFAULT_PIPELINE) + 2)
         return frame
 
-    def _notification_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _downstream_tab(self, parent: ttk.Frame) -> ttk.Frame:
+        frame = ttk.Frame(parent, padding=16)
+        ttk.Checkbutton(
+            frame,
+            text="启用固定 bulk RNA-seq 下游分析（DESeq2、QC、富集）",
+            variable=self.downstream_enabled,
+            command=self._refresh_downstream_summary,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Label(
+            frame,
+            text=(
+                "固定输入为 featurecounts/gene_counts.txt。统计设计、样本分组、GMT、镜像路径和运行时信息不会发送给普通对话模型；"
+                "下游 R 仅在已确认的 Slurm/PBS 任务中运行。"
+            ),
+            wraplength=860,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="样本元数据：sample_id,condition,batch（batch 选填）").grid(
+            row=2, column=0, columnspan=3, sticky="w"
+        )
+        self.downstream_metadata_text = Text(frame, height=7, width=92)
+        self.downstream_metadata_text.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(3, 8))
+        ttk.Checkbutton(
+            frame,
+            text="在设计中加入 batch（~ batch + condition）",
+            variable=self.downstream_use_batch,
+            command=self._refresh_downstream_summary,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
+        ttk.Label(frame, text="对比：id,numerator,denominator（固定为 numerator 相对 denominator）").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        self.downstream_contrasts_text = Text(frame, height=5, width=92)
+        self.downstream_contrasts_text.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(3, 8))
+        self._entry(frame, "最小计数", self.downstream_min_count, 7, "默认 10")
+        self._entry(frame, "最少样本数", self.downstream_min_samples, 8, "默认 2")
+        self._entry(frame, "Padj 阈值", self.downstream_padj, 9, "默认 0.05")
+        self._entry(frame, "|log2FC| 阈值", self.downstream_abs_log2fc, 10, "默认 1.0")
+        ttk.Checkbutton(frame, text="GO ORA", variable=self.downstream_go_ora).grid(row=11, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(frame, text="KEGG/离线路径 ORA", variable=self.downstream_kegg_ora).grid(row=11, column=2, sticky="w", pady=3)
+        ttk.Checkbutton(frame, text="GSEA", variable=self.downstream_gsea).grid(row=12, column=1, sticky="w", pady=3)
+        self._combo(frame, "富集物种", self.downstream_organism, ["", "human", "mouse"], 13)
+        ttk.Checkbutton(frame, text="使用本地 .gmt 文本基因集", variable=self.downstream_gmt_enabled).grid(row=14, column=1, sticky="w", pady=3)
+        self._entry(frame, "GMT 文件", self.downstream_gmt_path, 15, "选填，如 D:/sets/hallmark.gmt")
+        ttk.Button(frame, text="选择 GMT", command=self.choose_downstream_gmt).grid(row=15, column=2, sticky="w", padx=(8, 0))
+        self._entry(frame, "GMT SHA-256", self.downstream_gmt_sha256, 16, "选择文件后自动计算")
+        self._entry(frame, "下游 Apptainer 镜像", self.downstream_runtime_image, 17, "必填，如 /shared/containers/rnaseq-bioconductor.sif")
+        self._entry(frame, "镜像 SHA-256", self.downstream_runtime_sha256, 18, "必填，64 位十六进制摘要")
+        ttk.Button(frame, text="审阅并应用下游配置", command=self.apply_downstream_configuration).grid(
+            row=19, column=1, sticky="w", pady=(10, 5)
+        )
+        ttk.Label(frame, text="审阅摘要（点击“审阅并应用”前不会保存或连接服务器）").grid(
+            row=20, column=0, columnspan=3, sticky="w", pady=(8, 2)
+        )
+        self.downstream_summary = Text(frame, height=8, width=92, state="disabled", wrap="word")
+        self.downstream_summary.grid(row=21, column=0, columnspan=3, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(6, weight=1)
+        frame.rowconfigure(21, weight=1)
+        self._refresh_downstream_summary()
+        return frame
+
+    def _notification_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
         ttk.Checkbutton(frame, text="启用邮件通知", variable=self.email_enabled).grid(row=0, column=1, sticky="w", pady=5)
         self._entry(frame, "接收邮箱", self.recipient, 1)
@@ -285,7 +534,7 @@ class ConfigApp(Tk):
         ttk.Label(frame, text="密码/授权码不写入配置文件，请放在环境变量中。").grid(row=6, column=1, sticky="w")
         return frame
 
-    def _model_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _model_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
         self._combo(
             frame,
@@ -356,6 +605,11 @@ class ConfigApp(Tk):
         ).pack(side="left")
         ttk.Button(
             buttons,
+            text="进入 SYSU_Agent 引导",
+            command=self.start_onboarding,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            buttons,
             text="测试连接",
             command=self.test_model_connection,
         ).pack(side="left", padx=(8, 0))
@@ -391,18 +645,27 @@ class ConfigApp(Tk):
         frame.columnconfigure(1, weight=1)
         return frame
 
-    def _chat_tab(self, parent: ttk.Notebook) -> ttk.Frame:
+    def _chat_tab(self, parent: ttk.Frame) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=16)
         ttk.Label(
             frame,
-            text=(
-                "可以输入：项目摘要、校验配置、生成报告、看看状态、"
-                "解释结果、开始运行，或直接提出 RNA-seq 问题。"
-            ),
+            text="在引导阶段，Agent 每次只收集一个字段；建议须点击“应用引导填写”后才会写入表单。",
             wraplength=850,
         ).pack(anchor="w", pady=(0, 8))
 
-        self.chat_text = Text(frame, height=24, width=100, state="disabled", wrap="word")
+        self.chat_text = Text(
+            frame,
+            height=24,
+            width=100,
+            state="disabled",
+            wrap="word",
+            background="#0f172a",
+            foreground="#e5e7eb",
+            insertbackground="#f8fafc",
+            relief="flat",
+            padx=12,
+            pady=12,
+        )
         self.chat_text.pack(fill="both", expand=True)
 
         input_row = ttk.Frame(frame)
@@ -411,13 +674,124 @@ class ConfigApp(Tk):
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<Return>", lambda _event: self.send_chat_message())
         ttk.Button(input_row, text="发送", command=self.send_chat_message).pack(side="left", padx=(8, 0))
+        ttk.Button(input_row, text="应用引导填写", command=self.apply_pending_onboarding_proposals).pack(side="left", padx=(8, 0))
+        ttk.Button(input_row, text="丢弃引导填写", command=self.discard_pending_onboarding_proposals).pack(side="left", padx=(8, 0))
+        ttk.Button(input_row, text="应用其他建议", command=self.apply_pending_proposals).pack(side="left", padx=(8, 0))
+        ttk.Button(input_row, text="丢弃建议", command=self.discard_pending_proposals).pack(side="left", padx=(8, 0))
         ttk.Button(input_row, text="清空", command=self.clear_chat).pack(side="left", padx=(8, 0))
 
         self._append_chat(
-            "Agent",
-            "你好，我可以读取当前表单配置，帮助校验、运行、查看状态、生成报告和解释结果。",
+            "SYSU_Agent",
+            "您好！我是您的 SYSU_Agent。请先在“1. 模型设置”配置并应用模型，然后点击“进入 SYSU_Agent 引导”。我只会提出待确认的表单填写建议，不会自动保存、上传或连接集群。",
         )
         return frame
+
+    def start_onboarding(self) -> None:
+        client = self.apply_model_settings(show_message=False)
+        if client is None:
+            self._append_chat("SYSU_Agent", "模型尚未配置完成。你也可以点击后继续使用本地引导，但不会调用模型提取内容。")
+        self.onboarding_active = True
+        self.onboarding_field_index = 0
+        self.onboarding_turn += 1
+        self.pending_onboarding_proposals = ()
+        self._show_page("agent")
+        self._append_chat("SYSU_Agent", "您好！我是您的 SYSU_Agent。")
+        self._ask_onboarding_question()
+
+    def _ask_onboarding_question(self) -> None:
+        if self.onboarding_field_index >= len(self.ONBOARDING_FIELDS):
+            self.onboarding_active = False
+            self._append_chat("SYSU_Agent", "基础信息已收集完成。请检查各标签页的表单；需要保存、上传或提交时，请使用底部按钮并逐次确认。")
+            return
+        _, question = self.ONBOARDING_FIELDS[self.onboarding_field_index]
+        self._append_chat("SYSU_Agent", question)
+
+    def _current_onboarding_field(self) -> str:
+        return self.ONBOARDING_FIELDS[self.onboarding_field_index][0]
+
+    def _handle_local_onboarding_skip(self, message: str) -> bool:
+        if message.strip().lower() not in {
+            "跳过",
+            "跳过这一项",
+            "跳过这项",
+            "我自己填",
+            "跳过这一项我自己填",
+            "稍后填写",
+        }:
+            return False
+        self.pending_onboarding_proposals = ()
+        self.onboarding_field_index += 1
+        self.onboarding_turn += 1
+        self._append_chat("SYSU_Agent", "已跳过当前字段，当前字段未修改；你可以稍后在表单中自行填写。")
+        self._ask_onboarding_question()
+        return True
+
+    def _submit_onboarding_message(self, message: str) -> None:
+        field = self._current_onboarding_field()
+        client = load_llm_client_from_env()
+        if not isinstance(client, OpenAICompatibleClient):
+            self._append_chat("SYSU_Agent", "当前未使用兼容 API 模型。请根据问题直接填写，或在模型设置完成后重试。")
+            return
+        self.onboarding_turn += 1
+        turn = self.onboarding_turn
+        self._append_chat("SYSU_Agent", "正在整理为待确认的表单填写建议……")
+        threading.Thread(
+            target=self._onboarding_llm_worker,
+            args=(client, message, field, turn),
+            daemon=True,
+        ).start()
+
+    def _onboarding_llm_worker(
+        self,
+        client: OpenAICompatibleClient,
+        message: str,
+        field: str,
+        turn: int,
+    ) -> None:
+        try:
+            decision = client.decide_onboarding(message, current_field=field)
+        except Exception as exc:
+            self.after(0, lambda error=str(exc): self._append_chat("SYSU_Agent", f"无法提取填写建议：{error}"))
+            return
+        self.after(0, lambda result=decision, expected=turn: self._receive_onboarding_decision(result, expected))
+
+    def _receive_onboarding_decision(self, decision: OnboardingDecision, turn: int) -> None:
+        if not self.onboarding_active or turn != self.onboarding_turn:
+            return
+        if not decision.proposals:
+            self._append_chat("SYSU_Agent", decision.message or "我还不能确定该字段，请按问题补充说明。")
+            return
+        self.pending_onboarding_proposals = decision.proposals
+        self._append_chat("SYSU_Agent", decision.message or "请确认以下填写建议。")
+        self._append_chat("SYSU_Agent", self._onboarding_proposal_preview())
+        self._append_chat("SYSU_Agent", "点击“应用引导填写”后才会修改当前表单；不会保存或连接服务器。")
+
+    def _onboarding_proposal_preview(self) -> str:
+        return "\n".join(["待确认的引导填写：", *[
+            f"- {patch.field} → {patch.value!r}" for patch in self.pending_onboarding_proposals
+        ]])
+
+    def apply_pending_onboarding_proposals(self) -> None:
+        if not self.pending_onboarding_proposals:
+            self._append_chat("SYSU_Agent", "当前没有待确认的引导填写。")
+            return
+        if not messagebox.askyesno("应用引导填写", "只修改当前表单，不会保存、读取文件或连接服务器。是否应用？"):
+            return
+        try:
+            candidate = apply_onboarding_proposals(self.build_config(), self.pending_onboarding_proposals)
+        except Exception as exc:
+            self._append_chat("SYSU_Agent", f"无法应用引导填写：{exc}")
+            return
+        self._apply_loaded_config(candidate)
+        self.pending_onboarding_proposals = ()
+        self.onboarding_field_index += 1
+        self.onboarding_turn += 1
+        self._append_chat("SYSU_Agent", "已写入当前表单，尚未保存。")
+        self._ask_onboarding_question()
+
+    def discard_pending_onboarding_proposals(self) -> None:
+        self.pending_onboarding_proposals = ()
+        self._append_chat("SYSU_Agent", "已丢弃该建议，请重新说明。")
 
     def _entry(self, frame: ttk.Frame, label: str, variable: StringVar, row: int, hint: str = "") -> None:
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=5)
@@ -436,6 +810,136 @@ class ConfigApp(Tk):
         directory = filedialog.askdirectory(title="选择本地 FASTQ 目录")
         if directory:
             self.local_data_dir.set(directory.replace("\\", "/"))
+
+    def open_project_config(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="打开已保存项目",
+            filetypes=[("Project JSON", "project.json"), ("JSON files", "*.json")],
+        )
+        if not selected:
+            return
+        try:
+            config = load_project_config(Path(selected))
+        except Exception as exc:
+            messagebox.showerror("打开项目失败", str(exc))
+            return
+        self._apply_loaded_config(config)
+        self.current_config_path = Path(selected)
+        self.loaded_config = deepcopy(config)
+        self.pending_proposals = ()
+        self.status_text.set(f"已打开项目：{self.current_config_path}")
+        messagebox.showinfo("打开成功", f"已载入项目：\n{self.current_config_path}")
+
+    def _set_text(self, widget: Text, value: str) -> None:
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value)
+
+    def _apply_loaded_config(self, config: dict[str, Any]) -> None:
+        previous_host = self.server_host.get().strip()
+        previous_user = self.server_user.get().strip()
+        if previous_host and previous_user:
+            clear_ssh_credential(previous_host, previous_user)
+
+        project = config["project"]
+        server = config["server"]
+        sequencing = config.get("sequencing", {})
+        samples = config.get("samples", {})
+        notification = config.get("notification", {})
+        self.project_id.set(str(project.get("id", "")))
+        self.project_title.set(str(project.get("title", project.get("id", ""))))
+        self.owner.set(str(project.get("owner", "local_user")))
+        self.server_profile.set(str(server.get("profile", "")))
+        self.server_host.set(str(server.get("host", "")))
+        self.server_user.set(str(server.get("user", "")))
+        self.remote_base_dir.set(str(server.get("remote_base_dir", "")))
+        self.scheduler.set(str(server.get("scheduler", "slurm")))
+        self.threads.set(str(server.get("threads", 16)))
+        self.memory_gb.set(str(server.get("memory_gb", 64)))
+        self.ssh_auth_mode.set(str(server.get("auth_mode", "key")))
+        self.ssh_key_path.set(str(server.get("key_path", "")))
+        self._set_text(self.init_text, "\n".join(server.get("init_commands", [])))
+        self.layout.set(str(sequencing.get("layout", "paired")))
+        self.reads_per_sample_million.set(str(sequencing.get("reads_per_sample_million", 40)))
+        self.strandedness.set(str(sequencing.get("strandedness", "auto")))
+        self.local_data_dir.set(str(samples.get("local_data_dir", "")))
+        self.remote_data_dir.set(str(samples.get("remote_data_dir", "AUTO")))
+        rows = [
+            ",".join(str(item.get(key, "")) for key in ("sample_id", "condition", "fastq_1", "fastq_2"))
+            for item in samples.get("items", [])
+        ]
+        self._set_text(self.sample_text, "\n".join(rows))
+        for key, variable in self.ref_vars.items():
+            variable.set(str(config.get("reference", {}).get(key, "")))
+        for step, variable in self.pipeline_vars.items():
+            variable.set(bool(config.get("pipeline", {}).get(step, {}).get("enabled", False)))
+        if "downstream_enabled" in self.__dict__:
+            self._apply_loaded_downstream_config(config.get("downstream", {}))
+        polling = config.get("polling", {})
+        self.poll_interval.set(str(polling.get("interval_seconds", 300)))
+        self.poll_timeout.set(str(polling.get("timeout_hours", 168)))
+        self.email_enabled.set(bool(notification.get("email_enabled", False)))
+        self.recipient.set(str(notification.get("recipient", "")))
+        self.smtp_host.set(str(notification.get("smtp_host", "")))
+        self.smtp_port.set(str(notification.get("smtp_port", 587)))
+        self.smtp_user.set(str(notification.get("smtp_user", "")))
+        self.smtp_password_env.set(str(notification.get("password_env", "")))
+        if self.ssh_auth_mode.get() == "password":
+            self.ssh_status.set("已载入服务器设置；SSH 密码不会保存，请在本次会话中重新输入。")
+        else:
+            self.ssh_status.set("已载入服务器设置；尚未测试服务器连接。")
+
+    def _apply_loaded_downstream_config(self, downstream: dict[str, Any]) -> None:
+        enrichment = downstream.get("enrichment", {})
+        gmt = enrichment.get("gmt", {})
+        design = downstream.get("design", {})
+        filtering = downstream.get("filtering", {})
+        de = downstream.get("differential_expression", {})
+        runtime = downstream.get("runtime", {})
+        self.downstream_enabled.set(bool(downstream.get("enabled", False)))
+        self.downstream_use_batch.set(bool(design.get("batch_column")))
+        self.downstream_min_count.set(str(filtering.get("min_count", 10)))
+        self.downstream_min_samples.set(str(filtering.get("min_samples", 2)))
+        self.downstream_padj.set(str(de.get("padj_threshold", 0.05)))
+        self.downstream_abs_log2fc.set(str(de.get("abs_log2_fold_change", 1.0)))
+        self.downstream_go_ora.set(bool(enrichment.get("go_ora", True)))
+        self.downstream_kegg_ora.set(bool(enrichment.get("kegg_ora", True)))
+        self.downstream_gsea.set(bool(enrichment.get("gsea", True)))
+        self.downstream_organism.set(str(enrichment.get("organism", "")))
+        self.downstream_gmt_enabled.set(bool(gmt.get("enabled", False)))
+        self.downstream_gmt_path.set(str(gmt.get("source_path", "")))
+        self.downstream_gmt_sha256.set(str(gmt.get("sha256", "")))
+        self.downstream_runtime_image.set(str(runtime.get("image_path", "")))
+        self.downstream_runtime_sha256.set(str(runtime.get("image_sha256", "")))
+        metadata_rows = [
+            ",".join(str(item.get(key, "")) for key in ("sample_id", "condition", "batch"))
+            for item in downstream.get("metadata", {}).get("samples", [])
+            if isinstance(item, dict)
+        ]
+        contrast_rows = [
+            ",".join(str(item.get(key, "")) for key in ("id", "numerator", "denominator"))
+            for item in downstream.get("contrasts", [])
+            if isinstance(item, dict)
+        ]
+        self._set_text(self.downstream_metadata_text, "\n".join(metadata_rows))
+        self._set_text(self.downstream_contrasts_text, "\n".join(contrast_rows))
+        self._refresh_downstream_summary()
+
+    def _merge_config(self, base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+        merged = deepcopy(base)
+        for key, value in updates.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = self._merge_config(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _config_save_path(self, config: dict[str, Any]) -> Path:
+        if self.current_config_path is None:
+            return self.output_dir / config["project"]["id"] / "project.json"
+        loaded_id = (self.loaded_config or {}).get("project", {}).get("id")
+        if loaded_id and config["project"]["id"] != loaded_id:
+            raise ValueError("当前表单的项目 ID 已变更。为避免覆盖已打开的 project.json，请重新打开或新建项目。")
+        return self.current_config_path
 
     def build_config(self) -> dict[str, Any]:
         project_id = self.project_id.get().strip()
@@ -485,20 +989,25 @@ class ConfigApp(Tk):
                 step: {"enabled": bool(var.get()), "version": DEFAULT_PIPELINE[step]["version"]}
                 for step, var in self.pipeline_vars.items()
             },
+            "downstream": self._downstream_config(),
             "polling": {"interval_seconds": int(self.poll_interval.get()), "timeout_hours": int(self.poll_timeout.get())},
             "notification": self._notification_config(),
             "status": {"state": "configured", "message": "Project config created by GUI mode."},
         }
+        if self.loaded_config is not None:
+            config.pop("created_at", None)
+            config.pop("status", None)
+        config = self._merge_config(self.loaded_config or {}, config)
         config = normalize_config(config)
         runtime = estimate_runtime(config)
         config["runtime_estimate"] = {"hours": runtime.hours, "summary": runtime.summary}
         return config
 
     def collect_reference(self) -> dict[str, Any]:
-        reference = DEFAULT_REFERENCE.copy()
-        for key, variable in self.ref_vars.items():
-            reference[key] = variable.get().strip()
-        return reference
+        return {
+            key: variable.get().strip()
+            for key, variable in self.ref_vars.items()
+        }
 
     def _parse_init_commands(self) -> list[str]:
         text = self.init_text.get("1.0", "end").strip()
@@ -529,6 +1038,145 @@ class ConfigApp(Tk):
             )
         return items
 
+    def _parse_downstream_rows(self, widget: Text, expected_columns: int, label: str) -> list[list[str]]:
+        rows: list[list[str]] = []
+        for line_number, raw_line in enumerate(widget.get("1.0", "end").splitlines(), start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            values = [value.strip() for value in line.split(",")]
+            if len(values) != expected_columns:
+                raise ValueError(f"{label}第 {line_number} 行必须包含 {expected_columns} 列，以英文逗号分隔。")
+            rows.append(values)
+        return rows
+
+    def _downstream_config(self) -> dict[str, Any]:
+        metadata = [
+            {"sample_id": sample_id, "condition": condition, "batch": batch}
+            for sample_id, condition, batch in self._parse_downstream_rows(
+                self.downstream_metadata_text, 3, "下游样本元数据"
+            )
+        ]
+        contrasts = [
+            {
+                "id": contrast_id,
+                "factor": "condition",
+                "numerator": numerator,
+                "denominator": denominator,
+            }
+            for contrast_id, numerator, denominator in self._parse_downstream_rows(
+                self.downstream_contrasts_text, 3, "下游对比"
+            )
+        ]
+        gmt_path = self.downstream_gmt_path.get().strip()
+        return {
+            "enabled": bool(self.downstream_enabled.get()),
+            "profile_id": "bulk_rnaseq_deseq2_v1",
+            "input": {"kind": "featurecounts_raw_counts", "path": "featurecounts/gene_counts.txt"},
+            "metadata": {"samples": metadata},
+            "design": {
+                "condition_column": "condition",
+                "batch_column": "batch" if self.downstream_use_batch.get() else "",
+                "formula": "~ batch + condition" if self.downstream_use_batch.get() else "~ condition",
+            },
+            "contrasts": contrasts,
+            "filtering": {
+                "min_count": int(self.downstream_min_count.get()),
+                "min_samples": int(self.downstream_min_samples.get()),
+            },
+            "differential_expression": {
+                "padj_threshold": float(self.downstream_padj.get()),
+                "abs_log2_fold_change": float(self.downstream_abs_log2fc.get()),
+            },
+            "enrichment": {
+                "enabled": bool(self.downstream_go_ora.get() or self.downstream_kegg_ora.get() or self.downstream_gsea.get()),
+                "go_ora": bool(self.downstream_go_ora.get()),
+                "kegg_ora": bool(self.downstream_kegg_ora.get()),
+                "gsea": bool(self.downstream_gsea.get()),
+                "id_type": "ENSEMBL",
+                "organism": self.downstream_organism.get().strip(),
+                "gmt": {
+                    "enabled": bool(self.downstream_gmt_enabled.get()),
+                    "source_filename": Path(gmt_path).name if gmt_path else "",
+                    "source_path": gmt_path,
+                    "sha256": self.downstream_gmt_sha256.get().strip(),
+                },
+            },
+            "runtime": {
+                "environment_kind": "apptainer",
+                "image_path": self.downstream_runtime_image.get().strip(),
+                "image_sha256": self.downstream_runtime_sha256.get().strip(),
+                "rscript_path": "Rscript",
+            },
+        }
+
+    def _downstream_review_text(self) -> str:
+        try:
+            downstream = self._downstream_config()
+        except (TypeError, ValueError) as exc:
+            return f"请先修正下游表单：{exc}"
+        if not downstream["enabled"]:
+            return "下游分析未启用：本次只运行已勾选的上游流程。"
+        metadata = downstream["metadata"]["samples"]
+        contrasts = downstream["contrasts"]
+        design = downstream["design"]["formula"]
+        filtering = downstream["filtering"]
+        de = downstream["differential_expression"]
+        enrichment = downstream["enrichment"]
+        runtime = downstream["runtime"]
+        lines = [
+            "固定输入：featurecounts/gene_counts.txt 原始计数",
+            f"设计：{design}；样本：" + (", ".join(f"{row['sample_id']}={row['condition']}" for row in metadata) or "未填写"),
+            "对比：" + (", ".join(f"{row['id']}: {row['numerator']} / {row['denominator']}" for row in contrasts) or "未填写"),
+            f"过滤：count ≥ {filtering['min_count']}，至少 {filtering['min_samples']} 个样本；DE：padj ≤ {de['padj_threshold']}，|log2FC| ≥ {de['abs_log2_fold_change']}",
+            f"富集：GO={enrichment['go_ora']}，KEGG/离线路径={enrichment['kegg_ora']}，GSEA={enrichment['gsea']}；物种={enrichment['organism'] or '未填写'}；ID=ENSEMBL",
+            f"GMT：{enrichment['gmt']['source_filename'] or '未使用'}；SHA-256={enrichment['gmt']['sha256'] or '未填写'}",
+            f"不可变运行时：{runtime['image_path'] or '未填写'}；SHA-256={runtime['image_sha256'] or '未填写'}",
+            "执行方式：作为同一个已确认的调度任务中的 featureCounts 后续步骤运行；不会在登录节点直接运行。",
+        ]
+        return "\n".join(lines)
+
+    def _refresh_downstream_summary(self) -> None:
+        if "downstream_summary" not in self.__dict__:
+            return
+        self.downstream_summary.configure(state="normal")
+        self._set_text(self.downstream_summary, self._downstream_review_text())
+        self.downstream_summary.configure(state="disabled")
+
+    def choose_downstream_gmt(self) -> None:
+        selected = filedialog.askopenfilename(title="选择本地 GMT 文本基因集", filetypes=[("GMT files", "*.gmt")])
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            messagebox.showerror("无法读取 GMT", str(exc))
+            return
+        self.downstream_gmt_path.set(str(path))
+        self.downstream_gmt_sha256.set(digest)
+        self.downstream_gmt_enabled.set(True)
+        self._refresh_downstream_summary()
+
+    def apply_downstream_configuration(self) -> None:
+        review = self._downstream_review_text()
+        if not messagebox.askyesno(
+            "应用下游配置",
+            review + "\n\n确认后仅应用到当前表单；不会保存、上传、预检、连接服务器或提交任务。是否继续？",
+        ):
+            return
+        try:
+            config = self.build_config()
+        except Exception as exc:
+            messagebox.showerror("下游配置错误", str(exc))
+            return
+        errors = downstream_errors(config)
+        if errors:
+            messagebox.showwarning("下游配置未通过", "\n".join(errors))
+            return
+        self.status_text.set("下游配置已审阅并应用到当前表单；请保存或在提交前再次确认。")
+        self._refresh_downstream_summary()
+
     def _notification_config(self) -> dict[str, Any]:
         if not self.email_enabled.get():
             return {"email_enabled": False}
@@ -548,12 +1196,209 @@ class ConfigApp(Tk):
         save_defaults(payload)
         messagebox.showinfo("已保存", "默认参考配置已保存。")
 
+    def choose_text_attachment(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="选择本地文本元数据",
+            filetypes=[
+                ("文本元数据", "*.txt *.csv *.tsv *.json *.yaml *.yml *.md"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not selected:
+            return
+        try:
+            attachment = load_text_attachment(Path(selected))
+        except AttachmentError as exc:
+            messagebox.showerror("无法添加元数据", str(exc))
+            return
+        self.text_attachment = attachment
+        self.attachment_status.set(
+            f"已在本地加载 {attachment.name}（{attachment.size_bytes} bytes）；未保存或发送。"
+        )
+        self._stage_reference_candidates(
+            infer_reference_candidates(attachment.text),
+            unsupported_assembly=has_unsupported_assembly(attachment.text),
+        )
+
+    def remove_text_attachment(self) -> None:
+        self.text_attachment = None
+        self.pending_reference_candidates = ()
+        self.awaiting_species_answer = False
+        self.attachment_status.set("尚未添加本地文本元数据。")
+        self._render_reference_candidates()
+
+    def _stage_reference_candidates(
+        self,
+        candidates: tuple[ReferenceCandidate, ...],
+        *,
+        unsupported_assembly: bool = False,
+    ) -> None:
+        self.pending_reference_candidates = candidates
+        self._render_reference_candidates()
+        if candidates:
+            self.awaiting_species_answer = False
+            self._append_chat(
+                "SYSU_Agent",
+                "已在本地从元数据推断出参考候选。请在“参考”页核对后，点击“应用待确认参考”。",
+            )
+            return
+        self.awaiting_species_answer = not unsupported_assembly
+        if unsupported_assembly:
+            self._append_chat(
+                "SYSU_Agent",
+                "本地元数据识别到 mm10/GRCm38，但当前批准目录没有匹配参考；不会改用 GRCm39。请提供匹配的已批准参考后再继续。",
+            )
+            return
+        self._append_chat(
+            "SYSU_Agent",
+            "本地元数据无法确定唯一物种。请直接回复“人类”或“小鼠”；这不会发送给模型。",
+        )
+
+    def _render_reference_candidates(self) -> None:
+        if self.reference_candidate_text is None:
+            return
+        lines = ["当前没有待确认参考候选。"]
+        if self.pending_reference_candidates:
+            lines = ["以下候选仅待确认，尚未写入表单："]
+            for candidate in self.pending_reference_candidates:
+                entry = candidate.entry
+                evidence = "、".join(candidate.evidence)
+                lines.append(
+                    f"- {entry.catalog_id}: {entry.species}, {entry.assembly} "
+                    f"（{candidate.confidence}；证据：{evidence}）"
+                )
+        self.reference_candidate_text.configure(state="normal")
+        self.reference_candidate_text.delete("1.0", "end")
+        self.reference_candidate_text.insert("1.0", "\n".join(lines))
+        self.reference_candidate_text.configure(state="disabled")
+
+    def _handle_local_species_answer(self, message: str) -> bool:
+        if not self.awaiting_species_answer:
+            return False
+        species = normalize_explicit_species(message)
+        if species is None:
+            self._append_chat(
+                "SYSU_Agent",
+                "请仅回复“人类”或“小鼠”。该回答只在本地用于选择参考候选。",
+            )
+            return True
+        self._stage_reference_candidates(candidates_for_species(species))
+        return True
+
+    def apply_pending_reference_catalog(self) -> None:
+        if not self.pending_reference_candidates:
+            self._append_chat("SYSU_Agent", "当前没有待确认参考候选。")
+            return
+        if len(self.pending_reference_candidates) != 1:
+            self._append_chat(
+                "SYSU_Agent",
+                "当前有多个参考候选；请先在后续目录版本中明确选择一个组装版本。",
+            )
+            return
+        candidate = self.pending_reference_candidates[0]
+        entry = candidate.entry
+        if not messagebox.askyesno(
+            "应用参考目录",
+            f"将把已批准目录 {entry.catalog_id} 的字段填入当前参考表单。\n\n"
+            "这不会保存、连接服务器、下载参考、上传 FASTQ 或提交任务。是否应用？",
+        ):
+            return
+        for key, value in catalog_reference_fields(entry.catalog_id).items():
+            if key in self.ref_vars:
+                self.ref_vars[key].set(value)
+        self.reference_index_state = "unconfigured"
+        if "index_state" in self.ref_vars:
+            self.ref_vars["index_state"].set(self.reference_index_state)
+        self.pending_reference_candidates = ()
+        self.awaiting_species_answer = False
+        self.reference_index_state = "unconfigured"
+        self._render_reference_candidates()
+        self._append_chat("SYSU_Agent", "已填入当前参考表单，尚未保存。")
+
+    def configure_reference_index(self) -> None:
+        if not self.ref_vars["catalog_id"].get().strip():
+            self._append_chat("SYSU_Agent", "请先确认参考身份，再配置与其匹配的索引。")
+            return
+        has_existing = messagebox.askyesno(
+            "配置参考索引",
+            "你是否已有与当前参考身份匹配、可用的指定 STAR/RSEM 索引？\n\n"
+            "选择“是”只允许你手动填写路径，随后仍需可选的只读预检；不会连接服务器。",
+        )
+        if has_existing:
+            self.reference_index_state = "existing_pending_preflight"
+            self.ref_vars["index_state"].set(self.reference_index_state)
+            self._append_chat(
+                "SYSU_Agent",
+                "请手动填写已有的 STAR/RSEM index 路径及所需 GTF/FASTA 路径。"
+                "当前仅标记为待只读预检验证，尚未保存、连接或运行。",
+            )
+            return
+        build_plan = messagebox.askyesno(
+            "尚未指定索引",
+            "没有已有索引。是否只生成“未来自建索引计划”？\n\n"
+            "选择“是”不会生成命令、下载文件、构建索引或提交任务；选择“否”可继续审阅公开候选搜索查询。",
+        )
+        if build_plan:
+            self.reference_index_state = "build_plan_pending"
+            self.ref_vars["index_state"].set(self.reference_index_state)
+            self._append_chat(
+                "SYSU_Agent",
+                "已记录待确认的自建索引计划：需要匹配的参考 FASTA/GTF、STAR/RSEM 工具与计算资源。"
+                "这只是计划，不会生成命令、下载、构建、连接服务器或提交任务。",
+            )
+            return
+        self._confirm_public_reference_search()
+
+    def _confirm_public_reference_search(self) -> None:
+        from .llm_policy import ProposalError, build_reference_search_query
+
+        enabled_tools = tuple(
+            step for step, variable in self.pipeline_vars.items() if variable.get() and step in {"star", "rsem"}
+        )
+        try:
+            query = build_reference_search_query(
+                species=self.ref_vars["species"].get().strip(),
+                assembly=self.ref_vars["assembly"].get().strip(),
+                annotation_release=self.ref_vars["release"].get().strip(),
+                layout=self.layout.get().strip(),
+                enabled_tools=enabled_tools,
+            )
+        except ProposalError as exc:
+            self._append_chat("SYSU_Agent", str(exc))
+            return
+        displayed = (
+            "将仅发送以下公开信息以寻找官方参考/索引候选：\n"
+            f"物种：{query['species']}\n组装：{query['assembly']}\n注释：{query['annotation_release']}\n"
+            f"测序：{query['layout']} RNA-seq\n工具：{', '.join(query['enabled_tools'])}\n\n"
+            "不会发送本地 metadata、附件、路径、项目/样本/服务器信息或凭据。"
+        )
+        if not messagebox.askyesno("确认公开候选查询", displayed + "\n\n确认后仅记录待搜索候选，不会下载、填入索引路径、连接或运行。是否继续？"):
+            self._append_chat("SYSU_Agent", "已取消公开候选查询；未发送任何信息。")
+            return
+        self.reference_index_state = "search_candidate_pending"
+        self.ref_vars["index_state"].set(self.reference_index_state)
+        self._append_chat(
+            "SYSU_Agent",
+            "已确认公开候选查询范围。当前版本不会把候选自动变成运行路径；"
+            "请在获取并核对官方候选后，手动提供已有部署索引或建立独立的构建计划。",
+        )
+
     def send_chat_message(self) -> None:
         message = self.chat_input.get().strip()
         if not message:
             return
         self.chat_input.set("")
         self._append_chat("你", message)
+        if self._handle_local_species_answer(message):
+            return
+        if self.onboarding_active:
+            if self._handle_local_onboarding_skip(message):
+                return
+            if self.pending_onboarding_proposals:
+                self._append_chat("SYSU_Agent", "请先应用或丢弃当前待确认填写建议。")
+                return
+            self._submit_onboarding_message(message)
+            return
         if self._handle_local_chat_action(message):
             return
 
@@ -588,12 +1433,7 @@ class ConfigApp(Tk):
                 self._append_chat("Agent", "\n".join(lines))
             return True
         if lower in {"校验", "校验配置", "检查配置", "validate"}:
-            try:
-                result = validate_local_fastqs(self.build_config())
-            except Exception as exc:
-                self._append_chat("Agent", f"校验失败：{exc}")
-            else:
-                self._append_chat("Agent", "\n".join(validation_summary(result)))
+            self._start_local_validation(show_dialog=False)
             return True
         if lower in {"报告", "生成报告", "导出报告", "report"}:
             try:
@@ -616,18 +1456,10 @@ class ConfigApp(Tk):
             self._chat_refresh_status()
             return True
         if lower in {"运行", "开始运行", "run"}:
-            if messagebox.askyesno("确认运行", "是否保存配置并运行当前项目？"):
-                self._append_chat("Agent", "已开始运行，状态会显示在窗口底部。")
-                self.start_run(wait=True)
-            else:
-                self._append_chat("Agent", "已取消运行。")
+            self._append_chat("Agent", "请使用底部“保存并运行”按钮，并在确认窗口中确认远程副作用。")
             return True
         if lower in {"后台运行", "仅提交", "run-nowait"}:
-            if messagebox.askyesno("确认提交", "是否保存配置并提交当前项目？"):
-                self._append_chat("Agent", "已开始提交任务。")
-                self.start_run(wait=False)
-            else:
-                self._append_chat("Agent", "已取消提交。")
+            self._append_chat("Agent", "请使用底部“仅提交”按钮，并在确认窗口中确认远程副作用。")
             return True
         if lower in {"模型", "模型状态", "model", "llm"}:
             client = load_llm_client_from_env()
@@ -651,6 +1483,7 @@ class ConfigApp(Tk):
             decision = client.decide(
                 message,
                 has_project=self.current_config_path is not None,
+                config=self._llm_safe_config(),
             )
         except Exception as exc:
             self.after(
@@ -664,34 +1497,104 @@ class ConfigApp(Tk):
         self.after(0, lambda result=decision: self._execute_gui_decision(result))
 
     def _execute_gui_decision(self, decision: LLMDecision) -> None:
-        if decision.action == "chat":
+        if decision.action == "answer":
             self._append_chat(
                 "Agent",
-                decision.message or "我可以帮助你处理当前 RNA-seq 项目。",
+                decision.message or "我可以解释 RNA-seq 工作流，但不会替你执行操作。",
             )
             return
-        if decision.action in {"new", "open"}:
-            self._append_chat(
-                "Agent",
-                "请在上方“项目/服务器/样本”等标签页新建或编辑项目配置。",
-            )
+        if decision.action == "config_patch_proposal":
+            self.pending_proposals = decision.proposals
+            self._append_chat("Agent", decision.message or "这里是一份待审阅的配置建议。")
+            self._append_chat("Agent", self._proposal_preview())
+            self._append_chat("Agent", "请点击“应用建议”仅修改当前表单，或点击“丢弃建议”。保存配置仍需单独点击“保存配置”。")
             return
-        action_phrases = {
-            "validate": "校验配置",
-            "status": "看看状态",
-            "report": "生成报告",
-            "explain": "解释结果",
-            "summary": "项目摘要",
-            "where": "项目摘要",
-            "help": "帮助",
-            "run": "开始运行",
-            "run-nowait": "后台运行",
-        }
-        phrase = action_phrases.get(decision.action)
-        if phrase is None:
-            self._append_chat("Agent", decision.message or "该动作当前未在桌面端开放。")
+        if decision.action == "contract_submission_request":
+            self._request_llm_contract_submission(decision.message)
             return
-        self._handle_local_chat_action(phrase)
+        self._append_chat("Agent", "模型响应不符合受限策略，未执行任何操作。")
+
+    def _request_llm_contract_submission(self, message: str) -> None:
+        config_path = self.current_config_path
+        if config_path is None:
+            self._append_chat("Agent", "模型合同提交只能使用当前已保存并绑定的项目；不会自动保存表单。")
+            return
+        try:
+            preview = inspect_llm_submission(config_path)
+        except Exception as exc:
+            self._append_chat("Agent", f"当前保存项目不能通过模型通道提交：{exc}")
+            return
+        if self.running:
+            self._append_chat("Agent", "已有任务正在运行，请等待当前任务结束。")
+            return
+        confirmed = messagebox.askyesno(
+            "确认合同提交",
+            f"模型请求提交已验证合同：\n{preview.contract_id}\n\n"
+            "这会连接服务器、上传 FASTQ、创建或更新远程文件，并提交调度任务。"
+            "同一合同不能通过模型通道自动重试。是否继续？",
+        )
+        if not confirmed:
+            self._append_chat("Agent", "已取消合同提交。")
+            return
+        if not self._prepare_server_credential(require_password=True):
+            return
+        self.running = True
+        self.status_text.set(f"正在提交已验证合同 {preview.contract_id}……")
+        threading.Thread(
+            target=self._llm_contract_submission_worker,
+            args=(config_path,),
+            daemon=True,
+        ).start()
+
+    def _llm_contract_submission_worker(self, config_path: Path) -> None:
+        try:
+            outcome = submit_llm_contract(config_path)
+        except Exception as exc:
+            self.after(0, self._run_finished, False, str(exc), config_path)
+            return
+        self.after(0, self._run_finished, True, outcome.message, config_path)
+
+    def _llm_safe_config(self) -> dict[str, Any] | None:
+        try:
+            return self.build_config()
+        except Exception:
+            return None
+
+    def _proposal_preview(self) -> str:
+        if not self.pending_proposals:
+            return "当前没有待审阅的配置建议。"
+        lines = ["待审阅的配置建议："]
+        for patch in self.pending_proposals:
+            reason = f"；原因：{patch.reason}" if patch.reason else ""
+            lines.append(f"- {patch.path} → {patch.value!r}{reason}")
+        return "\n".join(lines)
+
+    def apply_pending_proposals(self) -> None:
+        if not self.pending_proposals:
+            self._append_chat("Agent", "当前没有待审阅的配置建议。")
+            return
+        if not messagebox.askyesno("应用配置建议", "仅修改当前表单，不会保存配置或连接服务器。是否应用？"):
+            return
+        try:
+            candidate = apply_proposals(self.build_config(), self.pending_proposals)
+        except Exception as exc:
+            self._append_chat("Agent", f"无法应用配置建议：{exc}")
+            return
+        sequencing = candidate["sequencing"]
+        self.layout.set(str(sequencing["layout"]))
+        self.strandedness.set(str(sequencing["strandedness"]))
+        self.reads_per_sample_million.set(str(sequencing["reads_per_sample_million"]))
+        polling = candidate["polling"]
+        self.poll_interval.set(str(polling["interval_seconds"]))
+        self.poll_timeout.set(str(polling["timeout_hours"]))
+        for step, variable in self.pipeline_vars.items():
+            variable.set(bool(candidate["pipeline"][step]["enabled"]))
+        self.pending_proposals = ()
+        self._append_chat("Agent", "配置建议已应用到当前表单，尚未保存到 project.json。")
+
+    def discard_pending_proposals(self) -> None:
+        self.pending_proposals = ()
+        self._append_chat("Agent", "已丢弃待审阅的配置建议。")
 
     def _chat_refresh_status(self) -> None:
         config_path = self.current_config_path
@@ -986,19 +1889,70 @@ class ConfigApp(Tk):
 
     def save_config_silent(self) -> Path:
         config = self.build_config()
-        config_path = self.output_dir / config["project"]["id"] / "project.json"
+        config_path = self._config_save_path(config)
         save_json(config_path, config)
         self.current_config_path = config_path
+        self.loaded_config = deepcopy(config)
         self.status_text.set(f"配置已保存：{config_path}")
         return config_path
 
     def validate_form(self) -> None:
+        self._start_local_validation(show_dialog=True)
+
+    def _start_local_validation(self, *, show_dialog: bool) -> None:
+        if self.validation_in_progress:
+            message = "本地 FASTQ 校验正在进行中，请等待完成。"
+            if show_dialog:
+                messagebox.showinfo("正在校验", message)
+            else:
+                self._append_chat("Agent", message)
+            return
         try:
             config = self.build_config()
+        except Exception as exc:
+            if show_dialog:
+                messagebox.showerror("配置错误", str(exc))
+            else:
+                self._append_chat("Agent", f"校验失败：{exc}")
+            return
+        self.validation_in_progress = True
+        self.status_text.set("正在本地校验 FASTQ；较大的 .fastq.gz 文件可能需要数分钟。")
+        threading.Thread(
+            target=self._local_validation_worker,
+            args=(config, show_dialog),
+            daemon=True,
+        ).start()
+
+    def _local_validation_worker(self, config: dict[str, Any], show_dialog: bool) -> None:
+        try:
             result = validate_local_fastqs(config)
         except Exception as exc:
-            messagebox.showerror("配置错误", str(exc))
+            self.after(0, self._local_validation_finished, None, str(exc), show_dialog)
             return
+        self.after(0, self._local_validation_finished, result, None, show_dialog)
+
+    def _local_validation_finished(
+        self,
+        result: ValidationResult | None,
+        error: str | None,
+        show_dialog: bool,
+    ) -> None:
+        self.validation_in_progress = False
+        if error is not None:
+            self.status_text.set("本地 FASTQ 校验失败。")
+            if show_dialog:
+                messagebox.showerror("校验失败", error)
+            else:
+                self._append_chat("Agent", f"校验失败：{error}")
+            return
+        assert result is not None
+        self.status_text.set("本地 FASTQ 校验通过。" if result.ok else "本地 FASTQ 校验未通过，请查看结果。")
+        if not show_dialog:
+            self._append_chat("Agent", "\n".join(validation_summary(result)))
+            return
+        self._show_validation_result(result)
+
+    def _show_validation_result(self, result: Any) -> None:
         if result.ok:
             messagebox.showinfo("校验通过", "本地 FASTQ 和配置校验通过。")
             return
@@ -1020,6 +1974,20 @@ class ConfigApp(Tk):
     def start_run(self, wait: bool) -> None:
         if self.running:
             messagebox.showinfo("正在运行", "已有任务正在运行，请等待当前任务结束。")
+            return
+        mode = "保存配置、上传 FASTQ 并提交分析任务" if wait else "保存配置、上传 FASTQ 并提交分析任务后返回"
+        downstream_notice = ""
+        if self.downstream_enabled.get():
+            downstream_notice = (
+                "\n\n本次还会在同一个调度任务的 featureCounts 后运行下游分析：\n"
+                + self._downstream_review_text()
+                + "\n下游阶段不会在登录节点直接运行，也不会另行提交嵌套任务。"
+            )
+        if not messagebox.askyesno(
+            "确认运行",
+            f"Agent 将{mode}。这会连接服务器、创建或更新远程文件，并可能在调度器中占用计算资源。"
+            f"{downstream_notice}\n\n是否继续？",
+        ):
             return
         if not self._prepare_server_credential(require_password=True):
             return
@@ -1109,6 +2077,11 @@ class ConfigApp(Tk):
             messagebox.showerror("任务失败", message)
 
     def refresh_project_status(self) -> None:
+        if not messagebox.askyesno(
+            "确认刷新状态",
+            "Agent 将连接服务器读取当前任务状态；如当前配置尚未保存，会先保存配置。是否继续？",
+        ):
+            return
         if not self._prepare_server_credential(require_password=True):
             return
         config_path = self.current_config_path

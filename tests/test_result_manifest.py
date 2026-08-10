@@ -68,6 +68,31 @@ class ResultManifestTests(unittest.TestCase):
             self.assertIn("Required result is missing: star/sample_1.Log.final.out", joined)
             self.assertIn("Required result is missing: featurecounts/gene_counts.txt", joined)
             self.assertIn("does not contain 'completed'", joined)
+    def test_requires_core_downstream_outputs_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            extracted = root / "extracted"
+            config = _config()
+            config["downstream"] = {
+                "enabled": True,
+                "contrasts": [{"id": "treated_vs_control"}],
+            }
+            _write(extracted, "status/completed.flag", b"")
+            _write(extracted, "status/state.txt", b"completed\n")
+            _write(extracted, "star/sample_1.Aligned.sortedByCoord.out.bam", b"bam")
+            _write(extracted, "star/sample_1.Log.final.out", b"mapped\n")
+            _write(extracted, "featurecounts/gene_counts.txt", b"gene\tcount\nA\t1\n")
+            _write(extracted, "featurecounts/gene_counts.txt.summary", b"Assigned\t1\n")
+            _write(extracted, "downstream/summary.json", b"{}\n")
+
+            summary = create_result_manifest(config, extracted, root / "result_manifest.json")
+
+            self.assertFalse(summary.ok)
+            self.assertIn("Required result is missing: downstream/vst_counts.csv", summary.errors)
+            self.assertIn(
+                "Required result is missing: downstream/de/treated_vs_control_results.csv",
+                summary.errors,
+            )
 
 
 if __name__ == "__main__":

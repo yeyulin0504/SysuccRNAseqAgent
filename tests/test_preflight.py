@@ -197,6 +197,71 @@ class PreflightTests(unittest.TestCase):
             self.assertNotIn(SECRET_USER, message)
             self.assertNotIn(SECRET_HOME, message)
 
+    def test_downstream_report_marks_missing_image_or_packages_as_errors(self) -> None:
+        config = _config()
+        config["pipeline"]["star"]["enabled"] = True
+        config["pipeline"]["featurecounts"]["enabled"] = True
+        config["reference"].update(
+            {"species": "human", "catalog_id": "GENCODE_R47_GRCh38p14_ALL", "index_state": "existing_confirmed"}
+        )
+        config["downstream"] = {
+            "enabled": True,
+            "enrichment": {"organism": "human"},
+            "runtime": {
+                "environment_kind": "apptainer",
+                "image_path": "/containers/downstream.sif",
+                "image_sha256": "a" * 64,
+                "rscript_path": "Rscript",
+            },
+        }
+        stdout = _probe_stdout() + "\n".join(
+            "\t".join((PREFIX, *row))
+            for row in [
+                ("reference", "downstream_runtime_image", "readable"),
+                ("downstream", "r_packages", "available"),
+            ]
+        ) + "\n"
+
+        class DownstreamTransport(FakeTransport):
+            def execute(self, remote_command: str) -> CommandResult:
+                self.execute_calls.append(remote_command)
+                return CommandResult(["fake-ssh", remote_command], 0, stdout, "")
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "project.json"
+            save_json(config_path, config)
+            _, report = run_preflight(config_path, transport=DownstreamTransport())
+
+        self.assertTrue(report["downstream"]["enabled"])
+        self.assertEqual(report["downstream"]["image_state"], "readable")
+        self.assertEqual(report["downstream"]["required_packages"], "available")
+        self.assertFalse(any(item["code"].startswith("downstream_") for item in report["findings"]))
+
+    def test_downstream_probe_checks_immutable_image_and_packages_read_only(self) -> None:
+        config = _config()
+        config["downstream"] = {
+            "enabled": True,
+            "runtime": {
+                "environment_kind": "apptainer",
+                "image_path": "/containers/downstream.sif",
+                "image_sha256": "a" * 64,
+                "rscript_path": "Rscript",
+            },
+        }
+
+        command = build_read_only_probe(config)
+
+        self.assertIn("probe_file downstream_runtime_image", command)
+        self.assertIn("apptainer exec", command)
+        self.assertIn("Rscript -e", command)
+        self.assertIn("jsonlite DESeq2 ggplot2 pheatmap", command)
+        self.assertIn("probe_emit downstream r_packages available", command)
+        self.assertIn("probe_emit downstream r_packages unavailable", command)
+        self.assertNotIn("install.packages", command)
+        self.assertNotIn("BiocManager::install", command)
+        self.assertNotIn("download.file", command)
+        self.assertNotRegex(command, re.compile(r"(^|[;&|]\s*)(mkdir|touch|rm|mv|cp|chmod|chown|sbatch|qsub)\b"))
+
     def test_star_and_rsem_probe_core_reference_artifacts(self) -> None:
         config = _config()
         config["pipeline"]["star"]["enabled"] = True

@@ -137,6 +137,41 @@ class FastqValidationTests(unittest.TestCase):
 
             self.assertFalse(result.ok)
             self.assertIn("Missing container.image_path for Apptainer execution.", result.errors)
+    def test_rejects_unconfirmed_reference_index_for_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            records = [("read1", "ACGT")]
+            _write_fastq(root / "sample_R1.fastq.gz", records)
+            _write_fastq(root / "sample_R2.fastq.gz", records)
+            config = _config(root)
+            config["pipeline"]["star"]["enabled"] = True
+            config["reference"] = {
+                "star_index_dir": "/refs/star",
+                "index_state": "build_plan_pending",
+            }
+
+            result = validate_local_fastqs(config)
+
+            self.assertFalse(result.ok)
+            self.assertIn("Reference indexes are not confirmed for execution.", result.errors)
+
+    def test_rejects_unsafe_reference_index_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            records = [("read1", "ACGT")]
+            _write_fastq(root / "sample_R1.fastq.gz", records)
+            _write_fastq(root / "sample_R2.fastq.gz", records)
+            config = _config(root)
+            config["pipeline"]["star"]["enabled"] = True
+            config["reference"] = {
+                "star_index_dir": "/refs/star; touch bad",
+                "index_state": "existing_confirmed",
+            }
+
+            result = validate_local_fastqs(config)
+
+            self.assertFalse(result.ok)
+            self.assertIn("Unsafe remote reference setting: star_index_dir", result.errors)
 
 
 if __name__ == "__main__":

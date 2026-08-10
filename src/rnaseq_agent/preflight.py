@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .container import container_config, container_errors
+from .downstream import downstream_errors
 from .configuration import normalize_config
 from .remote_transport import RemoteTransport, create_remote_transport
 from .shell import shell_quote
@@ -180,6 +181,27 @@ def build_read_only_probe(config: dict[str, Any]) -> str:
     for key, (command, flag) in _TOOL_COMMANDS.items():
         lines.append(f"{tool_probe} {shell_quote(key)} {shell_quote(command)} {shell_quote(flag)}")
 
+    downstream = config.get("downstream", {})
+    if downstream.get("enabled", False):
+        runtime = downstream["runtime"]
+        downstream_image = _safe_remote_path(runtime["image_path"], "downstream.runtime.image_path")
+        required_r_packages = "jsonlite DESeq2 ggplot2 pheatmap clusterProfiler enrichplot DOSE AnnotationDbi org.Hs.eg.db org.Mm.eg.db matrixStats"
+        lines.extend(
+            [
+                f"probe_file downstream_runtime_image {shell_quote(downstream_image)}",
+                "probe_downstream_r() { "
+                "if [ ! -r \"$1\" ]; then probe_emit downstream r_packages missing_image; return; fi; "
+                "probe_downstream_result=$(apptainer exec \"$1\" Rscript -e "
+                "'required <- strsplit(commandArgs(TRUE)[1], \" \")[[1]]; missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]; if (length(missing)) quit(status=1); cat(\"available\")' "
+                f"--args {shell_quote(required_r_packages)} 2>&1); "
+                "probe_downstream_status=$?; "
+                "if [ \"$probe_downstream_status\" -eq 0 ]; then probe_emit downstream r_packages available; "
+                "else probe_emit downstream r_packages unavailable; fi; "
+                "}",
+                f"probe_downstream_r {shell_quote(downstream_image)}",
+            ]
+        )
+
     lines.extend(_reference_probe_lines(config))
     lines.extend(
         [
@@ -288,6 +310,9 @@ def _validate_config_for_preflight(config: dict[str, Any]) -> None:
     errors = container_errors(config)
     if errors:
         raise PreflightError("; ".join(errors))
+    errors = downstream_errors(config)
+    if errors:
+        raise PreflightError("; ".join(errors))
 
 
 def _parse_probe_output(stdout: str) -> dict[str, Any]:
@@ -303,6 +328,7 @@ def _parse_probe_output(stdout: str) -> dict[str, Any]:
             "tool_path",
             "tool_version",
             "reference",
+            "downstream",
             "workdir",
             "storage",
         }:
@@ -499,6 +525,7 @@ def _build_report(config: dict[str, Any], parsed: dict[str, Any]) -> dict[str, A
         )
 
     container_details = _container_report(container, parsed, findings)
+    downstream_details = _downstream_report(config, parsed, findings)
     errors = sum(item["severity"] == "error" for item in findings)
     warnings = sum(item["severity"] == "warning" for item in findings)
     overall = "fail" if errors else "warning" if warnings else "pass"
@@ -529,6 +556,7 @@ def _build_report(config: dict[str, Any], parsed: dict[str, Any]) -> dict[str, A
             "commands": scheduler_commands,
         },
         "container": container_details,
+        "downstream": downstream_details,
         "tools": tools,
         "references": references,
         "workdir_access": {
@@ -614,6 +642,28 @@ def _container_report(
         "engine_available": engine_available,
         "image_state": image_state,
         "bind_paths_count": len(container.get("bind_paths", [])),
+    }
+
+
+def _downstream_report(
+    config: dict[str, Any],
+    parsed: dict[str, Any],
+    findings: list[dict[str, str]],
+) -> dict[str, Any]:
+    downstream = config.get("downstream", {})
+    if not downstream.get("enabled", False):
+        return {"enabled": False}
+    state = str(parsed.get("reference", {}).get("downstream_runtime_image", "not_reported"))
+    packages = str(parsed.get("downstream", {}).get("r_packages", "not_reported"))
+    if state != "readable":
+        findings.append({"severity": "error", "code": "downstream_runtime_image_unreadable", "message": "Downstream Apptainer image is not readable."})
+    if packages != "available":
+        findings.append({"severity": "error", "code": "downstream_r_packages_unavailable", "message": "Downstream R/Bioconductor runtime does not provide the required packages."})
+    return {
+        "enabled": True,
+        "environment_kind": downstream.get("runtime", {}).get("environment_kind", ""),
+        "image_state": state,
+        "required_packages": packages,
     }
 
 

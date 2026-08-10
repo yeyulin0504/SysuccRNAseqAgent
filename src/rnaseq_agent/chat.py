@@ -26,6 +26,8 @@ from .llm import (
     OpenAICompatibleClient,
     load_llm_client_from_env,
 )
+from .llm_policy import AgentStep, ConfigPatch, apply_proposals
+from .llm_submission import inspect_llm_submission, submit_llm_contract
 from .storage import load_defaults, save_defaults
 
 
@@ -37,12 +39,14 @@ class ChatSession:
     ) -> None:
         self.output_dir = output_dir
         self.current_config_path: Path | None = None
+        self.pending_proposals: tuple[ConfigPatch, ...] = ()
+        self.pending_config: dict[str, Any] | None = None
         self.llm = llm if llm is not None else load_llm_client_from_env()
 
     def run(self) -> Path:
         self.say("你好，我是 SYSU RNA-seq Agent。")
         self.say("我现在支持项目会话：先新建或打开项目，再继续校验、运行、查状态、生成报告和查看结果解释。")
-        self.say("可用命令：new, open <path>, validate, run, run-nowait, status, report, explain, summary, where, help, quit")
+        self.say("可用命令：new, open <path>, validate, run, run-nowait, status, report, explain, summary, where, proposal, apply proposal, save proposal, discard proposal, help, quit")
         if self.llm is None:
             self.say("模型状态：未配置，当前使用本地规则路由。")
         else:
@@ -66,6 +70,19 @@ class ChatSession:
 
     def dispatch_command(self, command: str) -> bool:
         lower = command.lower().strip()
+        if lower in {"proposal", "review proposal", "查看建议", "查看配置建议"}:
+            self.show_pending_proposals()
+            return True
+        if lower in {"discard proposal", "discard", "丢弃建议", "取消建议"}:
+            self.pending_proposals = ()
+            self.say("已丢弃待审阅的配置建议。")
+            return True
+        if lower in {"apply proposal", "apply", "应用建议", "应用配置建议"}:
+            self.apply_pending_proposals()
+            return True
+        if lower in {"save proposal", "保存建议", "保存配置建议"}:
+            self.save_pending_config()
+            return True
         if lower in {"quit", "exit", "退出"}:
             self.say("已退出。")
             raise SystemExit(0)
@@ -116,10 +133,17 @@ class ChatSession:
     def dispatch_llm_command(self, command: str) -> bool:
         if self.llm is None:
             return False
+        config: dict[str, Any] | None = None
+        if self.current_config_path is not None:
+            try:
+                config = load_project_config(self.current_config_path)
+            except Exception:
+                config = None
         try:
             decision = self.llm.decide(
                 command,
                 has_project=self.current_config_path is not None,
+                config=config,
             )
         except LLMError as exc:
             self.say(f"模型理解失败，已停止本次动作：{exc}")
@@ -127,51 +151,133 @@ class ChatSession:
         return self.execute_llm_decision(decision)
 
     def execute_llm_decision(self, decision: LLMDecision) -> bool:
-        action = decision.action
-        if action == "chat":
-            self.say(decision.message or "我可以帮助你新建、校验、运行项目，查看状态或生成报告。")
+        if decision.action == "answer":
+            self.say(decision.message or "我可以解释当前 RNA-seq 工作流与结果，但不会代替你执行操作。")
             return True
-        if action == "open":
-            self.open_project(decision.path)
+        if decision.action == "config_patch_proposal":
+            self.pending_proposals = decision.proposals
+            self.say(decision.message or "这里是一份待审阅的配置建议。")
+            self.show_pending_proposals()
+            self.say("输入 apply proposal 可仅在内存中应用；输入 discard proposal 可丢弃。保存仍需使用明确的保存操作。")
             return True
-        if action == "new":
-            self.create_project()
+        if decision.action == "agent_plan":
+            self.execute_agent_plan(decision)
             return True
-        if action == "validate":
+        if decision.action == "contract_submission_request":
+            self.submit_llm_contract_request(decision.message)
+            return True
+        self.say("模型响应不符合受限策略，未执行任何操作。")
+        return True
+
+    def execute_agent_plan(self, decision: LLMDecision) -> None:
+        if not decision.steps:
+            self.say("模型响应不符合受限策略，未执行任何操作。")
+            return
+        if self.require_current_project() is None:
+            return
+        self.say(decision.message or "将按本地受限步骤执行；远程操作仍需你确认。")
+        for step in decision.steps:
+            if not self.execute_agent_step(step):
+                return
+
+    def execute_agent_step(self, step: AgentStep) -> bool:
+        if step.kind == "validate":
             self.validate_current_project()
             return True
-        if action in {"run", "run-nowait"}:
-            if not self.ask_yes_no(
-                "模型识别到运行请求，是否确认执行当前项目？",
-                default=False,
-                help_text="运行会上传数据并在远程服务器提交任务。",
-            ):
-                self.say("已取消运行。")
-                return True
-            self.run_current_project(wait=action == "run")
-            return True
-        if action == "status":
-            self.show_current_status()
-            return True
-        if action == "report":
-            self.generate_current_report()
-            return True
-        if action == "explain":
-            self.explain_current_results()
-            return True
-        if action == "summary":
+        if step.kind == "summary":
             self.show_current_summary()
             return True
-        if action == "where":
-            self.show_current_location()
+        if step.kind == "report":
+            self.generate_current_report()
             return True
-        if action == "help":
-            self.show_help()
-            return True
-        if action == "quit":
-            self.say("已退出。")
-            raise SystemExit(0)
+        if step.kind == "status":
+            return self.show_current_status()
+        if step.kind == "run":
+            return self.run_current_project(wait=step.wait)
+        if step.kind == "contract_submission":
+            return self.submit_llm_contract_request("")
+        self.say("模型响应不符合受限策略，未执行任何操作。")
         return False
+
+    def submit_llm_contract_request(self, message: str) -> bool:
+        config_path = self.require_current_project()
+        if config_path is None:
+            return False
+        try:
+            preview = inspect_llm_submission(config_path)
+        except Exception as exc:
+            self.say(f"当前保存项目不能通过模型通道提交：{exc}")
+            return False
+        self.say(message or "模型请求提交当前绑定的分析合同。")
+        self.say(f"已在本地验证当前合同：{preview.contract_id}")
+        if not self.ask_yes_no(
+            f"是否确认提交已验证合同 {preview.contract_id}？",
+            default=False,
+            help_text=(
+                "此操作会连接服务器、上传 FASTQ、创建或更新远程文件，并提交调度任务。"
+                "模型不能重试同一合同。"
+            ),
+        ):
+            self.say("已取消合同提交。")
+            return False
+        try:
+            outcome = submit_llm_contract(config_path)
+        except Exception as exc:
+            self.say(f"合同提交失败：{exc}")
+            return False
+        self.say(outcome.message)
+        self.say(f"项目目录：{outcome.project_dir}")
+        return True
+
+    def show_pending_proposals(self) -> None:
+        if not self.pending_proposals:
+            self.say("当前没有待审阅的配置建议。")
+            return
+        for patch in self.pending_proposals:
+            reason = f"（{patch.reason}）" if patch.reason else ""
+            self.say(f"- {patch.path}: {patch.value!r} {reason}")
+
+    def apply_pending_proposals(self) -> None:
+        if not self.pending_proposals:
+            self.say("当前没有待审阅的配置建议。")
+            return
+        if self.current_config_path is None:
+            self.say("请先通过直接命令新建或打开项目；模型建议不会新建项目。")
+            return
+        if not self.ask_yes_no("是否仅在当前会话内应用这些配置建议？", default=False):
+            self.say("已取消应用建议。")
+            return
+        try:
+            config = load_project_config(self.current_config_path)
+            self.pending_config = apply_proposals(config, self.pending_proposals)
+        except Exception as exc:
+            self.say(f"无法在内存中应用配置建议：{exc}")
+            return
+        self.pending_proposals = ()
+        self.say("配置建议已应用到当前会话内存，尚未写入 project.json。")
+
+    def save_pending_config(self) -> None:
+        if self.pending_config is None:
+            self.say("当前没有已应用且待保存的配置建议。")
+            return
+        config_path = self.require_current_project()
+        if config_path is None:
+            return
+        if not self.ask_yes_no(
+            "是否将当前会话内的配置建议写入 project.json？",
+            default=False,
+            help_text="保存会覆盖当前项目配置，但不会连接服务器或提交任务。",
+        ):
+            self.say("已取消保存建议。")
+            return
+        try:
+            saved_path, _, _ = save_project_config(self.output_dir, self.pending_config)
+        except Exception as exc:
+            self.say(f"保存配置建议失败：{exc}")
+            return
+        self.current_config_path = saved_path
+        self.pending_config = None
+        self.say(f"配置建议已保存：{saved_path}")
 
     def create_project(self) -> Path:
         self.say("")
@@ -242,29 +348,46 @@ class ChatSession:
             return
         self._show_validation_result(config_path)
 
-    def run_current_project(self, *, wait: bool) -> None:
+    def run_current_project(self, *, wait: bool) -> bool:
         config_path = self.require_current_project()
         if config_path is None:
-            return
+            return False
+        mode = "上传 FASTQ 并提交远程分析任务" if wait else "上传 FASTQ 并提交远程分析任务后返回"
+        if not self.ask_yes_no(
+            f"是否确认{mode}？",
+            default=False,
+            help_text="此操作会连接服务器、创建或更新远程文件，并可能占用调度器计算资源。",
+        ):
+            self.say("已取消运行。")
+            return False
         try:
             outcome = run_project_action(config_path, wait=wait)
         except Exception as exc:
             self.say(f"运行失败：{exc}")
-            return
+            return False
         self.say(outcome.message)
         self.say(f"项目目录：{outcome.project_dir}")
+        return True
 
-    def show_current_status(self) -> None:
+    def show_current_status(self) -> bool:
         config_path = self.require_current_project()
         if config_path is None:
-            return
+            return False
+        if not self.ask_yes_no(
+            "是否连接服务器刷新当前项目状态？",
+            default=False,
+            help_text="此操作会通过 SSH 查询远程调度器和项目状态。",
+        ):
+            self.say("已取消刷新状态。")
+            return False
         try:
             status = refresh_project_status_action(config_path)
         except Exception as exc:
             self.say(f"刷新状态失败：{exc}")
-            return
+            return False
         for line in status_summary(status):
             self.say(line)
+        return True
 
     def generate_current_report(self) -> None:
         config_path = self.require_current_project()
@@ -328,6 +451,9 @@ class ChatSession:
         self.say("- where / 项目路径：显示当前绑定的 project.json 路径")
         self.say("- model / 模型状态：显示当前模型连接状态")
         self.say("- help / 帮助：显示帮助")
+        self.say("- apply proposal / 应用建议：仅在会话内应用待审阅的配置建议")
+        self.say("- save proposal / 保存建议：将已应用的建议写入当前项目")
+        self.say("- discard proposal / 丢弃建议：丢弃待审阅的配置建议")
         self.say("- quit / 退出：退出")
 
     def show_model_status(self) -> None:
@@ -338,7 +464,7 @@ class ChatSession:
         self.say(f"模型：{self.llm.model}")
         self.say(f"Base URL：{self.llm.base_url}")
         self.say(f"接口类型：{self.llm.resolved_api_mode}")
-        self.say("执行策略：模型只选择白名单动作，不直接生成或运行 shell 命令。")
+        self.say("执行策略：模型只能解释 RNA-seq 内容或提出待审阅的配置建议，不能执行操作。")
 
     def _show_validation_result(self, config_path: Path) -> None:
         try:

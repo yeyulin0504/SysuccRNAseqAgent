@@ -1,6 +1,6 @@
 [project]
 name = "sysu-rnaseq-agent"
-version = "0.2.0"
+version = "0.3.3"
 description = "Interactive RNA-seq analysis agent for local orchestration and remote server execution."
 requires-python = ">=3.11"
 dependencies = [

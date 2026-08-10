@@ -3,13 +3,13 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .defaults import DEFAULT_CONTAINER, DEFAULT_PIPELINE, DEFAULT_REFERENCE
+from .defaults import DEFAULT_CONTAINER, DEFAULT_DOWNSTREAM, DEFAULT_PIPELINE
 
 
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(config)
 
-    reference = {**DEFAULT_REFERENCE, **normalized.get("reference", {})}
+    reference = dict(normalized.get("reference", {}))
     normalized["reference"] = reference
 
     server = normalized.setdefault("server", {})
@@ -38,6 +38,28 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("notification", {"email_enabled": False})
     normalized.setdefault("sequencing", {"layout": "paired", "strandedness": "auto"})
     normalized.setdefault("samples", {"items": []})
+
+    downstream = deepcopy(DEFAULT_DOWNSTREAM)
+    downstream.update(normalized.get("downstream", {}))
+    for key in (
+        "input",
+        "metadata_input",
+        "metadata",
+        "design",
+        "filtering",
+        "differential_expression",
+        "enrichment",
+        "runtime",
+    ):
+        downstream[key] = {
+            **DEFAULT_DOWNSTREAM[key],
+            **dict(downstream.get(key, {})),
+        }
+    downstream["enrichment"]["gmt"] = {
+        **DEFAULT_DOWNSTREAM["enrichment"]["gmt"],
+        **dict(downstream["enrichment"].get("gmt", {})),
+    }
+    normalized["downstream"] = downstream
 
     execution = normalized.setdefault("execution", {})
     execution.setdefault("mode", "free")

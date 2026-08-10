@@ -13,21 +13,20 @@ from pathlib import Path
 from typing import Any
 
 
-ALLOWED_ACTIONS = {
-    "new",
-    "open",
-    "validate",
-    "run",
-    "run-nowait",
-    "status",
-    "report",
-    "explain",
-    "summary",
-    "where",
-    "help",
-    "quit",
-    "chat",
-}
+from .llm_policy import (
+    AgentStep,
+    ConfigPatch,
+    MAX_MESSAGE_LENGTH,
+    OnboardingPatch,
+    build_llm_context,
+    build_onboarding_context,
+    validate_agent_plan,
+    validate_onboarding_proposals,
+    validate_proposals,
+)
+
+
+ALLOWED_ACTIONS = {"answer", "config_patch_proposal", "contract_submission_request", "agent_plan"}
 API_MODES = {"auto", "chat_completions", "responses"}
 LLM_BACKENDS = {"api", "codex_cli"}
 
@@ -36,7 +35,14 @@ LLM_BACKENDS = {"api", "codex_cli"}
 class LLMDecision:
     action: str
     message: str = ""
-    path: str = ""
+    proposals: tuple[ConfigPatch, ...] = ()
+    steps: tuple[AgentStep, ...] = ()
+
+
+@dataclass(frozen=True)
+class OnboardingDecision:
+    message: str
+    proposals: tuple[OnboardingPatch, ...]
 
 
 class LLMError(RuntimeError):
@@ -115,13 +121,23 @@ class OpenAICompatibleClient:
             raise LLMError("模型列表接口没有返回可用模型。")
         return sorted(model_ids, key=str.casefold)
 
-    def decide(self, user_text: str, *, has_project: bool) -> LLMDecision:
+    def decide(
+        self,
+        user_text: str,
+        *,
+        has_project: bool,
+        config: dict[str, Any] | None = None,
+    ) -> LLMDecision:
         system_prompt = _router_system_prompt(has_project)
+        model_input = json.dumps(
+            {"user_message": user_text, "context": build_llm_context(has_project=has_project, config=config)},
+            ensure_ascii=False,
+        )
         if self.resolved_api_mode == "responses":
             payload = {
                 "model": self.model,
                 "instructions": system_prompt,
-                "input": user_text,
+                "input": model_input,
                 "store": False,
             }
             response = self._post_json("/responses", payload)
@@ -132,7 +148,7 @@ class OpenAICompatibleClient:
                 "temperature": 0,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text},
+                    {"role": "user", "content": model_input},
                 ],
             }
             response = self._post_json("/chat/completions", payload)
@@ -141,6 +157,32 @@ class OpenAICompatibleClient:
             except (KeyError, IndexError, TypeError) as exc:
                 raise LLMError("模型响应缺少 choices[0].message.content。") from exc
         return parse_decision(content)
+
+    def decide_onboarding(self, user_text: str, *, current_field: str) -> OnboardingDecision:
+        system_prompt = _onboarding_system_prompt(current_field)
+        model_input = json.dumps(
+            {"user_message": user_text, "context": build_onboarding_context(current_field=current_field)},
+            ensure_ascii=False,
+        )
+        if self.resolved_api_mode == "responses":
+            response = self._post_json(
+                "/responses",
+                {"model": self.model, "instructions": system_prompt, "input": model_input, "store": False},
+            )
+            content = _extract_responses_text(response)
+        else:
+            response = self._post_json(
+                "/chat/completions",
+                {"model": self.model, "temperature": 0, "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": model_input},
+                ]},
+            )
+            try:
+                content = response["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise LLMError("模型响应缺少 choices[0].message.content。") from exc
+        return parse_onboarding_decision(content)
 
     def _get_json(self, endpoint: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -226,7 +268,13 @@ class CodexCLIClient:
         self.codex_home = codex_home or codex_home_path()
         self.timeout_seconds = timeout_seconds
 
-    def decide(self, user_text: str, *, has_project: bool) -> LLMDecision:
+    def decide(
+        self,
+        user_text: str,
+        *,
+        has_project: bool,
+        config: dict[str, Any] | None = None,
+    ) -> LLMDecision:
         if self.executable is None:
             raise LLMError("没有找到 Codex CLI。请先安装 Codex。")
         self.codex_home.mkdir(parents=True, exist_ok=True)
@@ -235,16 +283,33 @@ class CodexCLIClient:
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": sorted(ALLOWED_ACTIONS)},
-                "message": {"type": "string"},
-                "path": {"type": "string"},
+                "message": {"type": "string", "maxLength": MAX_MESSAGE_LENGTH},
+                "proposals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": ["replace"]},
+                            "path": {"type": "string"},
+                            "value": {},
+                            "reason": {"type": "string", "maxLength": 400},
+                        },
+                        "required": ["op", "path", "value"],
+                        "additionalProperties": False,
+                    },
+                },
             },
-            "required": ["action", "message", "path"],
+            "required": ["action", "message"],
             "additionalProperties": False,
         }
+        model_input = json.dumps(
+            {"user_message": user_text, "context": build_llm_context(has_project=has_project, config=config)},
+            ensure_ascii=False,
+        )
         prompt = (
             f"{_router_system_prompt(has_project)}\n"
             "Do not call tools, inspect files, or run commands. Answer immediately.\n"
-            f"User input: {user_text}"
+            f"Sanitized user input and context: {model_input}"
         )
 
         with tempfile.TemporaryDirectory(prefix="rnaseq-agent-codex-") as temp_name:
@@ -414,17 +479,39 @@ def load_llm_client_from_env() -> OpenAICompatibleClient | CodexCLIClient | None
 
 def _router_system_prompt(has_project: bool) -> str:
     return (
-        "You are the intent router for a controlled RNA-seq analysis agent. "
-        "Choose exactly one action from: new, open, validate, run, run-nowait, "
-        "status, report, explain, summary, where, help, quit, chat. "
-        "Never produce shell commands and never invent file paths. "
-        "Use chat for general RNA-seq questions or when no safe action is appropriate. "
-        "For chat, put a concise, cautious Chinese answer in message. Clearly distinguish "
-        "artifact explanation from biological or clinical conclusions. "
-        "If the user asks to open a project, copy the explicit project.json path "
-        "into path; otherwise leave path empty. "
-        "Return only JSON with keys action, message, path. "
+        "You are a restricted RNA-seq analysis assistant. Return exactly one JSON response "
+        "with action set to answer, config_patch_proposal, contract_submission_request, or agent_plan. You have no authority to "
+        "open files, save configuration, validate inputs, contact servers, upload data, "
+        "submit or poll jobs, create reports, send notifications, or exit the application. "
+        "Never generate commands, paths, or instructions that the application should execute. "
+        "For answer, provide a concise, cautious Chinese explanation and no proposals. "
+        "For config_patch_proposal, provide a Chinese explanation and only review-only "
+        "replace proposals for the allowed fields exposed in the response schema. "
+        "For contract_submission_request, request only review and local confirmation of the "
+        "currently bound saved project; do not include proposals, paths, contract IDs, commands, "
+        "server details, credentials, or execution parameters. "
+        "For agent_plan, return only a nonempty steps array of no more than six fixed local step objects: "
+        "{kind: validate}, {kind: summary}, {kind: report}, {kind: status}, "
+        "{kind: run, wait: true|false}, or {kind: contract_submission}. "
+        "The application validates and executes approved steps locally; status, run, and contract_submission "
+        "always require local user confirmation. Never include commands, paths, hosts, remote directories, "
+        "credentials, scheduler parameters, arbitrary arguments, or proposals in an agent_plan. "
+        "Clearly distinguish artifact explanation from biological or clinical conclusions. "
+        "Return only JSON with action, message, and the action-specific proposals or steps field. "
         f"A project is currently bound: {has_project}."
+    )
+
+
+def _onboarding_system_prompt(current_field: str) -> str:
+    return (
+        "You extract one safe GUI form-fill proposal from a Chinese RNA-seq onboarding reply. "
+        "Return only JSON with message and proposals. You cannot save, validate, inspect files, "
+        "contact servers, upload data, run commands, submit jobs, or trigger any external action. "
+        "Never request, repeat, or return passwords, API keys, private keys, FASTQ names, sample IDs, "
+        "paths other than the one allowed GUI field, or any commands. "
+        f"The only allowed proposal field is {current_field!r}. "
+        "If the reply does not clearly provide that value, return an empty proposals array and ask one "
+        "short Chinese clarification. Otherwise return exactly one proposal with field, value, and reason."
     )
 
 
@@ -489,6 +576,30 @@ def _friendly_api_error(status_code: int, detail: str) -> str:
     return message[:300] or detail[:300]
 
 
+
+def parse_onboarding_decision(content: str) -> OnboardingDecision:
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()[1:]
+        if lines and lines[-1].strip() == "```":
+            lines.pop()
+        text = "\n".join(lines).strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise LLMError("模型没有返回合法的引导填写 JSON。") from exc
+    if not isinstance(payload, dict) or set(payload) != {"message", "proposals"}:
+        raise LLMError("引导填写响应必须只包含 message 和 proposals。")
+    message = payload.get("message")
+    if not isinstance(message, str) or len(message) > MAX_MESSAGE_LENGTH:
+        raise LLMError("引导填写消息格式不正确。")
+    try:
+        proposals = validate_onboarding_proposals(payload["proposals"]) if payload["proposals"] else ()
+    except (KeyError, ValueError) as exc:
+        raise LLMError(f"引导填写建议不符合本地策略：{exc}") from exc
+    return OnboardingDecision(message=message.strip(), proposals=proposals)
+
+
 def parse_decision(content: str) -> LLMDecision:
     text = content.strip()
     if text.startswith("```"):
@@ -501,15 +612,40 @@ def parse_decision(content: str) -> LLMDecision:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise LLMError("模型没有返回合法的动作 JSON。") from exc
-    if not isinstance(payload, dict):
-        raise LLMError("模型动作响应必须是 JSON 对象。")
+        raise LLMError("模型没有返回合法的受限响应 JSON。") from exc
+    if not isinstance(payload, dict) or set(payload) - {"action", "message", "proposals", "steps"}:
+        raise LLMError("模型响应必须使用受限的 JSON 结构。")
 
-    action = str(payload.get("action", "chat")).strip().lower()
-    if action not in ALLOWED_ACTIONS:
-        action = "chat"
+    action = payload.get("action")
+    message = payload.get("message")
+    if action not in ALLOWED_ACTIONS or not isinstance(message, str):
+        raise LLMError("模型响应包含不允许的动作或消息。")
+    if len(message) > MAX_MESSAGE_LENGTH:
+        raise LLMError("模型消息过长。")
+    if action == "agent_plan":
+        if set(payload) != {"action", "message", "steps"}:
+            raise LLMError("Agent 计划只能包含消息和受限步骤。")
+        try:
+            steps = validate_agent_plan(payload["steps"])
+        except (KeyError, ValueError) as exc:
+            raise LLMError(f"Agent 计划不符合本地策略：{exc}") from exc
+        return LLMDecision(action=action, message=message.strip(), steps=steps)
+    if action == "contract_submission_request":
+        if set(payload) != {"action", "message"}:
+            raise LLMError("合同提交请求必须是不带参数的受限意图。")
+        return LLMDecision(action=action, message=message.strip())
+
+    proposals = payload.get("proposals", [])
+    if action == "answer":
+        if proposals not in ([], None):
+            raise LLMError("解释性响应不能包含配置建议。")
+        return LLMDecision(action="answer", message=message.strip())
+    try:
+        validated = validate_proposals(proposals)
+    except ValueError as exc:
+        raise LLMError(f"模型配置建议不符合本地策略：{exc}") from exc
     return LLMDecision(
-        action=action,
-        message=str(payload.get("message", "")).strip(),
-        path=str(payload.get("path", "")).strip(),
+        action="config_patch_proposal",
+        message=message.strip(),
+        proposals=validated,
     )

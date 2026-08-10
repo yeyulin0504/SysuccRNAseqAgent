@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .container import container_errors
+from .downstream import downstream_errors
+from .downstream_inputs import StandaloneInputError, inspect_standalone_inputs
 from .safety import identifier_error, relative_filename_error
 
 
@@ -17,11 +19,31 @@ class ValidationResult:
     errors: list[str]
 
 
+def validate_standalone_downstream_inputs(
+    config: dict[str, Any],
+    *,
+    check_runtime: bool = True,
+) -> ValidationResult:
+    """Validate standalone count-matrix inputs without entering FASTQ validation."""
+    errors: list[str] = []
+    try:
+        inspect_standalone_inputs(config)
+    except (OSError, StandaloneInputError) as exc:
+        errors.append(str(exc))
+    errors.extend(downstream_errors(config))
+    if check_runtime:
+        errors.extend(container_errors(config))
+    return ValidationResult(ok=not errors, checked_files=0, missing_files=[], errors=errors)
+
+
 def validate_local_fastqs(
     config: dict[str, Any],
     *,
     check_pipeline: bool = True,
 ) -> ValidationResult:
+    if config.get("downstream", {}).get("enabled", False) and config.get("downstream", {}).get("source_mode") == "standalone_count_matrix":
+        return validate_standalone_downstream_inputs(config, check_runtime=check_pipeline)
+
     samples = config["samples"]
     local_data_dir = Path(samples["local_data_dir"])
     resolved_data_dir = local_data_dir.resolve()
@@ -269,7 +291,27 @@ def _pipeline_errors(config: dict[str, Any]) -> list[str]:
         required_reference_keys.append("rsem_index_prefix")
 
     for key in required_reference_keys:
-        if not reference.get(key):
+        value = reference.get(key)
+        if not value:
             errors.append(f"Missing required reference setting: {key}")
+        elif not _safe_remote_reference_path(str(value)):
+            errors.append(f"Unsafe remote reference setting: {key}")
 
+    index_state = reference.get("index_state", "existing_confirmed")
+    if required_reference_keys and index_state not in {"existing_confirmed", "existing_preflight_passed"}:
+        errors.append("Reference indexes are not confirmed for execution.")
+
+    errors.extend(downstream_errors(config))
     return errors
+
+
+def _safe_remote_reference_path(value: str) -> bool:
+    return (
+        value.startswith("/")
+        and "\x00" not in value
+        and "\n" not in value
+        and "\r" not in value
+        and not any(character in value for character in ";|&`$")
+        and "/../" not in value
+        and not value.endswith("/..")
+    )

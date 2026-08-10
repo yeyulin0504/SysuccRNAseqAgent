@@ -67,7 +67,7 @@ def create_result_manifest(
 
 def _artifact_category(relative_path: str) -> str:
     top_level = relative_path.split("/", 1)[0]
-    if top_level in {"fastp", "star", "arriba", "featurecounts", "rsem"}:
+    if top_level in {"fastp", "star", "arriba", "featurecounts", "rsem", "downstream"}:
         return "scientific"
     return "audit"
 
@@ -122,6 +122,27 @@ def _validate_required_outputs(config: dict[str, Any], root: Path) -> list[str]:
                 ("featurecounts/gene_counts.txt.summary", False),
             ]
         )
+
+    if config.get("downstream", {}).get("enabled", False):
+        expected.extend(
+            [
+                ("downstream/summary.json", False),
+                ("downstream/count_filter_audit.csv", False),
+                ("downstream/id_mapping_audit.csv", False),
+                ("downstream/vst_counts.csv", False),
+                ("downstream/qc/pca.csv", False),
+                ("downstream/session_info.txt", False),
+            ]
+        )
+        for contrast in config["downstream"].get("contrasts", []):
+            contrast_id = str(contrast.get("id", "")).strip()
+            if contrast_id:
+                expected.extend(
+                    [
+                        (f"downstream/de/{contrast_id}_results.csv", False),
+                        (f"downstream/de/{contrast_id}_deg.csv", False),
+                    ]
+                )
 
     errors: list[str] = []
     for relative_path, allow_empty in expected:

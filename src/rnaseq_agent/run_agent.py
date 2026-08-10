@@ -23,15 +23,22 @@ from .analysis_contract import (
     sha256_file,
 )
 from .configuration import normalize_config
+from .downstream_artifacts import downstream_gmt_source, downstream_script_artifacts
+from .downstream_inputs import StandaloneInputError, standalone_input_paths
 from .emailer import send_completion_email
 from .execution import CommandResult
-from .pipeline import render_env_setup_script, render_remote_pipeline_script, render_submit_script
+from .pipeline import (
+    render_env_setup_script,
+    render_remote_downstream_script,
+    render_remote_pipeline_script,
+    render_submit_script,
+)
 from .remote import collect_local_fastq_paths
 from .remote_transport import RemoteTransport, create_remote_transport
 from .result_manifest import ResultManifestSummary, create_result_manifest
 from .shell import shell_quote
 from .storage import append_jsonl, load_json, save_json
-from .validation import validate_local_fastqs
+from .validation import validate_local_fastqs, validate_standalone_downstream_inputs
 
 
 @dataclass(frozen=True)
@@ -93,8 +100,34 @@ def upload_project_fastqs(config_path: Path) -> RunOutcome:
         raise
 
 
+def run_standalone_downstream_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
+    """Submit an isolated downstream-only run from an approved count matrix."""
+    config = normalize_config(load_json(config_path))
+    downstream = config.get("downstream", {})
+    if not (
+        downstream.get("enabled", False)
+        and downstream.get("source_mode") == "standalone_count_matrix"
+    ):
+        raise ValueError("run_standalone_downstream_project requires standalone_count_matrix downstream mode.")
+    return _run_project_attempt(config_path, config, wait=wait, standalone=True)
+
+
 def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
     config = normalize_config(load_json(config_path))
+    if _is_standalone_downstream(config):
+        return run_standalone_downstream_project(config_path, wait=wait)
+    return _run_project_attempt(config_path, config, wait=wait, standalone=False)
+
+
+def _run_project_attempt(
+    config_path: Path,
+    config: dict[str, Any],
+    *,
+    wait: bool,
+    standalone: bool,
+) -> RunOutcome:
+    if standalone != _is_standalone_downstream(config):
+        raise ValueError("Standalone execution mode does not match the project configuration.")
     save_json(config_path, config)
     project_dir = config_path.parent
     run_id = _new_run_id()
@@ -128,14 +161,19 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
         },
     )
     try:
-        validation = validate_local_fastqs(run_config)
+        validation = (
+            validate_standalone_downstream_inputs(run_config)
+            if standalone
+            else validate_local_fastqs(run_config)
+        )
         if not validation.ok:
             parts = []
             if validation.missing_files:
                 parts.append(f"{len(validation.missing_files)} files missing")
             if validation.errors:
                 parts.append("; ".join(validation.errors))
-            message = "Local FASTQ validation failed: " + ", ".join(parts)
+            input_label = "standalone count-matrix" if standalone else "FASTQ"
+            message = f"Local {input_label} validation failed: " + ", ".join(parts)
             _update_status(config_path, "validation_failed", message)
             _log_event(
                 logs_dir,
@@ -147,7 +185,7 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
             )
             raise RuntimeError(message)
 
-        _update_status(config_path, "validated", "Local FASTQ validation passed.")
+        _update_status(config_path, "validated", "Local input validation passed.")
         try:
             policy = enforce_execution_policy(config_path, config)
         except ContractError as exc:
@@ -160,9 +198,18 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
         )
         save_json(snapshot_path, run_config)
         _log_event(logs_dir, "execution_policy_verified", {"run_id": run_id, **policy})
+        staged_standalone_inputs = (
+            _stage_standalone_inputs(config, attempt_dir)
+            if standalone
+            else None
+        )
         transport = create_remote_transport(run_config)
-        _upload_fastqs(run_config, logs_dir, transport)
-        _update_status(config_path, "uploaded", "Local FASTQ files uploaded to the server.")
+        if staged_standalone_inputs is not None:
+            _upload_standalone_inputs(run_config, staged_standalone_inputs, logs_dir, transport)
+            _update_status(config_path, "uploaded", "Standalone count matrix and metadata uploaded to the server.")
+        else:
+            _upload_fastqs(run_config, logs_dir, transport)
+            _update_status(config_path, "uploaded", "Local FASTQ files uploaded to the server.")
 
         remote_scripts = _prepare_remote_scripts(run_config, config_path, attempt_dir, logs_dir)
         manifest_path = _write_run_manifest(
@@ -260,6 +307,58 @@ def refresh_status(config_path: Path) -> dict[str, Any]:
     return normalize_config(load_json(config_path)).get("status", {})
 
 
+def _is_standalone_downstream(config: dict[str, Any]) -> bool:
+    downstream = config.get("downstream", {})
+    return (
+        downstream.get("enabled", False)
+        and downstream.get("source_mode") == "standalone_count_matrix"
+    )
+
+
+def _stage_standalone_inputs(config: dict[str, Any], attempt_dir: Path) -> list[Path]:
+    """Copy and rehash the two approved standalone input artifacts locally."""
+    try:
+        count_source, metadata_source = standalone_input_paths(config)
+    except (OSError, StandaloneInputError) as exc:
+        raise RuntimeError(f"Standalone downstream inputs are invalid: {exc}") from exc
+    expected = {item["role"]: item["sha256"] for item in build_input_artifacts(config)}
+    sources = (
+        ("downstream_counts", count_source, attempt_dir / "inputs" / "counts.tsv"),
+        ("downstream_metadata", metadata_source, attempt_dir / "inputs" / "metadata.tsv"),
+    )
+    staged_paths: list[Path] = []
+    for role, source, destination in sources:
+        if sha256_file(source) != expected.get(role):
+            raise RuntimeError(f"Standalone {role} changed after validation; create a new approved run.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copyfile(source, destination)
+        if sha256_file(destination) != expected[role]:
+            raise RuntimeError(f"Staged standalone {role} does not match its approved SHA-256 digest.")
+        staged_paths.append(destination)
+    return staged_paths
+
+
+def _upload_standalone_inputs(
+    config: dict[str, Any],
+    paths: list[Path],
+    logs_dir: Path,
+    transport: RemoteTransport,
+) -> None:
+    remote_workdir = config["server"]["remote_workdir"].rstrip("/")
+    remote_inputs = f"{remote_workdir}/inputs"
+    result = transport.execute(
+        f"umask 077 && mkdir -p {shell_quote(remote_inputs)} && "
+        f"chmod 700 {shell_quote(remote_workdir)} {shell_quote(remote_inputs)}"
+    )
+    _log_command(logs_dir, "Create remote standalone input directory", result)
+    _raise_for_remote_result(result)
+    result = transport.upload(paths, remote_inputs)
+    _log_command(logs_dir, "Upload standalone count matrix and metadata", result)
+    _raise_for_remote_result(result)
+    uploaded = " ".join(shell_quote(f"{remote_inputs}/{path.name}") for path in paths)
+    result = transport.execute(f"chmod 600 {uploaded}")
+    _log_command(logs_dir, "Restrict standalone input permissions", result)
+    _raise_for_remote_result(result)
 def _upload_fastqs(
     config: dict[str, Any],
     logs_dir: Path,
@@ -284,6 +383,15 @@ def _upload_fastqs(
             _log_command(logs_dir, "Restrict uploaded FASTQ permissions", result)
 
 
+def _raise_for_remote_result(result: CommandResult) -> None:
+    if result.returncode == 0:
+        return
+    raise RuntimeError(
+        f"Remote command failed with exit code {result.returncode}: "
+        f"{' '.join(result.command)}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+
+
 def _prepare_remote_scripts(
     config: dict[str, Any],
     config_path: Path,
@@ -296,8 +404,15 @@ def _prepare_remote_scripts(
     env_setup_script = scripts_dir / "env_setup.sh"
     env_setup_script.write_text(render_env_setup_script(config), encoding="utf-8", newline="\n")
 
-    run_script = scripts_dir / "run_pipeline.sh"
-    run_script.write_text(render_remote_pipeline_script(config), encoding="utf-8", newline="\n")
+    standalone = _is_standalone_downstream(config)
+    run_name = "run_downstream.sh" if standalone else "run_pipeline.sh"
+    run_content = (
+        render_remote_downstream_script(config)
+        if standalone
+        else render_remote_pipeline_script(config)
+    )
+    run_script = scripts_dir / run_name
+    run_script.write_text(run_content, encoding="utf-8", newline="\n")
 
     submit_name = "submit.sh"
     scheduler = config["server"]["scheduler"]
@@ -309,6 +424,20 @@ def _prepare_remote_scripts(
     submit_script.write_text(render_submit_script(config), encoding="utf-8", newline="\n")
 
     rendered_paths = [env_setup_script, run_script, submit_script]
+    for name, content in downstream_script_artifacts(config).items():
+        artifact_path = scripts_dir / name
+        artifact_path.write_text(content, encoding="utf-8", newline="\n")
+        rendered_paths.append(artifact_path)
+    if gmt_source := downstream_gmt_source(config):
+        source_path, source_filename = gmt_source
+        expected_sha256 = config["downstream"]["enrichment"]["gmt"]["sha256"]
+        if sha256_file(Path(source_path)) != expected_sha256:
+            raise RuntimeError("Downstream GMT changed after validation; review it and create a new approved run.")
+        staged_gmt = scripts_dir / source_filename
+        copyfile(source_path, staged_gmt)
+        if sha256_file(staged_gmt) != expected_sha256:
+            raise RuntimeError("Staged downstream GMT does not match its approved SHA-256 digest.")
+        rendered_paths.append(staged_gmt)
     if config.get("execution", {}).get("mode") == "contract":
         contract_source = project_contract_path(config_path, config)
         contract_copy = scripts_dir / "analysis_contract.json"
@@ -425,7 +554,7 @@ def _download_results(
     pack_cmd = (
         f"umask 077 && cd {shell_quote(remote_workdir)} && "
         "paths=(); "
-        "for d in scripts logs fastp star arriba featurecounts rsem status; do "
+        "for d in scripts logs fastp star arriba featurecounts rsem downstream status; do "
         'if [ -e "$d" ]; then paths+=("$d"); fi; '
         "done; "
         f"tar -czf {shell_quote(remote_tar)} \"${{paths[@]}}\""
