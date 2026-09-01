@@ -159,6 +159,83 @@ by the Codex client, so other desktop applications should use an independent
 API provider/key or a local model service.
 See `docs/model_setup.md` for details.
 
+## MVP: capability-aware auditable session (v0.3)
+
+The MVP introduces a conversational, auditable session layer on top of the
+existing execution engine. It implements the "讨论、确认、执行、回滚、继续"
+loop from the architecture design: the user and the agent agree on a draft,
+the plan is frozen into an immutable Analysis Contract, and every change is
+recorded as a ChangeSet with full config snapshots.
+
+### State machine
+
+```
+idle -> drafting -> planned -> confirmed -> executing -> completed | failed
+                 ^   |   ^   |   ^
+                 |   +---+   +---+  (edit / rollback record a ChangeSet
+                 +---------------+   and return to drafting)
+```
+
+- `drafting`: a project config exists but is not final. `edit` and `rollback`
+  are available; every change is appended to `changesets.jsonl` with the
+  `previous_config` / `new_config` snapshots and a sha256 fingerprint.
+- `planned`: `build_execution_plan()` materializes a deterministic step list.
+- `confirmed`: the plan is frozen into `analysis_contract.json`; `edit` is
+  rejected to preserve auditability. `rollback` returns to the pre-freeze
+  draft so parameters can be changed and re-confirmed.
+- `executing`: the plan is submitted through the existing execution gateway
+  (`run_agent.run_project`, local / slurm / pbs).
+
+### CLI
+
+```powershell
+$env:PYTHONPATH = "src"
+
+# List registered capabilities (Gate-A input contracts)
+python -m rnaseq_agent.mvp_cli caps
+
+# Create a project draft (prompts minimal questions)
+python -m rnaseq_agent.mvp_cli new
+
+# Resume / inspect
+python -m rnaseq_agent.mvp_cli open <project-dir>
+python -m rnaseq_agent.mvp_cli history --project-dir <project-dir>
+
+# The core loop
+python -m rnaseq_agent.mvp_cli plan     --project-dir <project-dir>
+python -m rnaseq_agent.mvp_cli confirm  --project-dir <project-dir>
+python -m rnaseq_agent.mvp_cli edit     --project-dir <project-dir>   # records ChangeSet, back to drafting
+python -m rnaseq_agent.mvp_cli rollback --project-dir <project-dir>   # stack-based undo of the last change
+python -m rnaseq_agent.mvp_cli run      --project-dir <project-dir>   # execute through the gateway
+python -m rnaseq_agent.mvp_cli status   --project-dir <project-dir>
+python -m rnaseq_agent.mvp_cli report   --project-dir <project-dir>
+```
+
+Default project directory is `runs/mvp_demo`; pass `--project-dir` to use
+another location.
+
+### Design contract
+
+- The LLM is never asked to produce shell commands. The CLI drives the same
+  `ProjectSession` state machine directly; tool execution happens only through
+  registered capabilities and the execution gateway.
+- Gate-A is a metadata-only suitability check: layout, sample count, design
+  (≤ 2 groups in this MVP), required sample fields, reference settings, and
+  file presence. A failing draft returns `NOT_EVALUABLE` so the session can
+  explain why the request cannot proceed.
+- `confirm` reuses the existing `create_project_contract` freeze mechanism:
+  the workflow / inputs / scripts sections are fingerprinted with sha256.
+
+### Audit trail
+
+Every project directory contains:
+
+- `project.json` — the current config snapshot.
+- `session.json` — session state (`state`, `capability_id`, serialized plan).
+- `changesets.jsonl` — append-only audit log. Each `changeset_applied` entry
+  stores the patch, the user note, and the full before/after config snapshots
+  with sha256 hashes, so any step can be reproduced or reverted.
+
 ## Agent vs Traditional Software
 
 This project has a GUI, but its core is still an agent-style workflow:
@@ -259,9 +336,12 @@ python -m rnaseq_agent run runs/<project_id>/project.json --no-wait
 
 ## Planned Next Steps
 
-1. Verify uploaded FASTQ checksums and lock remote reference/index checksums.
-2. Bind actual tool versions to the analysis contract or an Apptainer digest.
-3. Add semantic count-matrix/DEG consistency metrics beyond ERCC diagnostics
+1. Wire the LLM chat layer to the MVP session (`chat.py` currently routes to
+   the classic one-shot `run`; it should emit structured capability requests
+   that feed `ProjectSession` instead).
+2. Verify uploaded FASTQ checksums and lock remote reference/index checksums.
+3. Bind actual tool versions to the analysis contract or an Apptainer digest.
+4. Add semantic count-matrix/DEG consistency metrics beyond ERCC diagnostics
    and exact file hashes.
-4. Add scheduler accounting, resource-usage capture, and resumable steps.
-5. Add a native `claw` backend as an alternative to `ssh` and `scp`.
+5. Add scheduler accounting, resource-usage capture, and resumable steps.
+6. Add a native `claw` backend as an alternative to `ssh` and `scp`.
