@@ -1,0 +1,32 @@
+Bootstrap: docker
+From: mambaorg/micromamba:2.0.5
+
+%labels
+    Author SysuccRNAseqAgent
+    Description Controlled RNA-seq runtime for Apptainer HPC execution
+    Toolchain fastp=0.24.1 STAR=2.7.11b subread=2.1.1 rsem=1.2.28
+
+%post
+    micromamba install -y -n base -c conda-forge -c bioconda \
+        fastp=0.24.1 \
+        star=2.7.11b \
+        subread=2.1.1 \
+        rsem=1.2.28 \
+        samtools=1.20 \
+        multiqc=1.21 \
+        pigz=2.8
+    micromamba clean -a -y
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH=/opt/conda/bin:$PATH
+    export LC_ALL=C
+
+%runscript
+    exec "$@"
+
+%test
+    fastp --version
+    STAR --version
+    featureCounts -v
+    rsem-calculate-expression --version

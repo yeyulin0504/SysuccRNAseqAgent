@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "dataset_id": "griffith_hbr_uhr_ercc_chr22_3x3_v1",
+  "title": "UHR ERCC Mix1 vs HBR ERCC Mix2, three experimental replicates",
+  "organism": "Homo sapiens",
+  "data_classification": "public-human-derived-commercial-reference-rna",
+  "redistribution_note": "Keep downloaded reads under the gitignored runs directory; cite the source instead of republishing the archive.",
+  "layout": "paired",
+  "read_length": 101,
+  "strandedness": "reverse",
+  "design": {
+    "contrast_direction": "UHR_Mix1_over_HBR_Mix2",
+    "control": ["HBR_Rep1", "HBR_Rep2", "HBR_Rep3"],
+    "treatment": ["UHR_Rep1", "UHR_Rep2", "UHR_Rep3"],
+    "truth_scope": "ERCC spike-ins; endogenous chr22 genes do not have complete gold truth"
+  },
+  "provenance": {
+    "tutorial": "https://rnabio.org/module-01-inputs/0001/05/01/RNAseq_Data/",
+    "paper_doi": "10.1371/journal.pcbi.1004393",
+    "downloaded_source_last_modified": "2018-10-23",
+    "note": "Reads were prefiltered for chromosome 22. FASTQ names retain a Build37 label while the current tutorial provides a GRCh38 chr22+ERCC reference; mapping compatibility must be measured and reported."
+  },
+  "samples": [
+    {"sample_id": "HBR_Rep1", "condition": "HBR_Mix2", "fastq_1": "HBR_Rep1_ERCC-Mix2_Build37-ErccTranscripts-chr22.read1.fastq.gz", "fastq_2": "HBR_Rep1_ERCC-Mix2_Build37-ErccTranscripts-chr22.read2.fastq.gz"},
+    {"sample_id": "HBR_Rep2", "condition": "HBR_Mix2", "fastq_1": "HBR_Rep2_ERCC-Mix2_Build37-ErccTranscripts-chr22.read1.fastq.gz", "fastq_2": "HBR_Rep2_ERCC-Mix2_Build37-ErccTranscripts-chr22.read2.fastq.gz"},
+    {"sample_id": "HBR_Rep3", "condition": "HBR_Mix2", "fastq_1": "HBR_Rep3_ERCC-Mix2_Build37-ErccTranscripts-chr22.read1.fastq.gz", "fastq_2": "HBR_Rep3_ERCC-Mix2_Build37-ErccTranscripts-chr22.read2.fastq.gz"},
+    {"sample_id": "UHR_Rep1", "condition": "UHR_Mix1", "fastq_1": "UHR_Rep1_ERCC-Mix1_Build37-ErccTranscripts-chr22.read1.fastq.gz", "fastq_2": "UHR_Rep1_ERCC-Mix1_Build37-ErccTranscripts-chr22.read2.fastq.gz"},
+    {"sample_id": "UHR_Rep2", "condition": "UHR_Mix1", "fastq_1": "UHR_Rep2_ERCC-Mix1_Build37-ErccTranscripts-chr22.read1.fastq.gz", "fastq_2": "UHR_Rep2_ERCC-Mix1_Build37-ErccTranscripts-chr22.read2.fastq.gz"},
+    {"sample_id": "UHR_Rep3", "condition": "UHR_Mix1", "fastq_1": "UHR_Rep3_ERCC-Mix1_Build37-ErccTranscripts-chr22.read1.fastq.gz", "fastq_2": "UHR_Rep3_ERCC-Mix1_Build37-ErccTranscripts-chr22.read2.fastq.gz"}
+  ],
+  "files": [
+    {"path": "source/HBR_UHR_ERCC_ds_5pc.tar", "size_bytes": 116602880, "sha256": "8850392715718f5d12503b0f9e5b157199a4439df829b52a468ed1bf0ad84c27", "url": "https://genomedata.org/rnaseq-tutorial/HBR_UHR_ERCC_ds_5pc.tar"},
+    {"path": "source/chr22_with_ERCC92.fa", "size_bytes": 51751056, "sha256": "98acde4a57edaaba443206938ca1ebf8cf35bd2ea60548cccedf366ce3346296", "url": "https://genomedata.org/rnaseq-tutorial/fasta/GRCh38/chr22_with_ERCC92.fa"},
+    {"path": "source/chr22_with_ERCC92.gtf", "size_bytes": 30712117, "sha256": "f5ea9899f975a1bc2381994d1c429067e5b2ea1d73e5bcfabbb90bd81e49b5ff", "url": "https://genomedata.org/rnaseq-tutorial/annotations/GRCh38/chr22_with_ERCC92.gtf"},
+    {"path": "source/ERCC_Controls_Analysis.txt", "size_bytes": 4086, "sha256": "5151b394332477301851404d37b907cb6f27c9aaa2569e288531a839d6ca2b3b", "url": "https://genomedata.org/rnaseq-tutorial/ERCC_Controls_Analysis.txt"}
+  ],
+  "archive_members_root": "fastq",
+  "archive_members": [
+    {"path": "HBR_Rep1_ERCC-Mix2_Build37-ErccTranscripts-chr22.read1.fastq.gz", "size_bytes": 6612368, "sha256": "db87dc303bf4d9389be5d665d5998f202b70582ed7904a66286365b0cf00fda3"},
+    {"path": "HBR_Rep1_ERCC-Mix2_Build37-ErccTranscripts-chr22.read2.fastq.gz", "size_bytes": 6964773, "sha256": "076216029151099d96fe5e2bcc12d8c6528d4443ad1dfb35ec96cbeace4fa1ec"},
+    {"path": "HBR_Rep2_ERCC-Mix2_Build37-ErccTranscripts-chr22.read1.fastq.gz", "size_bytes": 8013417, "sha256": "09cfc1b40e75394989183d391e79ddd313cec94ff4b04cc04559f158518706a8"},
+    {"path": "HBR_Rep2_ERCC-Mix2_Build37-ErccTranscripts-chr22.read2.fastq.gz", "size_bytes": 8460032, "sha256": "cef758e8c517e6b1a26fdf09618445e024fbedbc5f7e12960ca9cb8e6176d27b"},
+    {"path": "HBR_Rep3_ERCC-Mix2_Build37-ErccTranscripts-chr22.read1.fastq.gz", "size_bytes": 7205832, "sha256": "7668ac37e2c921d4e92c28a19c786c1957efcf0111d8a5dd9d3195dde608fe77"},
+    {"path": "HBR_Rep3_ERCC-Mix2_Build37-ErccTranscripts-chr22.read2.fastq.gz", "size_bytes": 7609183, "sha256": "f5a045bccc654f75096b48d81f176b3b85ade67ef2d88f2437fd7f59b23172a5"},
+    {"path": "UHR_Rep1_ERCC-Mix1_Build37-ErccTranscripts-chr22.read1.fastq.gz", "size_bytes": 13464036, "sha256": "19648b68f9a3c8f1bb11f48cd03d94587d8c0e168fbe503b5c4b9205c5f7d8e1"},
+    {"path": "UHR_Rep1_ERCC-Mix1_Build37-ErccTranscripts-chr22.read2.fastq.gz", "size_bytes": 14475272, "sha256": "1bc2cfb8505c8cc60578fec3f3ef353f78d20ee4e765cfba32ee00ce48eea719"},
+    {"path": "UHR_Rep2_ERCC-Mix1_Build37-ErccTranscripts-chr22.read1.fastq.gz", "size_bytes": 10137426, "sha256": "81c2d88ae97d51e1a98ef2b98f3f62e0f64eb93bcd331c031ab9d88ec695729b"},
+    {"path": "UHR_Rep2_ERCC-Mix1_Build37-ErccTranscripts-chr22.read2.fastq.gz", "size_bytes": 10731212, "sha256": "1627ee5b04cbf9eb2fe15c23f8ca6e3c4c190ceb3b32a48dec951bf2fb9605c1"},
+    {"path": "UHR_Rep3_ERCC-Mix1_Build37-ErccTranscripts-chr22.read1.fastq.gz", "size_bytes": 11102204, "sha256": "5b95ea141ff5bc2d0d7e09b270930b2ad1f7393c98d7656dc52312462b934111"},
+    {"path": "UHR_Rep3_ERCC-Mix1_Build37-ErccTranscripts-chr22.read2.fastq.gz", "size_bytes": 11815583, "sha256": "9807db4a754ec1026587f28641d3cb42475e0959b798cbeb54e89d54b05fa2d1"}
+  ]
+}

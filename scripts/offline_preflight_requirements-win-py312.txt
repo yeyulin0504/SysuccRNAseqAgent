@@ -1,0 +1,9 @@
+# Exact environment prepared for the Windows/Python 3.12 offline password launcher.
+# This is a version pin, not a hash-locked cross-platform supply-chain lock.
+bcrypt==5.0.0
+cffi==2.1.0
+cryptography==50.0.0
+invoke==3.0.3
+paramiko==4.0.0
+pycparser==3.0
+PyNaCl==1.6.2

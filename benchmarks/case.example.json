@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "same-data-three-mode-repeats",
+  "description": "Copy this file, replace manifest paths, and record terminal outcomes. Keep data and intended workflow constant across modes.",
+  "cases": [
+    {
+      "case_id": "free-repeats",
+      "expected_mode": "free",
+      "runs": [
+        {"run_label": "free-01", "manifest": "../runs/PROJECT/attempts/RUN_FREE_01/run_manifest.json", "result_manifest": "../runs/PROJECT/attempts/RUN_FREE_01/result_manifest.json", "success": true, "outcome": "completed"},
+        {"run_label": "free-02", "manifest": "../runs/PROJECT/attempts/RUN_FREE_02/run_manifest.json", "result_manifest": "../runs/PROJECT/attempts/RUN_FREE_02/result_manifest.json", "success": true, "outcome": "completed"}
+      ]
+    },
+    {
+      "case_id": "skill-repeats",
+      "expected_mode": "skill",
+      "runs": [
+        {"run_label": "skill-01", "manifest": "../runs/PROJECT/attempts/RUN_SKILL_01/run_manifest.json", "result_manifest": "../runs/PROJECT/attempts/RUN_SKILL_01/result_manifest.json", "success": true, "outcome": "completed"},
+        {"run_label": "skill-02", "manifest": "../runs/PROJECT/attempts/RUN_SKILL_02/run_manifest.json", "result_manifest": null, "success": false, "outcome": "failed"}
+      ]
+    },
+    {
+      "case_id": "contract-repeats",
+      "expected_mode": "contract",
+      "runs": [
+        {"run_label": "contract-01", "manifest": "../runs/PROJECT/attempts/RUN_CONTRACT_01/run_manifest.json", "result_manifest": "../runs/PROJECT/attempts/RUN_CONTRACT_01/result_manifest.json", "success": true, "outcome": "completed"},
+        {"run_label": "contract-02", "manifest": "../runs/PROJECT/attempts/RUN_CONTRACT_02/run_manifest.json", "result_manifest": null, "success": null, "outcome": "submitted"}
+      ]
+    }
+  ]
+}

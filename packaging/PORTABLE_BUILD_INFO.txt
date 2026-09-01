@@ -1,0 +1,15 @@
+Portable read-only HPC preflight build
+======================================
+
+Target: Windows x64
+Python: 3.12.13
+Freezer: PyInstaller 6.16.0 (one-file console executable)
+SSH: Paramiko 4.0.0
+Cryptography: 50.0.0
+Build date: 2026-08-04 (Asia/Shanghai)
+Code scope: fixed read-only preflight only; no general project runner or LLM client
+Signature: unsigned internal test build
+
+The exact executable and delivery-file hashes are recorded in SHA256SUMS.txt.
+The minimal preflight config deliberately excludes samples, FASTQ paths,
+passwords, init_commands, notification settings, API keys, and model settings.

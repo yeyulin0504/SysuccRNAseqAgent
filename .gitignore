@@ -1,0 +1,16 @@
+.agents/
+.codex/
+.claude/
+.workbuddy/
+downloads/
+output/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.tmp*/
+runs/
+*.log
