@@ -138,7 +138,7 @@ class TestSessionStateMachine:
         session.new_project(_minimal_config(project_dir))
         plan = session.plan()
         assert session.state == PLANNED
-        assert plan.capability_id == "bulk_rnaseq_expression_v1"
+        assert plan.capability_id == "workflow.bulk_rna.grch38_pe_expression_fusion"
         assert plan.steps
 
     def test_edit_records_changeset_and_rebuilds_plan(
@@ -248,12 +248,12 @@ class TestSessionStateMachine:
         assert resumed.state == PLANNED
         assert resumed.config is not None
         assert resumed.execution_plan is not None
-        assert resumed.execution_plan.capability_id == "bulk_rnaseq_expression_v1"
+        assert resumed.execution_plan.capability_id == "workflow.bulk_rna.grch38_pe_expression_fusion"
 
     def test_summary_lines_include_capability(self, session: ProjectSession, project_dir: Path) -> None:
         session.new_project(_minimal_config(project_dir))
         lines = session.summary_lines()
-        assert any("bulk_rnaseq_expression_v1" in line for line in lines)
+        assert any("workflow.bulk_rna.grch38_pe_expression_fusion" in line for line in lines)
         assert any("样本数" in line for line in lines)
 
 

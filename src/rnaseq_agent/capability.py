@@ -26,15 +26,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .defaults import DEFAULT_PIPELINE
-from .workflow_profiles import WORKFLOW_PROFILES
+from .workflow_profiles import DEFAULT_WORKFLOW_PROFILE, WORKFLOW_PROFILES
 
 CAPABILITY_SCHEMA_VERSION = 1
 
-# Refusal semantics from the design document.
+# Refusal semantics from the design document (framework section 6.3).
 NOT_EVALUABLE = "NOT_EVALUABLE"
 ABSTAIN = "ABSTAIN"
 PASS = "PASS"
 WARN = "WARN"
+FAIL = "FAIL"
+FAIL_OUTPUT_CONTRACT = "FAIL_OUTPUT_CONTRACT"
+NOT_APPLICABLE = "NOT_APPLICABLE"
+WAITING_USER = "WAITING_USER"
+WAITING_HPC = "WAITING_HPC"
+STALE = "STALE"
 
 
 @dataclass(frozen=True)
@@ -75,49 +81,28 @@ class ExecutionPlan:
 
 
 def register_builtin_capabilities() -> dict[str, Capability]:
-    """Return the versioned set of workflow capabilities available in this MVP."""
+    """Return the versioned set of workflow capabilities available in this MVP.
 
-    expression_profile = WORKFLOW_PROFILES["bulk_rnaseq_expression_v1"]
-    full_profile = WORKFLOW_PROFILES["bulk_rnaseq_full_v1"]
+    Capability IDs follow the frozen slots in framework section 15.2.
+    """
+
+    bulk_profile = WORKFLOW_PROFILES[DEFAULT_WORKFLOW_PROFILE]
 
     return {
-        "bulk_rnaseq_expression_v1": Capability(
-            capability_id="bulk_rnaseq_expression_v1",
-            title="Bulk RNA-seq expression workflow v1",
-            description=(
-                "fastp -> STAR -> featureCounts gene-level expression counts. "
-                "Fusion calling and RSEM quantification are disabled."
-            ),
+        # 框架 15.2：workflow.bulk_rna.grch38_pe_expression_fusion 1.0.0
+        DEFAULT_WORKFLOW_PROFILE: Capability(
+            capability_id=DEFAULT_WORKFLOW_PROFILE,
+            title=bulk_profile["title"],
+            description=bulk_profile["description"],
             version="1.0.0",
             input_contract={
                 "data_type": "bulk_rna_seq_fastq",
-                "layout": {"paired", "single"},
+                "layout": {"paired"},  # 框架 15.3：Illumina paired-end
                 "min_samples": 1,
                 "designs": {"independent_two_group", "single_group"},
                 "required_sample_fields": ["sample_id", "condition", "fastq_1"],
-            },
-            output_artifacts={
-                "featurecounts/gene_counts.txt": "gene-level count matrix",
-                "fastp/*.json": "per-sample fastp QC JSON",
-                "star/*.Log.final.out": "per-sample STAR alignment summary",
-            },
-            requires_reference_keys=["star_index_dir", "remote_gtf_path"],
-            pipeline=expression_profile["pipeline"],
-        ),
-        "bulk_rnaseq_full_v1": Capability(
-            capability_id="bulk_rnaseq_full_v1",
-            title="Bulk RNA-seq full workflow v1",
-            description=(
-                "fastp -> STAR with Arriba fusion calling, featureCounts, and "
-                "RSEM quantification enabled."
-            ),
-            version="1.0.0",
-            input_contract={
-                "data_type": "bulk_rna_seq_fastq",
-                "layout": {"paired", "single"},
-                "min_samples": 1,
-                "designs": {"independent_two_group", "single_group"},
-                "required_sample_fields": ["sample_id", "condition", "fastq_1"],
+                "cancer_types": bulk_profile.get("cancer_types", ["pan_cancer"]),
+                "sample_mode": bulk_profile.get("sample_mode", "cohort_or_single"),
             },
             output_artifacts={
                 "featurecounts/gene_counts.txt": "gene-level count matrix",
@@ -132,7 +117,7 @@ def register_builtin_capabilities() -> dict[str, Capability]:
                 "remote_genome_fasta_path",
                 "rsem_index_prefix",
             ],
-            pipeline=full_profile["pipeline"],
+            pipeline=bulk_profile["pipeline"],
         ),
     }
 
@@ -169,19 +154,34 @@ def gate_a_check(
     if layout not in capability.input_contract["layout"]:
         reasons.append(f"测序类型 {layout!r} 不在能力 {capability.capability_id} 的支持范围内。")
 
-    samples = config.get("samples", {})
-    items = samples.get("items", [])
+    # 框架 5.2：Gate-A 检查癌种与单样本/队列模式。
+    cancer_types = capability.input_contract.get("cancer_types", [])
+    declared_cancer = str(config.get("study", {}).get("cancer_type", "")).strip()
+    if cancer_types and declared_cancer and declared_cancer not in cancer_types:
+        reasons.append(
+            f"能力 {capability.capability_id} 的适用癌种为 {cancer_types}，"
+            f"当前声明为 {declared_cancer!r}。"
+        )
+
+    sample_mode = capability.input_contract.get("sample_mode", "cohort_or_single")
+    items = config.get("samples", {}).get("items", [])
     if len(items) < capability.input_contract["min_samples"]:
         reasons.append(
             f"至少需要 {capability.input_contract['min_samples']} 个样本，当前为 {len(items)} 个。"
         )
-
-    conditions = {str(sample.get("condition", "")).strip() for sample in items}
-    conditions.discard("")
-    if len(conditions) > 2:
-        reasons.append(
-            f"首期 MVP 只接受非配对两组或单组队列设计，检测到 {len(conditions)} 个分组。"
-        )
+    design = str(config.get("study", {}).get("design", "")).strip()
+    if sample_mode == "cohort_or_single":
+        conditions = {str(sample.get("condition", "")).strip() for sample in items}
+        conditions.discard("")
+        if design and design not in capability.input_contract["designs"]:
+            reasons.append(
+                f"能力 {capability.capability_id} 支持的设计为 "
+                f"{sorted(capability.input_contract['designs'])}，当前声明为 {design!r}。"
+            )
+        if len(conditions) > 2:
+            reasons.append(
+                f"首期只接受非配对两组或单组队列设计，检测到 {len(conditions)} 个分组。"
+            )
 
     required_fields = capability.input_contract["required_sample_fields"]
     for index, sample in enumerate(items, start=1):

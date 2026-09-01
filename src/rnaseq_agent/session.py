@@ -32,24 +32,26 @@ from .actions import (
     prepare_project_config,
     validate_project,
 )
+from .adapter import adapter_inspect, adapter_materialize, adapter_plan
 from .analysis_contract import create_project_contract, verify_project_contract
 from .capability import (
     ExecutionPlan,
     GateResult,
     NOT_EVALUABLE,
-    build_execution_plan,
     gate_a_check,
     list_capabilities,
     resolve_capability,
 )
+from .output_validator import mark_stale_downstream, register_artifacts
 from .run_agent import run_project
 from .storage import append_jsonl, load_json, save_json
 
 SESSION_FILE = "session.json"
 CHANGESET_FILE = "changesets.jsonl"
-DEFAULT_CAPABILITY_ID = "bulk_rnaseq_expression_v1"
+# 框架 15.2 冻结的 bulk RNA 黄金路线能力槽。
+DEFAULT_CAPABILITY_ID = "workflow.bulk_rna.grch38_pe_expression_fusion"
 
-# States in the MVP session machine.
+# States in the MVP session machine (framework section 6.3).
 IDLE = "idle"
 DRAFTING = "drafting"
 PLANNED = "planned"
@@ -57,6 +59,9 @@ CONFIRMED = "confirmed"
 EXECUTING = "executing"
 COMPLETED = "completed"
 FAILED = "failed"
+WAITING_USER = "WAITING_USER"  # 框架：等待人工确认（QC 检查点）
+WAITING_HPC = "WAITING_HPC"  # 框架：作业已提交，等待外部状态
+STALE = "STALE"  # 框架：上游变化导致旧产物失效
 
 
 class SessionError(RuntimeError):
@@ -174,10 +179,22 @@ class ProjectSession:
         return gate
 
     def plan(self) -> ExecutionPlan:
-        """Build a deterministic execution plan from the current draft."""
+        """Adapter.plan: read-only pre-check then build a deterministic plan.
+
+        Framework call chain: Gate-A -> Adapter.inspect/plan. The adapter
+        inspects the draft (read-only) and produces the ExecutionPlan that
+        the user will confirm before freezing.
+        """
         self._require_state(DRAFTING, PLANNED, CONFIRMED)
         assert self.config is not None
-        self.execution_plan = build_execution_plan(self.capability, self.config)
+        config, validation = validate_project(self.config_path)
+        inspection = adapter_inspect(
+            self.capability,
+            config,
+            validation_errors=validation.errors,
+            missing_files=[str(path) for path in validation.missing_files],
+        )
+        self.execution_plan = adapter_plan(self.capability, self.config, inspection=inspection)
         self.state = PLANNED
         self._save_session()
         return self.execution_plan
@@ -206,6 +223,11 @@ class ProjectSession:
         self.config = load_project_config(self.config_path)
         self.state = DRAFTING
         self.execution_plan = None
+        # Framework 6.2: ChangeSet invalidates affected downstream artifacts.
+        try:
+            stale = mark_stale_downstream(self.project_dir, "project_config")
+        except OSError:
+            stale = []
         self._log(
             "changeset_applied",
             {
@@ -215,6 +237,7 @@ class ProjectSession:
                 "new_config_sha256": _config_sha256(self.config),
                 "previous_config": deepcopy(previous),
                 "new_config": deepcopy(self.config),
+                "stale_artifacts": stale,
             },
         )
         self._save_session()
@@ -298,16 +321,28 @@ class ProjectSession:
         return True
 
     def confirm(self) -> dict[str, Any]:
-        """Freeze the plan into an immutable Analysis Contract."""
+        """Freeze the plan into an immutable Analysis Contract.
+
+        After freezing, the Adapter materializes the actual run inputs
+        (rendered scripts) into the project directory, ready for the
+        Execution Gateway.
+        """
         self._require_state(PLANNED)
         assert self.execution_plan is not None
+        assert self.config is not None
+        if self.execution_plan.summary.startswith("Adapter 预检未通过"):
+            raise SessionError("Adapter 预检未通过，无法冻结契约。请先修正配置。")
         config_path, contract = create_project_contract(self.config_path)
+        # Framework 5.2: Analysis Contract -> Adapter.materialize.
+        self.config = load_project_config(self.config_path)
+        materialized = adapter_materialize(config_path, self.config)
         self.state = CONFIRMED
         self._log(
             "contract_frozen",
             {
                 "contract_id": contract["contract_id"],
                 "contract_path": str(config_path),
+                "materialized_scripts": {k: str(v) for k, v in materialized.items()},
                 "previous_config": deepcopy(self.config),
             },
         )

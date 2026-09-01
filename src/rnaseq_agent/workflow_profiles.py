@@ -6,33 +6,22 @@ from typing import Any
 from .defaults import DEFAULT_PIPELINE
 
 
-DEFAULT_WORKFLOW_PROFILE = "bulk_rnaseq_full_v1"
+# 框架 15.2 冻结的 bulk RNA 黄金路线能力槽（对齐架构图）。
+DEFAULT_WORKFLOW_PROFILE = "workflow.bulk_rna.grch38_pe_expression_fusion"
 
 
 WORKFLOW_PROFILES: dict[str, dict[str, Any]] = {
-    "bulk_rnaseq_expression_v1": {
-        "title": "Bulk RNA-seq expression workflow v1",
+    # 框架 15.2：workflow.bulk_rna.grch38_pe_expression_fusion 1.0.0
+    # 固定 paired-end bulk RNA 表达/融合主线。
+    "workflow.bulk_rna.grch38_pe_expression_fusion": {
+        "title": "Bulk RNA-seq expression + fusion (GRCh38 paired-end) v1",
         "description": (
-            "Versioned fastp -> STAR -> featureCounts workflow for gene-level "
-            "expression counts. Fusion calling and RSEM quantification are disabled."
+            "Versioned fastp -> MultiQC -> STAR -> featureCounts + RSEM -> "
+            "Arriba workflow for GRCh38 Illumina paired-end FASTQ, matching "
+            "framework gold route A."
         ),
-        "pipeline": {
-            "fastp": {"enabled": True, "version": DEFAULT_PIPELINE["fastp"]["version"]},
-            "star": {"enabled": True, "version": DEFAULT_PIPELINE["star"]["version"]},
-            "arriba": {"enabled": False, "version": DEFAULT_PIPELINE["arriba"]["version"]},
-            "featurecounts": {
-                "enabled": True,
-                "version": DEFAULT_PIPELINE["featurecounts"]["version"],
-            },
-            "rsem": {"enabled": False, "version": DEFAULT_PIPELINE["rsem"]["version"]},
-        },
-    },
-    "bulk_rnaseq_full_v1": {
-        "title": "Bulk RNA-seq full workflow v1",
-        "description": (
-            "Versioned fastp -> STAR workflow with Arriba, featureCounts, and "
-            "RSEM outputs enabled."
-        ),
+        "cancer_types": ["pan_cancer"],
+        "sample_mode": "cohort_or_single",
         "pipeline": deepcopy(DEFAULT_PIPELINE),
     },
 }

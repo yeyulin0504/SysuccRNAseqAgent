@@ -13,7 +13,7 @@ from rnaseq_agent.storage import load_json, save_json
 from rnaseq_agent.workflow_profiles import apply_workflow_profile
 
 
-SKILL_ID = "bulk_rnaseq_expression_v1"
+SKILL_ID = "workflow.bulk_rna.grch38_pe_expression_fusion"
 
 
 def _write_fastq(path: Path, read_id: str, sequence: str = "ACGT") -> None:

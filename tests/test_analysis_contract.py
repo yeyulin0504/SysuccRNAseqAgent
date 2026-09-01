@@ -172,10 +172,11 @@ class WorkflowProfileTests(unittest.TestCase):
     def test_applying_profile_locks_pipeline_and_detects_drift(self) -> None:
         config = {"pipeline": {}, "execution": {"mode": "free"}}
 
-        locked = apply_workflow_profile(config, "bulk_rnaseq_expression_v1")
+        locked = apply_workflow_profile(config, "workflow.bulk_rna.grch38_pe_expression_fusion")
 
         self.assertEqual(locked["execution"]["mode"], "skill")
-        self.assertFalse(locked["pipeline"]["arriba"]["enabled"])
+        # 框架 15.2：expression + fusion 主线，Arriba 融合检测默认启用。
+        self.assertTrue(locked["pipeline"]["arriba"]["enabled"])
         self.assertEqual(workflow_profile_errors(locked), [])
 
         locked["pipeline"]["star"]["version"] = "different"

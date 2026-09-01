@@ -70,11 +70,11 @@ class TestCapabilityRegistry:
     def test_lists_builtin_capabilities(self) -> None:
         caps = list_capabilities()
         ids = [cap.capability_id for cap in caps]
-        assert "bulk_rnaseq_expression_v1" in ids
-        assert "bulk_rnaseq_full_v1" in ids
+        assert "workflow.bulk_rna.grch38_pe_expression_fusion" in ids
+        assert "workflow.bulk_rna.grch38_pe_expression_fusion" in ids
 
     def test_capability_version_and_contract(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         assert cap.version == "1.0.0"
         assert cap.input_contract["data_type"] == "bulk_rna_seq_fastq"
         assert "paired" in cap.input_contract["layout"]
@@ -87,13 +87,13 @@ class TestCapabilityRegistry:
 
 class TestGateA:
     def test_passes_for_valid_two_group_config(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         result = gate_a_check(cap, _base_config())
         assert result.verdict == PASS
         assert result.ok
 
     def test_too_many_conditions_is_not_evaluable(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         config = _base_config()
         config["samples"]["items"].append(
             {
@@ -108,7 +108,7 @@ class TestGateA:
         assert any("分组" in reason for reason in result.reasons)
 
     def test_missing_sample_fields_is_not_evaluable(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         config = _base_config()
         config["samples"]["items"][0]["condition"] = ""
         result = gate_a_check(cap, config)
@@ -116,14 +116,14 @@ class TestGateA:
         assert any("缺少字段" in reason for reason in result.reasons)
 
     def test_unsupported_layout_is_not_evaluable(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         config = _base_config()
         config["sequencing"]["layout"] = "amplicon"
         result = gate_a_check(cap, config)
         assert result.verdict == NOT_EVALUABLE
 
     def test_missing_reference_key_is_not_evaluable(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         config = _base_config()
         config["reference"]["star_index_dir"] = ""
         result = gate_a_check(cap, config)
@@ -131,14 +131,14 @@ class TestGateA:
         assert any("star_index_dir" in reason for reason in result.reasons)
 
     def test_passes_validation_errors_through(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         result = gate_a_check(cap, _base_config(), validation_errors=["fake error"], missing_files=["a.fastq.gz"])
         assert result.verdict == NOT_EVALUABLE
         assert any("fake error" in reason for reason in result.reasons)
         assert any("缺少输入文件" in reason for reason in result.reasons)
 
     def test_formatted_messages(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         passed = gate_a_check(cap, _base_config())
         assert passed.formatted()[0].startswith("通过")
         failed = gate_a_check(cap, _base_config(), validation_errors=["boom"])
@@ -147,21 +147,21 @@ class TestGateA:
 
 class TestExecutionPlan:
     def test_plan_is_deterministic(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         plan_a = build_execution_plan(cap, _base_config())
         plan_b = build_execution_plan(cap, _base_config())
         assert plan_a.summary == plan_b.summary
         assert plan_a.steps == plan_b.steps
-        assert plan_a.capability_id == "bulk_rnaseq_expression_v1"
+        assert plan_a.capability_id == "workflow.bulk_rna.grch38_pe_expression_fusion"
 
     def test_plan_describes_steps_and_samples(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         plan = build_execution_plan(cap, _base_config())
         assert any("2 个" in step for step in plan.steps)
         assert any("fastp -> star -> featurecounts" in step.lower() for step in plan.steps)
 
     def test_plan_does_not_mutate_config(self) -> None:
-        cap = resolve_capability("bulk_rnaseq_expression_v1")
+        cap = resolve_capability("workflow.bulk_rna.grch38_pe_expression_fusion")
         config = _base_config()
         before = repr(config)
         build_execution_plan(cap, config)
