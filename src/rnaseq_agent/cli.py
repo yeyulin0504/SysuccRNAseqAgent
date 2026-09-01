@@ -170,6 +170,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mvp.add_argument("mvp_args", nargs=argparse.REMAINDER)
 
+    web = subparsers.add_parser(
+        "web",
+        help="Start the localhost web workbench (framework phase-1 UI).",
+    )
+    web.add_argument(
+        "--project-dir",
+        default="runs/mvp_web",
+        help="Project directory. Default: runs/mvp_web",
+    )
+    web.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Loopback port. Default: 8000",
+    )
+
     return parser
 
 
@@ -338,6 +354,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "mvp":
         return mvp_main(args.mvp_args)
+
+    if args.command == "web":
+        try:
+            from .webapp import run_server
+        except ImportError as exc:
+            print(
+                f"缺少 web 依赖（{exc}）。请安装：pip install langgraph fastapi uvicorn jinja2",
+                file=sys.stderr,
+            )
+            return 1
+        run_server(project_dir=Path(args.project_dir), port=args.port)
+        return 0
 
     parser.error(f"Unknown command: {args.command}")
     return 2

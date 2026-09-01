@@ -236,6 +236,59 @@ Every project directory contains:
   stores the patch, the user note, and the full before/after config snapshots
   with sha256 hashes, so any step can be reproduced or reverted.
 
+## Framework alignment (v0.3, design spec 2026-08-20)
+
+The MVP is rebuilt along the design document's call chain:
+
+```
+Registry -> Gate-A -> Adapter.inspect/plan -> user confirm
+-> Analysis Contract -> Adapter.materialize -> Execution Gateway
+-> HPC -> Output Validator -> Post-run Gate -> Artifact Registry
+```
+
+Capability IDs follow the frozen slots (framework 15.2):
+
+- `workflow.bulk_rna.grch38_pe_expression_fusion` — GRCh38 paired-end bulk
+  RNA expression + fusion golden route (fastp -> STAR -> featureCounts +
+  RSEM -> Arriba).
+
+Status vocabulary matches framework 6.3: `NOT_EVALUABLE` (input cannot
+proceed), `ABSTAIN` (module refuses to conclude), `FAIL_OUTPUT_CONTRACT`
+(artifact missing / schema invalid), `WAITING_USER` (QC checkpoint),
+`STALE` (upstream change invalidates an artifact), and the session states.
+
+New modules:
+
+- `src/rnaseq_agent/adapter.py` — `adapter_inspect` (read-only deep
+  pre-check), `adapter_plan` (builds the plan the user confirms; a failed
+  inspection marks it NOT_EVALUABLE instead of raising), `adapter_materialize`
+  (renders the frozen scripts after confirm).
+- `src/rnaseq_agent/output_validator.py` — Output Validator (schema/hash
+  checks, raises `FAIL_OUTPUT_CONTRACT`), Post-run Gate (QC/OOD refusal ->
+  `ABSTAIN`), Artifact Registry (registration + `STALE` invalidation).
+- `src/rnaseq_agent/agent_graph.py` — LangGraph control plane
+  (framework 5.6). `BulkRNAGraph` drives the audited session; nodes mark
+  scientific decision boundaries. A QC checkpoint uses a LangGraph
+  `interrupt` (framework 6.1 checkpoint #4).
+- `src/rnaseq_agent/webapp.py` — localhost web workbench (framework 11,
+  phase-1 single-user): project / flow / audit / decision panels.
+
+### Localhost web workbench
+
+```powershell
+# Requires the optional control-plane deps:
+pip install "langgraph>=0.2" fastapi uvicorn jinja2
+# or: pip install -e .[control-plane]
+
+$env:PYTHONPATH = "src"
+python -m rnaseq_agent.webapp            # serves 127.0.0.1:8000
+# or
+python -m rnaseq_agent.cli web --project-dir runs/mvp_web --port 8000
+```
+
+The server binds loopback only and issues a random session token; API
+calls without the token are rejected (framework 12.1).
+
 ## Agent vs Traditional Software
 
 This project has a GUI, but its core is still an agent-style workflow:
