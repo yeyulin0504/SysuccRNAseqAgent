@@ -20,6 +20,7 @@ from .chat import run_chat
 from .configuration import normalize_config
 from .estimate import estimate_runtime
 from .gui import run_gui
+from .mvp_cli import main as mvp_main
 from .preflight import PreflightError, run_preflight
 from .remote import build_directory_scan_command, build_upload_commands
 from .storage import load_json, save_json
@@ -162,6 +163,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     contract_verify.add_argument("config", help="Path to project.json")
     contract_verify.add_argument("--contract", help="Optional contract path override")
+
+    mvp = subparsers.add_parser(
+        "mvp",
+        help="Capability-aware, auditable MVP project session.",
+    )
+    mvp.add_argument("mvp_args", nargs=argparse.REMAINDER)
 
     return parser
 
@@ -328,6 +335,9 @@ def main(argv: list[str] | None = None) -> int:
         for error in verification.errors:
             print(f"- {error}", file=sys.stderr)
         return 1
+
+    if args.command == "mvp":
+        return mvp_main(args.mvp_args)
 
     parser.error(f"Unknown command: {args.command}")
     return 2
