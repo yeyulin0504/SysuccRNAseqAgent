@@ -122,6 +122,49 @@
       <button onclick="createProject()">创建项目草稿</button>
     </div>
 
+    <h2>服务器与执行</h2>
+    <div class="card">
+      <div class="row">
+        <div style="flex:1"><label>主机</label><input id="srvHost" placeholder="login.hpc"></div>
+        <div style="flex:1"><label>用户名</label><input id="srvUser" placeholder="user"></div>
+        <div style="flex:1"><label>调度器</label>
+          <input id="srvScheduler" placeholder="slurm / local"></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>线程数</label><input id="srvThreads" placeholder="8"></div>
+        <div style="flex:1"><label>内存 (GB)</label><input id="srvMemory" placeholder="32"></div>
+        <div style="flex:1"><div class="muted" style="margin-top:22px" id="srvRemoteDir"></div></div>
+      </div>
+      <div class="row">
+        <button class="secondary" onclick="saveServerConfig()">保存服务器配置</button>
+        <div class="muted" style="margin-top:18px">远程工作目录在项目创建时固定，如需变更请回滚后重建。</div>
+      </div>
+    </div>
+
+    <h2>大模型接入</h2>
+    <div class="card">
+      <div class="row">
+        <div style="flex:1"><label>API Base</label><input id="llmBase" placeholder="https://api.openai.com/v1"></div>
+        <div style="flex:1"><label>模型</label><input id="llmModel" placeholder="gpt-4o-mini"></div>
+        <div style="flex:1"><label>提供商（可选）</label><input id="llmProvider" placeholder="openai / deepseek / ..."></div>
+      </div>
+      <div class="row">
+        <div style="flex:1"><label>API Key <span class="muted" id="llmKeyState"></span></label>
+          <input id="llmKey" type="password" placeholder="sk-..."></div>
+        <div style="flex:1"><label>&nbsp;</label>
+          <label style="display:flex;align-items:center;gap:6px;margin-top:2px">
+            <input type="checkbox" id="llmEnabled" style="width:auto"> 启用大模型对话
+          </label>
+        </div>
+        <div style="flex:1"></div>
+      </div>
+      <div class="row">
+        <button class="secondary" onclick="saveLlmConfig()">保存大模型配置</button>
+        <button class="secondary" onclick="clearLlmKey()">清除 API Key</button>
+        <div class="muted" style="margin-top:18px">未启用或请求失败时，对话自动回退本地规则路由。</div>
+      </div>
+    </div>
+
     <h2>流程</h2>
     <div class="card">
       <div id="planSteps" class="muted">尚未生成计划。创建项目后点击「生成执行计划」。</div>
@@ -192,8 +235,13 @@ function createProject() {
     design: document.getElementById("design").value,
     fastq_dir: document.getElementById("fastqDir").value,
     owner: document.getElementById("owner").value,
+    host: document.getElementById("srvHost").value.trim() || undefined,
+    user: document.getElementById("srvUser").value.trim() || undefined,
+    scheduler: document.getElementById("srvScheduler").value.trim() || undefined,
+    threads: Number(document.getElementById("srvThreads").value) || undefined,
+    memory_gb: Number(document.getElementById("srvMemory").value) || undefined,
     samples,
-  }).then(d => { if (d.error) { alert(d.error); } else { setState(d.state); refreshState(); degGate(); } });
+  }).then(d => { if (d.error) { alert(d.error); } else { setState(d.state); refreshState(); degGate(); loadConfig(); } });
 }
 function doPlan() {
   api("/api/plan").then(d => {
@@ -242,6 +290,70 @@ function toggleDeg(enabled) {
 function degGate() {
   api("/api/deg", {}).then(d => renderDeg(d));
 }
+function loadConfig() {
+  fetch("/api/config", { headers: { "x-session-token": TOKEN } })
+    .then(r => r.json()).then(d => {
+      const c = d.config;
+      if (!c) return;
+      document.getElementById("srvHost").value = c.server.host || "";
+      document.getElementById("srvUser").value = c.server.user || "";
+      document.getElementById("srvScheduler").value = c.server.scheduler || "local";
+      document.getElementById("srvThreads").value = c.server.threads ?? "";
+      document.getElementById("srvMemory").value = c.server.memory_gb ?? "";
+      document.getElementById("srvRemoteDir").textContent = "远程目录：" + (c.server.remote_workdir || "");
+      document.getElementById("llmBase").value = c.llm.api_base || "";
+      document.getElementById("llmModel").value = c.llm.model || "";
+      document.getElementById("llmProvider").value = c.llm.provider || "";
+      document.getElementById("llmEnabled").checked = !!c.llm.enabled;
+      document.getElementById("llmKeyState").textContent = c.llm.api_key_set ? "（已设置）" : "（未设置）";
+      document.getElementById("llmKey").value = "";
+    });
+}
+function saveServerConfig() {
+  const server = {
+    host: document.getElementById("srvHost").value.trim(),
+    user: document.getElementById("srvUser").value.trim(),
+    scheduler: document.getElementById("srvScheduler").value.trim(),
+    threads: document.getElementById("srvThreads").value.trim(),
+    memory_gb: document.getElementById("srvMemory").value.trim(),
+  };
+  Object.keys(server).forEach(k => { if (server[k] === "") delete server[k]; });
+  if (server.threads) server.threads = Number(server.threads);
+  if (server.memory_gb) server.memory_gb = Number(server.memory_gb);
+  api("/api/config", { server }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    setState(d.state); refreshState();
+    alert("服务器配置已保存。");
+  });
+}
+function saveLlmConfig() {
+  const llm = {
+    provider: document.getElementById("llmProvider").value.trim(),
+    api_base: document.getElementById("llmBase").value.trim(),
+    model: document.getElementById("llmModel").value.trim(),
+    enabled: document.getElementById("llmEnabled").checked,
+  };
+  Object.keys(llm).forEach(k => { if (llm[k] === "") delete llm[k]; });
+  const key = document.getElementById("llmKey").value.trim();
+  if (key) llm.api_key = key;
+  api("/api/config", { llm }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    if (d.config) {
+      document.getElementById("llmKeyState").textContent = d.config.llm.api_key_set ? "（已设置）" : "（未设置）";
+      document.getElementById("llmKey").value = "";
+      document.getElementById("llmEnabled").checked = !!d.config.llm.enabled;
+    }
+    setState(d.state); refreshState();
+    alert("大模型配置已保存。");
+  });
+}
+function clearLlmKey() {
+  api("/api/config", { llm: { api_key_clear: true } }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    document.getElementById("llmKeyState").textContent = "（未设置）";
+    alert("API Key 已清除。");
+  });
+}
 function sendChat() {
   const q = document.getElementById("chatInput").value.trim();
   if (!q) return;
@@ -259,7 +371,7 @@ function sendChat() {
       reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
         d.gate.map(s => `<div class="step err">${escapeHtml(s)}</div>`).join("");
     } else {
-      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || d.error || "完成。");
+      reply.innerHTML = head + "<b>Agent" + (d.via === "llm" ? "（大模型）" : "（规则）") + "：</b>" + escapeHtml(d.reply || d.error || "完成。");
     }
     if (d.state) setState(d.state);
     refreshState();
@@ -272,7 +384,8 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 setState("{{ session.state }}");
-{% if session.config %}degGate();{% endif %}
+{% if session.config %}degGate();
+loadConfig();{% endif %}
 </script>
 </body>
 </html>

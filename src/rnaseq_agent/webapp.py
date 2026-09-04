@@ -54,7 +54,80 @@ def _session_view(session: ProjectSession) -> dict[str, Any]:
         "capability_id": session.capability_id,
         "summary": session.summary_lines(),
         "history": _load_changesets(session.changeset_path)[-8:],
+        # Web-editable connection / LLM configuration (secrets redacted).
+        "config": _editable_config(session.config) if session.config is not None else None,
     }
+
+
+def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Surface only the fields the web form may edit, never the api_key."""
+    llm = config.get("llm", {})
+    return {
+        "server": {
+            "profile": config.get("server", {}).get("profile", ""),
+            "host": config.get("server", {}).get("host", ""),
+            "user": config.get("server", {}).get("user", ""),
+            "remote_base_dir": config.get("server", {}).get("remote_base_dir", ""),
+            "remote_workdir": config.get("server", {}).get("remote_workdir", ""),
+            "scheduler": config.get("server", {}).get("scheduler", "local"),
+            "threads": config.get("server", {}).get("threads", 8),
+            "memory_gb": config.get("server", {}).get("memory_gb", 32),
+        },
+        "llm": {
+            "enabled": bool(llm.get("enabled")),
+            "provider": llm.get("provider", ""),
+            "api_base": llm.get("api_base", ""),
+            "model": llm.get("model", ""),
+            "api_key_set": bool(llm.get("api_key")),
+        },
+    }
+
+
+def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0) -> str | None:
+    """Call the configured OpenAI-compatible chat endpoint.
+
+    Returns the assistant reply text, or None when LLM is not enabled /
+    not configured / the call fails — the caller falls back to the local
+    rule router so the chat panel keeps working without a model.
+    """
+    llm = config.get("llm", {})
+    if not llm.get("enabled") or not llm.get("api_key") or not llm.get("api_base"):
+        return None
+    api_base = str(llm.get("api_base", "")).rstrip("/")
+    model = str(llm.get("model", "")).strip() or "gpt-4o-mini"
+    url = f"{api_base}/chat/completions"
+    try:
+        import requests
+
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {llm['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是 SYSU 多组学分析 Agent 的前端助手。用户正在配置一个"
+                            "bulk RNA-seq 分析项目。能识别为可执行操作时，简短回复并提示"
+                            "可继续点击「生成执行计划 / 确认并冻结契约 / 启用差异表达」。"
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                "temperature": 0.2,
+            },
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception:  # noqa: BLE001 - any failure falls back to the rule router
+        return None
 
 
 def create_app(*, project_dir: Path | None = None) -> FastAPI:
@@ -218,13 +291,77 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
         except SessionError as exc:
             return {"error": str(exc)}
 
+    @app.get("/api/config")
+    async def api_config_get(request: Request):
+        """Read back the web-editable connection / LLM settings (api_key masked)."""
+        _guard(request)
+        session = _session_for(project_dir)
+        if session.config is None:
+            return {"config": None}
+        return {"config": _editable_config(session.config)}
+
+    @app.post("/api/config")
+    async def api_config_post(request: Request):
+        """Edit connection (server.*) or LLM settings through the audited session."""
+        _guard(request)
+        session = _session_for(project_dir)
+        payload = await request.json()
+        patch: dict[str, Any] = {}
+        note_parts: list[str] = []
+
+        server = payload.get("server")
+        if isinstance(server, dict):
+            allowed = {"host", "user", "scheduler", "threads", "memory_gb"}
+            server_patch = {k: v for k, v in server.items() if k in allowed and v is not None}
+            if server_patch:
+                # threads / memory_gb arrive as numbers from the form.
+                if "threads" in server_patch:
+                    server_patch["threads"] = int(server_patch["threads"])
+                if "memory_gb" in server_patch:
+                    server_patch["memory_gb"] = int(server_patch["memory_gb"])
+                patch["server"] = server_patch
+                note_parts.append("服务器配置：" + ", ".join(f"{k}={v}" for k, v in server_patch.items()))
+
+        llm = payload.get("llm")
+        if isinstance(llm, dict):
+            llm_patch: dict[str, Any] = {}
+            for key in ("provider", "api_base", "model", "enabled"):
+                if key in llm and llm[key] is not None:
+                    llm_patch[key] = llm[key]
+            # api_key is write-only: an empty string means "keep it".
+            if llm.get("api_key"):
+                llm_patch["api_key"] = llm["api_key"]
+            if "api_key_clear" in llm and llm["api_key_clear"]:
+                llm_patch["api_key"] = ""
+            if llm_patch:
+                patch["llm"] = llm_patch
+                note_parts.append(
+                    "大模型接入：" + (f"启用 {llm_patch.get('model', '')}" if llm_patch.get("enabled") else "更新")
+                )
+
+        if not patch:
+            return {"error": "没有可保存的字段。"}
+        try:
+            gate = session.edit(patch, note=" / ".join(note_parts))
+            return {
+                "state": session.state,
+                "gate": gate.formatted(),
+                "config": _editable_config(session.config) if session.config is not None else None,
+            }
+        except SessionError as exc:
+            return {"error": str(exc)}
+
     @app.post("/api/chat")
     async def api_chat(request: Request):
         """Chat panel endpoint: route intent -> audited session action.
 
+        When the project has an OpenAI-compatible LLM configured and enabled
+        the message is sent to the model first. If the model is unavailable
+        (connection error / HTTP error / not configured) the local rule router
+        drives the session instead, so the panel never breaks.
+
         Design doc 5.2: the assistant only emits a structured action request;
-        execution happens through the session (deterministic code). A plain
-        question with no actionable intent gets a conversational reply.
+        execution happens through the session (deterministic code).
         """
         _guard(request)
         payload = await request.json()
@@ -233,9 +370,18 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
             return {"reply": "请输入想做的事。"}
 
         session = _session_for(project_dir)
+        config = session.config
+
+        # 1) LLM path (when enabled and reachable).
+        if config is not None:
+            llm_reply = _llm_reply_or_none(config, text)
+            if llm_reply:
+                return {"state": session.state, "reply": llm_reply, "via": "llm"}
+
+        # 2) Local rule router fallback.
         intent = route_intent(text)
         if intent is None:
-            has_project = session.config is not None
+            has_project = config is not None
             capabilities = ", ".join(
                 c.capability_id
                 for c in __import__(
@@ -290,9 +436,9 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
             "user": payload.get("user") or "local_user",
             "remote_base_dir": str(project_dir / "remote"),
             "remote_workdir": str(project_dir / "remote" / "work"),
-            "scheduler": "local",
-            "threads": 8,
-            "memory_gb": 32,
+            "scheduler": payload.get("scheduler") or "local",
+            "threads": int(payload.get("threads") or 8),
+            "memory_gb": int(payload.get("memory_gb") or 32),
             "shell": "bash",
             "init_commands": [],
         },
@@ -316,6 +462,15 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
             "arriba": {"enabled": True, "version": "2.5.0"},
             "featurecounts": {"enabled": True, "version": "Subread 2.1.1"},
             "rsem": {"enabled": True, "version": "1.2.28"},
+        },
+        # Web chat may optionally connect to an OpenAI-compatible endpoint.
+        # Stored in project.json only; never uploaded to the remote workdir.
+        "llm": {
+            "enabled": False,
+            "provider": "",
+            "api_base": "",
+            "model": "",
+            "api_key": "",
         },
         "polling": {"interval_seconds": 300, "timeout_hours": 24},
         "notification": {"email_enabled": False},

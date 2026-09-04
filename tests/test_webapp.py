@@ -157,3 +157,129 @@ class TestWebApp:
         status = client.post("/api/deg", json={}, headers=_headers(token)).json()
         assert status["requested"] is True
         assert status["design"]["contrast"] == "trt_vs_ctrl"
+
+    def test_config_endpoint_reads_and_writes(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _new_project(client, token)
+
+        # GET: llm api_key must be masked.
+        cfg = client.get("/api/config", headers=_headers(token)).json()["config"]
+        assert cfg["server"]["host"] == "localhost"
+        assert cfg["llm"]["api_key_set"] is False
+        assert "api_key" not in cfg["llm"]
+
+        # POST: edit server settings through the audited session.
+        resp = client.post(
+            "/api/config",
+            json={"server": {"host": "login.hpc", "user": "alynn", "threads": 48, "memory_gb": 128}},
+            headers=_headers(token),
+        ).json()
+        assert resp["state"] == "drafting"
+        cfg = resp["config"]
+        assert cfg["server"]["host"] == "login.hpc"
+        assert cfg["server"]["threads"] == 48
+        assert cfg["server"]["memory_gb"] == 128
+
+        # Persisted in project.json.
+        config_path = tmp_path / "proj" / "project.json"
+        stored = json.loads(config_path.read_text(encoding="utf-8"))
+        assert stored["server"]["user"] == "alynn"
+        assert stored["server"]["host"] == "login.hpc"
+
+    def test_config_endpoint_llm_key_is_write_only(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _new_project(client, token)
+
+        resp = client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "provider": "openai", "api_base": "https://api.openai.com/v1",
+                          "model": "gpt-4o-mini", "api_key": "sk-secret-123"}},
+            headers=_headers(token),
+        ).json()
+        assert resp["state"] == "drafting"
+        assert resp["config"]["llm"]["api_key_set"] is True
+        assert "api_key" not in resp["config"]["llm"]
+
+        # Second read (no write) still masks the key.
+        cfg = client.get("/api/config", headers=_headers(token)).json()["config"]
+        assert cfg["llm"]["enabled"] is True
+        assert cfg["llm"]["api_key_set"] is True
+
+        # Clear the key.
+        resp = client.post(
+            "/api/config",
+            json={"llm": {"api_key_clear": True}},
+            headers=_headers(token),
+        ).json()
+        assert resp["config"]["llm"]["api_key_set"] is False
+
+    def test_chat_uses_llm_when_configured(self, client, tmp_path: Path, monkeypatch) -> None:
+        import requests
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "api_base": "https://api.openai.com/v1",
+                          "model": "gpt-4o-mini", "api_key": "sk-secret-123"}},
+            headers=_headers(token),
+        )
+
+        calls = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls["url"] = url
+            calls["auth"] = headers.get("Authorization")
+            calls["model"] = json["model"]
+            calls["content"] = json["messages"][-1]["content"]
+
+            class FakeResp:
+                status_code = 200
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "你好，我在。"}}]}
+
+            return FakeResp()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+        resp = client.post(
+            "/api/chat",
+            json={"message": "你好"},
+            headers=_headers(token),
+        ).json()
+        assert resp["via"] == "llm"
+        assert resp["reply"] == "你好，我在。"
+        assert calls["url"] == "https://api.openai.com/v1/chat/completions"
+        assert calls["auth"] == "Bearer sk-secret-123"
+
+    def test_chat_falls_back_to_rule_when_llm_fails(self, client, tmp_path: Path, monkeypatch) -> None:
+        import requests
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "api_base": "https://api.openai.com/v1",
+                          "model": "gpt-4o-mini", "api_key": "sk-secret-123"}},
+            headers=_headers(token),
+        )
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            class FakeResp:
+                status_code = 500
+
+                def json(self):
+                    return {}
+
+            return FakeResp()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+        # A non-actionable question hits the LLM, fails, then falls to hint.
+        resp = client.post(
+            "/api/chat",
+            json={"message": "生成执行计划"},
+            headers=_headers(token),
+        ).json()
+        # Rule router takes over.
+        assert resp.get("state") == "planned"
+        assert "steps" in resp
