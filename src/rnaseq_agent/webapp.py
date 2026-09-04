@@ -31,6 +31,7 @@ from .session import (
     SessionError,
     _load_changesets,
 )
+from .webchat import execute_intent, route_intent
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
 TEMPLATES_DIR = Path(__file__).resolve().parent / "webtemplates"
@@ -164,6 +165,48 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
         except SessionError as exc:
             return {"error": str(exc)}
 
+    @app.post("/api/deg")
+    async def api_deg(request: Request):
+        """差异表达（条件开放）状态与启用：设计门禁的结果回读。
+
+        框架 15.3：DESeq2 两组差异表达是 counts 之后的*条件开放*阶段。
+        该端点让 UI 可以查看当前样本表是否满足冻结模板
+        （两组、每组生物学重复阈值、batch 与 condition 不混杂）。
+        """
+        _guard(request)
+        session = _session_for(project_dir)
+        payload = await request.json()
+        enabled = bool(payload.get("enabled"))
+        if session.config is None:
+            return {"error": "当前还没有项目，请先创建。"}
+        try:
+            if enabled:
+                session.edit(
+                    {"pipeline": {"diffexp": {"enabled": True}}},
+                    note="Web DEG 面板启用 diffexp",
+                )
+            from .differential import (
+                DEG_DESIGN_FORMULA,
+                deg_gate,
+                diffexp_design_of,
+                diffexp_is_requested,
+            )
+
+            config = session.config
+            requested = diffexp_is_requested(config)
+            gate = deg_gate(config)
+            design = diffexp_design_of(config) if requested else None
+            return {
+                "state": session.state,
+                "requested": requested,
+                "formula": DEG_DESIGN_FORMULA,
+                "design": design,
+                "gate_ok": gate.ok,
+                "gate_reasons": gate.reasons,
+            }
+        except SessionError as exc:
+            return {"error": str(exc)}
+
     @app.post("/api/rollback")
     async def api_rollback(request: Request):
         _guard(request)
@@ -174,6 +217,46 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
             return {"state": session.state}
         except SessionError as exc:
             return {"error": str(exc)}
+
+    @app.post("/api/chat")
+    async def api_chat(request: Request):
+        """Chat panel endpoint: route intent -> audited session action.
+
+        Design doc 5.2: the assistant only emits a structured action request;
+        execution happens through the session (deterministic code). A plain
+        question with no actionable intent gets a conversational reply.
+        """
+        _guard(request)
+        payload = await request.json()
+        text = str(payload.get("message", "")).strip()
+        if not text:
+            return {"reply": "请输入想做的事。"}
+
+        session = _session_for(project_dir)
+        intent = route_intent(text)
+        if intent is None:
+            has_project = session.config is not None
+            capabilities = ", ".join(
+                c.capability_id
+                for c in __import__(
+                    "rnaseq_agent.capability", fromlist=["list_capabilities"]
+                ).list_capabilities()
+            )
+            return {
+                "reply": (
+                    "我还没理解成可执行操作。可以试试："
+                    + ("生成计划 / 确认 / 把线程改成 16 / 关闭 arriba / 回滚 / 状态。" if has_project else "先在左侧创建项目，然后对我说：生成计划、确认、把线程改成 16。")
+                    + f"\n当前能力：{capabilities}"
+                ),
+                "state": session.state,
+            }
+
+        result = execute_intent(session, intent)
+        if "error" in result:
+            result["reply"] = f"操作未完成：{result['error']}"
+        elif "reply" not in result:
+            result["reply"] = intent.message
+        return result
 
     return app
 
@@ -193,6 +276,8 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
         }
         if raw.get("fastq_2"):
             item["fastq_2"] = raw["fastq_2"]
+        if raw.get("batch"):
+            item["batch"] = raw["batch"]
         items.append(item)
 
     return {

@@ -67,7 +67,7 @@ def create_result_manifest(
 
 def _artifact_category(relative_path: str) -> str:
     top_level = relative_path.split("/", 1)[0]
-    if top_level in {"fastp", "star", "arriba", "featurecounts", "rsem"}:
+    if top_level in {"fastp", "star", "arriba", "featurecounts", "rsem", "diffexp"}:
         return "scientific"
     return "audit"
 
@@ -120,6 +120,14 @@ def _validate_required_outputs(config: dict[str, Any], root: Path) -> list[str]:
             [
                 ("featurecounts/gene_counts.txt", False),
                 ("featurecounts/gene_counts.txt.summary", False),
+            ]
+        )
+
+    if pipeline.get("diffexp", {}).get("enabled"):
+        expected.extend(
+            [
+                ("diffexp/deseq2_results.tsv", False),
+                ("diffexp/deseq2_summary.json", False),
             ]
         )
 

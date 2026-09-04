@@ -32,7 +32,6 @@ from .pipeline import (
     render_submit_script,
 )
 
-
 class AdapterError(RuntimeError):
     pass
 
@@ -167,6 +166,10 @@ def adapter_materialize(
     Called only after the Analysis Contract is frozen. Writes the three
     deterministic scripts into ``<project_dir>/generated_scripts/`` and
     returns their paths. The Execution Gateway then uploads and runs them.
+
+    When the frozen config enables the conditional diffexp stage, the
+    DESeq2 R script and its colData table are materialized too (framework
+    15.3: 条件开放 DE 阶段；单样本/混杂等设计由 DEG 门禁先行拒绝)。
     """
     project_dir = config_path.parent
     scripts_dir = project_dir / "generated_scripts"
@@ -177,6 +180,12 @@ def adapter_materialize(
         "run_pipeline.sh": render_remote_pipeline_script(config),
         "submit.sh": render_submit_script(config),
     }
+    if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+        from .differential import render_colData, render_diffexp_script
+
+        rendered["diffexp_deseq2.R"] = render_diffexp_script(config)
+        rendered["colData.tsv"] = render_colData(config)
+
     paths: dict[str, Path] = {}
     for name, content in rendered.items():
         path = scripts_dir / name

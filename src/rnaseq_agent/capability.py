@@ -42,6 +42,12 @@ WAITING_USER = "WAITING_USER"
 WAITING_HPC = "WAITING_HPC"
 STALE = "STALE"
 
+# 框架 15.3 条件开放阶段的输出产物（仅在 diffexp 启用后要求）。
+DIFFEXP_OUTPUT_ARTIFACTS: dict[str, str] = {
+    "diffexp/deseq2_results.tsv": "DESeq2 all-gene results (baseMean/lfc/padj)",
+    "diffexp/deseq2_summary.json": "DESeq2 design/contrast summary",
+}
+
 
 @dataclass(frozen=True)
 class Capability:
@@ -87,6 +93,17 @@ def register_builtin_capabilities() -> dict[str, Capability]:
     """
 
     bulk_profile = WORKFLOW_PROFILES[DEFAULT_WORKFLOW_PROFILE]
+    pipeline = bulk_profile["pipeline"]
+    output_artifacts: dict[str, str] = {
+        "featurecounts/gene_counts.txt": "gene-level count matrix",
+        "rsem/*.genes.results": "per-sample RSEM gene-level quantification",
+        "arriba/*.fusions.tsv": "fusion candidate calls (manual review required)",
+        "fastp/*.json": "per-sample fastp QC JSON",
+        "star/*.Log.final.out": "per-sample STAR alignment summary",
+    }
+    # 框架 15.3 条件开放：启用 diffexp 时才把 DE 产物列为必需输出。
+    if pipeline.get("diffexp", {}).get("enabled"):
+        output_artifacts.update(DIFFEXP_OUTPUT_ARTIFACTS)
 
     return {
         # 框架 15.2：workflow.bulk_rna.grch38_pe_expression_fusion 1.0.0
@@ -104,20 +121,14 @@ def register_builtin_capabilities() -> dict[str, Capability]:
                 "cancer_types": bulk_profile.get("cancer_types", ["pan_cancer"]),
                 "sample_mode": bulk_profile.get("sample_mode", "cohort_or_single"),
             },
-            output_artifacts={
-                "featurecounts/gene_counts.txt": "gene-level count matrix",
-                "rsem/*.genes.results": "per-sample RSEM gene-level quantification",
-                "arriba/*.fusions.tsv": "fusion candidate calls (manual review required)",
-                "fastp/*.json": "per-sample fastp QC JSON",
-                "star/*.Log.final.out": "per-sample STAR alignment summary",
-            },
+            output_artifacts=output_artifacts,
             requires_reference_keys=[
                 "star_index_dir",
                 "remote_gtf_path",
                 "remote_genome_fasta_path",
                 "rsem_index_prefix",
             ],
-            pipeline=bulk_profile["pipeline"],
+            pipeline=pipeline,
         ),
     }
 
@@ -202,6 +213,13 @@ def gate_a_check(
     for missing in missing_files or []:
         reasons.append(f"缺少输入文件：{missing}")
 
+    # 框架 15.3：diffexp 是条件开放阶段 —— 请求启用时必须满足设计门禁，
+    # 否则把整个计划置为 NOT_EVALUABLE（单样本/不足重复/混杂均在此拒绝）。
+    if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+        from .differential import diffexp_design_checks
+
+        reasons.extend(diffexp_design_checks(config))
+
     if reasons:
         return GateResult(verdict=NOT_EVALUABLE, reasons=reasons)
     return GateResult(verdict=PASS)
@@ -228,6 +246,19 @@ def build_execution_plan(capability: Capability, config: dict[str, Any]) -> Exec
         f"将对 {len(samples)} 个样本执行 {capability.capability_id} "
         f"（{' -> '.join(enabled_steps) or '无步骤'}）。"
     )
+
+    # 框架 15.3 条件开放：启用 diffexp 时把冻结设计/对比写入计划。
+    diffexp = config.get("pipeline", {}).get("diffexp", {}).get("enabled")
+    if diffexp:
+        from .differential import DEG_DESIGN_FORMULA, diffexp_design_of
+
+        design = diffexp_design_of(config)
+        steps.append(
+            f"差异表达：DESeq2 两组对比 {design['contrast']}"
+            f"（{DEG_DESIGN_FORMULA}，reference={design['reference_condition']}）"
+        )
+        summary += f" 条件开放：DESeq2 差异表达（{design['contrast']}）。"
+
     return ExecutionPlan(
         capability_id=capability.capability_id,
         config=deepcopy(config),

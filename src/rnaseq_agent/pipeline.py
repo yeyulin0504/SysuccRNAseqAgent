@@ -33,7 +33,6 @@ def render_remote_pipeline_script(config: dict[str, Any]) -> str:
     arriba_command = wrap_command(config, "arriba")
     rsem_command = wrap_command(config, "rsem-calculate-expression")
     featurecounts_command = wrap_command(config, "featureCounts")
-
     sample_blocks = []
     bam_exprs = []
     for sample in samples:
@@ -181,6 +180,28 @@ mkdir -p featurecounts
 {chr(10).join(featurecounts_lines)}
 """.strip()
 
+    # 框架 15.3 条件开放：DESeq2 差异表达（冻结 ~ condition 模板）。
+    # counts 落盘后、比对后 QC 人工检查点之前由脚本在同一 attempt 内执行；
+    # 设计门禁（单样本/不足重复/混杂）在计划冻结阶段已经拒绝非法设计。
+    diffexp_block = ""
+    if pipeline.get("diffexp", {}).get("enabled"):
+        from .differential import render_diffexp_script, render_colData
+
+        diffexp_script = "scripts/diffexp_deseq2.R"
+        col_data = "scripts/colData.tsv"
+        diffexp_block = f"""
+mkdir -p diffexp
+cat > diffexp/colData.tsv <<'RNA_AGENT_COLDATA_EOF'
+{render_colData(config)}RNA_AGENT_COLDATA_EOF
+if command -v Rscript >/dev/null 2>&1; then
+  Rscript {shell_quote(diffexp_script)} featurecounts/gene_counts.txt diffexp/colData.tsv diffexp/deseq2
+elif [ -x "$RNASEQ_RSEM_IMAGE" ]; then
+  {wrap_command(config, 'Rscript')} {shell_quote(diffexp_script)} featurecounts/gene_counts.txt diffexp/colData.tsv diffexp/deseq2
+else
+  echo "diffexp requested but Rscript is not available; skipping DE stage." >&2
+fi
+""".strip()
+
     sample_section = "\n\n".join(sample_blocks)
     env_setup_line = "source scripts/env_setup.sh" if server.get("init_commands") else ""
     prefix = f"{env_setup_line}\n\n" if env_setup_line else ""
@@ -209,6 +230,8 @@ date -Is > status/started_at.txt
 {prefix}{sample_section}
 
 {featurecounts_block}
+
+{diffexp_block}
 
 echo "completed" > status/state.txt
 date -Is > status/ended_at.txt

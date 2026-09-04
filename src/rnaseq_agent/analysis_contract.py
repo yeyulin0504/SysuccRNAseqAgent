@@ -250,6 +250,7 @@ def _workflow_snapshot(config: dict[str, Any]) -> dict[str, Any]:
                 "condition": sample.get("condition", ""),
                 "fastq_1": sample.get("fastq_1", ""),
                 "fastq_2": sample.get("fastq_2", ""),
+                "batch": str(sample.get("batch", "") or "").strip(),
             }
         )
 
@@ -292,6 +293,7 @@ def _workflow_snapshot(config: dict[str, Any]) -> dict[str, Any]:
             "items": sample_items,
         },
         "pipeline": deepcopy(config.get("pipeline", {})),
+        "diffexp": deepcopy(config.get("diffexp", {})),
     }
 
 

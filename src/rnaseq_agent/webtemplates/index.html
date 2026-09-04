@@ -44,7 +44,7 @@
   .mono { font-family: ui-monospace, Consolas, monospace; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
   .step { font-size: 12px; color: var(--muted); padding: 2px 0; }
-  .sample-input { display: grid; grid-template-columns: 1fr 1fr 1.2fr 1.2fr; gap: 8px; margin-bottom: 6px; }
+  .sample-input { display: grid; grid-template-columns: 1fr 1fr 1.2fr 1.2fr 1fr; gap: 8px; margin-bottom: 6px; }
   #history li { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
   .notice { background: rgba(240,180,41,.12); border: 1px solid rgba(240,180,41,.4);
             color: var(--warn); padding: 10px 12px; border-radius: 8px; font-size: 13px; }
@@ -108,14 +108,16 @@
           <input id="fastqDir" value="outputs/mvp_demo_data"></div>
         <div style="flex:1"><label>负责人</label><input id="owner" value="local_user"></div>
       </div>
-      <label>样本（sample_id, condition, R1, R2）</label>
+      <label>样本（sample_id, condition, R1, R2, batch[可选]）</label>
       <div class="sample-input">
         <input class="s-id" placeholder="ctrl_1"><input class="s-cond" placeholder="control">
         <input class="s-r1" placeholder="ctrl_1_R1.fastq.gz"><input class="s-r2" placeholder="ctrl_1_R2.fastq.gz">
+        <input class="s-batch" placeholder="batch">
       </div>
       <div class="sample-input">
         <input class="s-id" placeholder="trt_1"><input class="s-cond" placeholder="treatment">
         <input class="s-r1" placeholder="trt_1_R1.fastq.gz"><input class="s-r2" placeholder="trt_1_R2.fastq.gz">
+        <input class="s-batch" placeholder="batch">
       </div>
       <button onclick="createProject()">创建项目草稿</button>
     </div>
@@ -126,6 +128,16 @@
       <div class="row">
         <button onclick="doPlan()">生成执行计划</button>
         <button id="confirmBtn" class="secondary" onclick="doConfirm()">确认并冻结契约</button>
+      </div>
+    </div>
+
+    <h2>差异表达（条件开放）</h2>
+    <div class="card">
+      <div id="degStatus" class="muted">DESeq2 两组对比。需要样本满足设计门禁（两组、每组 ≥3、batch 不混杂）才能启用。</div>
+      <div class="row">
+        <button class="secondary" onclick="toggleDeg(true)">启用差异表达</button>
+        <button class="secondary" onclick="toggleDeg(false)">关闭差异表达</button>
+        <button class="secondary" onclick="degGate()">查看 DEG 门禁</button>
       </div>
     </div>
 
@@ -162,7 +174,7 @@ function refreshState() {
       document.getElementById("summary").innerHTML =
         data.summary.map(l => `<div class="step">${l}</div>`).join("");
     });
-}
+} 
 function createProject() {
   const samples = [];
   document.querySelectorAll(".sample-input").forEach(row => {
@@ -170,7 +182,8 @@ function createProject() {
     const cond = row.querySelector(".s-cond").value.trim();
     const r1 = row.querySelector(".s-r1").value.trim();
     const r2 = row.querySelector(".s-r2").value.trim();
-    if (id && cond && r1) samples.push({ sample_id: id, condition: cond, fastq_1: r1, fastq_2: r2 });
+    const batch = row.querySelector(".s-batch").value.trim();
+    if (id && cond && r1) samples.push({ sample_id: id, condition: cond, fastq_1: r1, fastq_2: r2, batch: batch || undefined });
   });
   api("/api/new", {
     project_id: document.getElementById("projectId").value,
@@ -180,7 +193,7 @@ function createProject() {
     fastq_dir: document.getElementById("fastqDir").value,
     owner: document.getElementById("owner").value,
     samples,
-  }).then(d => { if (d.error) { alert(d.error); } else { setState(d.state); refreshState(); } });
+  }).then(d => { if (d.error) { alert(d.error); } else { setState(d.state); refreshState(); degGate(); } });
 }
 function doPlan() {
   api("/api/plan").then(d => {
@@ -204,15 +217,62 @@ function doRollback() {
 function resumeQc() {
   api("/api/resume").then(d => { if (d.error) alert(d.error); else { refreshState(); } });
 }
+function renderDeg(d) {
+  const el = document.getElementById("degStatus");
+  if (d.error) { el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
+  const lines = [];
+  lines.push(d.requested ? `状态：已启用（${escapeHtml(d.formula)}）` : "状态：未启用");
+  if (d.design) lines.push(`对比：${escapeHtml(d.design.contrast)}（reference=${escapeHtml(d.design.reference_condition)}）`);
+  if (d.gate_ok) {
+    lines.push(`<span class="ok">设计门禁通过</span>`);
+  } else {
+    lines.push(`<span class="err">设计门禁未通过：</span>`);
+    (d.gate_reasons || []).forEach(r => lines.push(`<div class="step">- ${escapeHtml(r)}</div>`));
+  }
+  el.innerHTML = lines.join("<br>");
+}
+function toggleDeg(enabled) {
+  api("/api/deg", { enabled }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    renderDeg(d);
+    if (d.state) setState(d.state);
+    refreshState();
+  });
+}
+function degGate() {
+  api("/api/deg", {}).then(d => renderDeg(d));
+}
 function sendChat() {
   const q = document.getElementById("chatInput").value.trim();
   if (!q) return;
   const reply = document.getElementById("chatReply");
-  reply.innerHTML = "<span class='muted'>本地规则路由（MVP 未接 LLM）：</span><br>" +
-    "当前会话状态：" + document.getElementById("stateBadge").textContent + "<br>" +
-    "你可以继续：生成执行计划、确认冻结契约、回滚变更。";
+  reply.innerHTML = "<span class='muted'>你：</span>" + escapeHtml(q) + "<br><span class='muted'>Agent：处理中…</span>";
+  api("/api/chat", { message: q }).then(d => {
+    const head = "<span class='muted'>你：</span>" + escapeHtml(q) + "<br>";
+    if (d.steps) {
+      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
+        d.steps.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
+    } else if (d.summary) {
+      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
+        d.summary.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
+    } else if (d.gate && Array.isArray(d.gate)) {
+      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
+        d.gate.map(s => `<div class="step err">${escapeHtml(s)}</div>`).join("");
+    } else {
+      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || d.error || "完成。");
+    }
+    if (d.state) setState(d.state);
+    refreshState();
+  }).catch(err => {
+    reply.innerHTML = "<span class='err'>请求失败：" + escapeHtml(String(err)) + "</span>";
+  });
+}
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 setState("{{ session.state }}");
+{% if session.config %}degGate();{% endif %}
 </script>
 </body>
 </html>

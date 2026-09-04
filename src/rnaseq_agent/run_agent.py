@@ -309,6 +309,18 @@ def _prepare_remote_scripts(
     submit_script.write_text(render_submit_script(config), encoding="utf-8", newline="\n")
 
     rendered_paths = [env_setup_script, run_script, submit_script]
+
+    # 框架 15.3 条件开放：diffexp 启用时把冻结 DESeq2 R 脚本与 colData
+    # 一并渲染上传（run_pipeline.sh 在 counts 落盘后调用它）。
+    if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+        from .differential import render_colData, render_diffexp_script
+
+        diffexp_script = scripts_dir / "diffexp_deseq2.R"
+        diffexp_script.write_text(render_diffexp_script(config), encoding="utf-8", newline="\n")
+        col_data = scripts_dir / "colData.tsv"
+        col_data.write_text(render_colData(config), encoding="utf-8", newline="\n")
+        rendered_paths.extend([diffexp_script, col_data])
+
     if config.get("execution", {}).get("mode") == "contract":
         contract_source = project_contract_path(config_path, config)
         contract_copy = scripts_dir / "analysis_contract.json"
@@ -425,7 +437,7 @@ def _download_results(
     pack_cmd = (
         f"umask 077 && cd {shell_quote(remote_workdir)} && "
         "paths=(); "
-        "for d in scripts logs fastp star arriba featurecounts rsem status; do "
+        "for d in scripts logs fastp star arriba featurecounts rsem diffexp status; do "
         'if [ -e "$d" ]; then paths+=("$d"); fi; '
         "done; "
         f"tar -czf {shell_quote(remote_tar)} \"${{paths[@]}}\""

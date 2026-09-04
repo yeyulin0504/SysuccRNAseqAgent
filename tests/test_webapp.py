@@ -6,6 +6,7 @@ QC checkpoint interrupt surfaced as a resume action.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -100,3 +101,59 @@ class TestWebApp:
         _new_project(client, token)
         resp = client.post("/api/resume", headers=_headers(token)).json()
         assert "error" in resp  # not in WAITING_USER yet
+
+    def test_chat_routes_intent_to_session(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _new_project(client, token)
+
+        # Chat requests the plan in natural language.
+        resp = client.post(
+            "/api/chat",
+            json={"message": "生成执行计划"},
+            headers=_headers(token),
+        ).json()
+        assert resp.get("state") == "planned"
+        assert "steps" in resp
+
+        # Chat edits the thread count.
+        resp = client.post(
+            "/api/chat",
+            json={"message": "把线程改成 24"},
+            headers=_headers(token),
+        ).json()
+        assert resp.get("state") == "drafting"
+        assert "操作未完成" not in resp.get("reply", "")
+
+        # Threads change is persisted in the config snapshot.
+        config_path = tmp_path / "proj" / "project.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert config["server"]["threads"] == 24
+
+    def test_chat_unrecognized_returns_hint(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _new_project(client, token)
+        resp = client.post(
+            "/api/chat",
+            json={"message": "今天的天气怎么样"},
+            headers=_headers(token),
+        ).json()
+        assert "reply" in resp
+
+    def test_deg_endpoint_reports_and_enables(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _new_project(client, token)
+
+        # 初始未启用。
+        status = client.post("/api/deg", json={}, headers=_headers(token)).json()
+        assert status["requested"] is False
+
+        # 启用：2 样本 1v1 会触发设计门禁失败。
+        status = client.post("/api/deg", json={"enabled": True}, headers=_headers(token)).json()
+        assert status["requested"] is True
+        assert status["gate_ok"] is False
+        assert any("重复" in reason or "单样本" in reason for reason in status["gate_reasons"])
+
+        # 回读。
+        status = client.post("/api/deg", json={}, headers=_headers(token)).json()
+        assert status["requested"] is True
+        assert status["design"]["contrast"] == "trt_vs_ctrl"

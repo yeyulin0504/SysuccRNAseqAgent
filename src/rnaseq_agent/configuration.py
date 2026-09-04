@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .defaults import DEFAULT_CONTAINER, DEFAULT_PIPELINE, DEFAULT_REFERENCE
+from .defaults import DEFAULT_CONTAINER, DEFAULT_DIFFEXP, DEFAULT_PIPELINE, DEFAULT_REFERENCE
 
 
 def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -34,6 +34,11 @@ def normalize_config(config: dict[str, Any]) -> dict[str, Any]:
     container = {**DEFAULT_CONTAINER, **normalized.get("container", {})}
     container.setdefault("bind_paths", [])
     normalized["container"] = container
+
+    diffexp = {**DEFAULT_DIFFEXP, **normalized.get("diffexp", {})}
+    diffexp.setdefault("formula", DEFAULT_DIFFEXP["formula"])
+    diffexp.setdefault("min_replicates_per_group", DEFAULT_DIFFEXP["min_replicates_per_group"])
+    normalized["diffexp"] = diffexp
 
     normalized.setdefault("notification", {"email_enabled": False})
     normalized.setdefault("sequencing", {"layout": "paired", "strandedness": "auto"})

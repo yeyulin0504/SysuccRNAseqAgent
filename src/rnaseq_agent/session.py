@@ -407,6 +407,17 @@ class ProjectSession:
                 f"调度器：{server.get('scheduler', 'unknown')}，"
                 f"远程目录：{server.get('remote_workdir', '')}"
             )
+            # 框架 15.3：条件开放阶段可见性。
+            if self.config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+                from .differential import DEG_DESIGN_FORMULA, diffexp_design_of
+
+                design = diffexp_design_of(self.config)
+                lines.append(
+                    f"差异表达（条件开放）：DESeq2 {DEG_DESIGN_FORMULA}，"
+                    f"对比 {design['contrast']}（reference={design['reference_condition']}）"
+                )
+            elif self.config.get("diffexp"):
+                lines.append("差异表达：未启用（DESeq2 条件开放，可对会话说“打开差异表达”）。")
         if self.execution_plan:
             lines.append("已生成执行计划：")
             lines.extend(f"  - {step}" for step in self.execution_plan.steps)

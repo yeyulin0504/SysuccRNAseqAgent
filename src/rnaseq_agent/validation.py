@@ -257,6 +257,16 @@ def _pipeline_errors(config: dict[str, Any]) -> list[str]:
         if pipeline.get(step, {}).get("enabled", False) and not star_enabled:
             errors.append(f"{step} requires star to be enabled.")
 
+    # 框架 15.3：diffexp（条件开放）需要 STAR 比对与 featureCounts counts。
+    if pipeline.get("diffexp", {}).get("enabled"):
+        if not star_enabled:
+            errors.append("diffexp requires star to be enabled.")
+        if not pipeline.get("featurecounts", {}).get("enabled", False):
+            errors.append("diffexp requires featurecounts to be enabled.")
+        from .differential import diffexp_design_checks
+
+        errors.extend(diffexp_design_checks(config))
+
     reference = config.get("reference", {})
     required_reference_keys = []
     if pipeline.get("star", {}).get("enabled", True):

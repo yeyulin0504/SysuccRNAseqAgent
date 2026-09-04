@@ -102,6 +102,26 @@ def node_adapter_plan(state: BulkRNAState) -> BulkRNAState:
     }
 
 
+def node_diffexp_gate(state: BulkRNAState) -> BulkRNAState:
+    """条件开放（框架 15.3）：diffexp 启用时执行 DEG 设计门禁。
+
+    门禁只接受冻结的非配对两组设计（每组达到生物学重复阈值、batch 与
+    condition 不混杂）。不通过时返回 NOT_EVALUABLE 并附可解释原因；
+    未启用 diffexp 时该节点直接放行（PASS）。
+    """
+    from .differential import deg_gate, diffexp_is_requested
+
+    session = _session(state)
+    if session.config is None:
+        return {"status": FAIL, "message": "会话尚无项目配置。"}
+    if not diffexp_is_requested(session.config):
+        return {"status": PASS, "message": "diffexp 未启用，跳过差异表达门禁。"}
+    gate = deg_gate(session.config)
+    if not gate.ok:
+        return {"status": NOT_EVALUABLE, "message": "DEG 设计门禁未通过：" + "; ".join(gate.reasons)}
+    return {"status": PASS, "message": "DEG 设计门禁通过：满足冻结的非配对两组模板。"}
+
+
 def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
     """Checkpoint #4 (framework 6.1): pause for QC confirmation before STAR.
 
@@ -192,6 +212,12 @@ def _edge_after_gate_a(state: BulkRNAState) -> str:
 
 def _edge_after_plan(state: BulkRNAState) -> str:
     if state.get("status") == PLANNED:
+        return "diffexp_gate"
+    return "end_fail"
+
+
+def _edge_after_diffexp_gate(state: BulkRNAState) -> str:
+    if state.get("status") == PASS:
         return "wait_qc"
     return "end_fail"
 
@@ -226,6 +252,7 @@ def build_bulk_rna_graph():
     builder = StateGraph(BulkRNAState)
     builder.add_node("gate_a", node_gate_a)
     builder.add_node("adapter_plan", node_adapter_plan)
+    builder.add_node("diffexp_gate", node_diffexp_gate)
     builder.add_node("wait_qc", node_wait_qc)
     builder.add_node("confirm_contract", node_confirm_contract)
     builder.add_node("execute", node_execute)
@@ -237,6 +264,7 @@ def build_bulk_rna_graph():
     builder.add_edge(START, "gate_a")
     builder.add_conditional_edges("gate_a", _edge_after_gate_a)
     builder.add_conditional_edges("adapter_plan", _edge_after_plan)
+    builder.add_conditional_edges("diffexp_gate", _edge_after_diffexp_gate)
     builder.add_conditional_edges("wait_qc", _edge_after_qc)
     builder.add_edge("confirm_contract", "execute")
     builder.add_edge("execute", "validate_output")
