@@ -91,7 +91,13 @@ def _validate_required_outputs(
         ("status/state.txt", False),
     ]
     # Stage-scoped validation (说明书 §5 分阶段)。None = 全流程单次运行。
-    from .pipeline import STAGE_CMS, STAGE_DE, STAGE_QC, STAGE_QUANT
+    from .pipeline import (
+        STAGE_CMS,
+        STAGE_COUNTS,
+        STAGE_DE,
+        STAGE_QC,
+        STAGE_QUANT,
+    )
 
     def _enabled(step: str) -> bool:
         if stage is None:
@@ -144,7 +150,7 @@ def _validate_required_outputs(
             ]
         )
 
-    if _enabled("diffexp") and (stage is None or stage == STAGE_DE):
+    if _enabled("diffexp") and (stage is None or stage in (STAGE_DE, STAGE_COUNTS)):
         expected.extend(
             [
                 ("diffexp/deseq2_results.tsv", False),
@@ -152,7 +158,7 @@ def _validate_required_outputs(
             ]
         )
 
-    if _enabled("cms") and (stage is None or stage == STAGE_CMS):
+    if _enabled("cms") and (stage is None or stage in (STAGE_CMS, STAGE_COUNTS)):
         expected.extend(
             [
                 ("cms/cms_result.csv", False),

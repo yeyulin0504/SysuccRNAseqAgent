@@ -175,6 +175,34 @@ def render_diffexp_script(config: dict[str, Any]) -> str:
     ``treatment vs reference`` as resolved by ``diffexp_design_of``. Outputs
     land in ``<workdir>/diffexp/``. No arbitrary formulas are reachable.
     """
+    return _render_diffexp_script(
+        config,
+        counts_source="featurecounts/gene_counts.txt",
+        counts_note="# 输入：featureCounts gene_counts.txt（第一列是基因 id）",
+    )
+
+
+def render_diffexp_counts_script(config: dict[str, Any]) -> str:
+    """Render the DESeq2 script for the *counts 直入* entry.
+
+    The uploaded matrix lives at ``<workdir>/counts_matrix.tsv`` (first column
+    gene id, one column per sample). Sample conditions/batches come from the
+    frozen colData block declared in ``config.samples.items``. The DESeq2
+    design/contrast rules are identical to the pipeline entry.
+    """
+    return _render_diffexp_script(
+        config,
+        counts_source="counts_matrix.tsv",
+        counts_note="# 输入：用户上传的 counts_matrix.tsv（第一列为基因 id）",
+    )
+
+
+def _render_diffexp_script(
+    config: dict[str, Any],
+    *,
+    counts_source: str,
+    counts_note: str,
+) -> str:
     design = diffexp_design_of(config)
     contrast = design["contrast"]
     reference = design["reference_condition"]
@@ -190,13 +218,14 @@ suppressMessages({{ library(DESeq2) }})
 suppressMessages({{ library(jsonlite) }})
 
 args <- commandArgs(trailingOnly = TRUE)
-counts_file <- if (length(args) >= 1) args[[1]] else "featurecounts/gene_counts.txt"
+counts_file <- if (length(args) >= 1) args[[1]] else "{counts_source}"
 coldata_file <- if (length(args) >= 2) args[[2]] else "diffexp/colData.tsv"
 out_prefix <- if (length(args) >= 3) args[[3]] else "diffexp/deseq2"
 
 dir.create("diffexp", showWarnings = FALSE, recursive = TRUE)
 counts <- as.matrix(read.delim(counts_file, row.names = 1, check.names = FALSE))
 coldata <- read.delim(coldata_file, row.names = 1, check.names = FALSE)
+{counts_note}
 
 coldata$condition <- factor(coldata$condition, levels = c({ref_r}, {trt_r}))
 stopifnot(all(rownames(coldata) %in% colnames(counts)))

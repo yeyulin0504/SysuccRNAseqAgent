@@ -11,7 +11,8 @@ STAGE_QC = "qc"      # fastp（+ MultiQC 汇总，若站点提供）
 STAGE_QUANT = "quant"  # STAR -> featureCounts + RSEM + Arriba（比对后 QC 检查点前）
 STAGE_DE = "de"      # 条件开放：DESeq2 差异表达 / fgsea 富集
 STAGE_CMS = "cms"    # 条件开放：CMScaller CMS 结直肠癌分子分型
-ALL_STAGES = (STAGE_QC, STAGE_QUANT, STAGE_DE, STAGE_CMS)
+STAGE_COUNTS = "counts"  # counts 直入：DESeq2 差异表达 / CMScaller CMS（无 FASTQ 处理）
+ALL_STAGES = (STAGE_QC, STAGE_QUANT, STAGE_DE, STAGE_CMS, STAGE_COUNTS)
 
 
 def pipeline_stages(config: dict[str, Any]) -> list[str]:
@@ -22,9 +23,21 @@ def pipeline_stages(config: dict[str, Any]) -> list[str]:
     stage (Stage 3) runs only when ``pipeline.diffexp.enabled`` is true, and
     the conditional CMS stage (Stage 4) only when ``pipeline.cms.enabled`` is
     true.
+
+    Counts 直入（2026-09-08）：当 ``cms.run_mode == "counts"`` 时 diffexp/cms
+    不再挂在 FASTQ 主流程后，而是单独由 ``de_cms_counts`` 阶段执行（上游
+    featurecounts 产物不再被引用）；此时主流程只剩 qc/quant（若显式禁用
+    fastp/star 则主流程为空），diffexp 与 cms 都在 counts 阶段运行。
     """
     pipeline = config.get("pipeline", {})
+    # counts 直入会关闭主流程对 featureCounts 的依赖，diffexp/cms 读上传矩阵。
+    counts_entry = _counts_entry_enabled(config)
     stages: list[str] = []
+    if counts_entry:
+        # counts 直入：可选的 FASTQ 主流程与 counts 阶段互斥路径留给上层执行
+        # 编排决定；这里只保证 diffexp/cms 不再错误地作为主流程追加阶段出现。
+        stages.append(STAGE_COUNTS)
+        return stages
     if pipeline.get("fastp", {}).get("enabled"):
         stages.append(STAGE_QC)
     quant_enabled = any(
@@ -38,6 +51,15 @@ def pipeline_stages(config: dict[str, Any]) -> list[str]:
     if pipeline.get("cms", {}).get("enabled"):
         stages.append(STAGE_CMS)
     return stages
+
+
+def _counts_entry_enabled(config: dict[str, Any]) -> bool:
+    """Whether the FASTQ main pipeline is bypassed for a counts 直入 stage."""
+    from .cms import COUNTS_ENTRY, cms_run_mode
+
+    if cms_run_mode(config) == COUNTS_ENTRY:
+        return True
+    return bool(config.get("study", {}).get("input", {}).get("counts_matrix"))
 
 
 def render_env_setup_script(config: dict[str, Any]) -> str:
@@ -629,6 +651,46 @@ else
 fi
 """.strip()
         )
+
+    elif stage == STAGE_COUNTS:
+        # counts 直入（2026-09-08）：DESeq2 差异表达 + CMScaller CMS 在同一
+        # 阶段执行，输入为上传的 counts_matrix.tsv（样本设计冻结在 colData）。
+        from .differential import render_colData
+
+        blocks: list[str] = [
+            f"""
+mkdir -p diffexp
+cat > diffexp/colData.tsv <<'RNA_AGENT_COLDATA_EOF'
+{render_colData(config)}RNA_AGENT_COLDATA_EOF
+""".strip()
+        ]
+        if pipeline.get("diffexp", {}).get("enabled"):
+            blocks.append(
+                f"""
+mkdir -p diffexp
+if command -v Rscript >/dev/null 2>&1; then
+  Rscript scripts/diffexp_counts_deseq2.R counts_matrix.tsv diffexp/colData.tsv diffexp/deseq2
+elif [ -n "$RNASEQ_RSEM_IMAGE" ] && [ -x "$RNASEQ_RSEM_IMAGE" ]; then
+  {wrap_command(config, 'Rscript')} scripts/diffexp_counts_deseq2.R counts_matrix.tsv diffexp/colData.tsv diffexp/deseq2
+else
+  echo "diffexp requested but Rscript is not available; skipping DE stage." >&2
+fi
+""".strip()
+            )
+        if pipeline.get("cms", {}).get("enabled"):
+            blocks.append(
+                f"""
+mkdir -p cms
+if command -v Rscript >/dev/null 2>&1; then
+  Rscript scripts/cms_counts_cmscaller.R counts_matrix.tsv cms/cms
+elif [ -n "$RNASEQ_RSEM_IMAGE" ] && [ -x "$RNASEQ_RSEM_IMAGE" ]; then
+  {wrap_command(config, 'Rscript')} scripts/cms_counts_cmscaller.R counts_matrix.tsv cms/cms
+else
+  echo "cms requested but Rscript is not available; skipping CMS stage." >&2
+fi
+""".strip()
+            )
+        body.extend(blocks)
 
     header = _script_header(config, stage)
     footer = _script_footer(config, stage)

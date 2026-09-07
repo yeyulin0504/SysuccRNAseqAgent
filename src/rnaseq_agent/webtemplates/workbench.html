@@ -6,76 +6,103 @@
 <title>SYSU 多组学分析 Agent — 分析工作台</title>
 <style>
   :root {
-    --bg: #0f1420; --panel: #1a2130; --border: #2b3550;
-    --text: #e6e9f0; --muted: #8b94a8; --accent: #4da3ff;
-    --ok: #3ecf8e; --warn: #f0b429; --err: #e05c5c;
+    --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --accent-weak: #ddf4ff; --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    --shadow: 0 1px 2px rgba(31,35,40,.06);
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-         background: var(--bg); color: var(--text); }
+         background: var(--bg); color: var(--text); font-size: 14px; }
   header { padding: 12px 24px; border-bottom: 1px solid var(--border);
-           display: flex; align-items: center; gap: 14px; }
+           display: flex; align-items: center; gap: 14px; background: var(--panel); }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .crumb { color: var(--muted); font-size: 13px; }
   nav { margin-left: auto; display: flex; gap: 10px; }
   nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  nav a:hover { text-decoration: underline; }
   .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px;
-           border: 1px solid var(--border); color: var(--muted); }
-  .state { font-size: 12px; padding: 3px 10px; border-radius: 20px; }
-  .state.planned { background: rgba(77,163,255,.15); color: var(--accent); }
-  .state.confirmed { background: rgba(62,207,142,.15); color: var(--ok); }
-  .state.waiting { background: rgba(240,180,41,.18); color: var(--warn); }
-  .state.waiting_user { background: rgba(240,180,41,.18); color: var(--warn); }
-  .state.drafting { background: rgba(139,148,168,.15); color: var(--muted); }
-  .state.completed { background: rgba(62,207,142,.15); color: var(--ok); }
-  .state.failed, .state.error { background: rgba(224,92,92,.15); color: var(--err); }
-  .state.idle { background: rgba(139,148,168,.15); color: var(--muted); }
+           border: 1px solid var(--border); color: var(--muted); background: var(--bg); }
+  .state { font-size: 12px; padding: 3px 10px; border-radius: 20px; white-space: nowrap; }
+  .state.planned { background: rgba(9,105,218,.12); color: var(--accent); }
+  .state.confirmed { background: rgba(26,127,55,.12); color: var(--ok); }
+  .state.waiting, .state.waiting_user { background: rgba(154,103,0,.14); color: var(--warn); }
+  .state.drafting { background: rgba(101,109,118,.14); color: var(--muted); }
+  .state.completed { background: rgba(26,127,55,.12); color: var(--ok); }
+  .state.failed, .state.error, .state.FAIL, .state.NOT_EVALUABLE { background: rgba(207,34,46,.12); color: var(--err); }
+  .state.idle { background: rgba(101,109,118,.14); color: var(--muted); }
+  .state.executing { background: rgba(9,105,218,.12); color: var(--accent); }
 
-  .layout { display: grid; grid-template-columns: 250px 1fr 320px; height: calc(100vh - 60px); }
+  .layout { display: grid; grid-template-columns: 260px 1fr 330px; height: calc(100vh - 58px); }
   .left { border-right: 1px solid var(--border); padding: 14px; overflow: auto; }
   .middle { padding: 16px 20px; overflow: auto; }
   .right { border-left: 1px solid var(--border); padding: 14px; overflow: auto; }
 
   h2 { font-size: 12px; color: var(--muted); text-transform: uppercase;
        letter-spacing: .5px; margin: 16px 0 8px; }
-  .card { background: var(--panel); border: 1px solid var(--border);
-          border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .card { background: var(--bg); border: 1px solid var(--border);
+          border-radius: 10px; padding: 14px; margin-bottom: 12px; box-shadow: var(--shadow); }
   .card h3 { margin: 0 0 8px; font-size: 14px; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
-  input, textarea { width: 100%; background: var(--bg); border: 1px solid var(--border);
+  .card h3 .tag { font-size: 11px; font-weight: 500; color: var(--accent);
+    background: var(--accent-weak); border-radius: 12px; padding: 1px 8px; margin-left: 6px; }
+  label { display: block; font-size: 12px; color: var(--text); font-weight: 600; margin: 8px 0 4px; }
+  .hint { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  input, textarea, select { width: 100%; background: var(--bg); border: 1px solid var(--border);
         border-radius: 6px; color: var(--text); padding: 7px 9px; font-size: 13px; }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(9,105,218,.12); }
   textarea { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
   button { background: var(--accent); color: #fff; border: none; border-radius: 6px;
-           padding: 7px 14px; font-size: 13px; cursor: pointer; margin-top: 10px; }
-  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
-  button.small { padding: 4px 9px; font-size: 12px; margin-top: 4px; }
+           padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 10px; }
+  button:hover { filter: brightness(1.06); }
+  button.secondary { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+  button.secondary:hover { background: var(--panel); filter: none; }
+  button.small { padding: 4px 10px; font-size: 12px; margin-top: 4px; }
+  button.danger { background: var(--err); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  .row { display: flex; gap: 10px; }
-  .row > div { flex: 1; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
   .muted { color: var(--muted); font-size: 12px; }
   .mono { font-family: ui-monospace, Consolas, monospace; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
   .step { font-size: 12px; color: var(--muted); padding: 2px 0; }
-  .notice { background: rgba(240,180,41,.12); border: 1px solid rgba(240,180,41,.4);
+  .notice { background: rgba(154,103,0,.1); border: 1px solid rgba(154,103,0,.35);
             color: var(--warn); padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px; }
-  .hidden { display: none; }
+  .hidden { display: none !important; }
 
   .list { list-style: none; margin: 0; padding: 0; }
   .list li { padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13px;
              display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-  .list li:hover { background: rgba(77,163,255,.08); }
-  .list li.active { background: rgba(77,163,255,.16); border: 1px solid var(--accent); }
+  .list li:hover { background: var(--panel); }
+  .list li.active { background: var(--accent-weak); border: 1px solid var(--accent); }
   .list .sub { color: var(--muted); font-size: 11px; }
 
   .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
-  .tabs button { flex: 1; background: transparent; border: 1px solid var(--border);
-                 color: var(--muted); padding: 7px 4px; margin-top: 0; font-size: 12px; }
-  .tabs button.active { color: var(--accent); border-color: var(--accent); }
+  .tabs button { flex: 1; background: var(--bg); border: 1px solid var(--border);
+                 color: var(--muted); padding: 7px 4px; margin-top: 0; font-size: 12px; font-weight: 500; }
+  .tabs button.active { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); color: var(--text); }
-  th { color: var(--muted); font-weight: 500; }
-  .sample-input { display: grid; grid-template-columns: 1fr 1fr 1.2fr 1.2fr 1fr; gap: 6px; margin-bottom: 6px; }
+  th { color: var(--muted); font-weight: 600; }
+
+  /* ---- 新建草稿表单 ---- */
+  .seg { display: flex; gap: 6px; }
+  .seg button { flex: 1; background: var(--panel); border: 1px solid var(--border);
+                color: var(--muted); padding: 8px 6px; margin-top: 6px; font-weight: 500; }
+  .seg button.active { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+  .seg-hint { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+  .sample-head, .sample-row { display: grid; grid-template-columns: 1fr 1fr 1.6fr 1.6fr 1fr 32px; gap: 6px; align-items: center; }
+  .sample-head { font-size: 12px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+  .sample-row { margin-bottom: 6px; }
+  .icon-btn { background: transparent; border: none; color: var(--err); cursor: pointer;
+              font-size: 16px; padding: 4px; margin-top: 0; }
+  .icon-btn:hover { background: rgba(207,34,46,.1); border-radius: 4px; }
+  .add-row { color: var(--accent); background: none; border: none; cursor: pointer;
+             font-size: 12px; padding: 4px 0; margin-top: 2px; text-align: left; }
+  .add-row:hover { text-decoration: underline; }
+  .ref-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
+  .ref-grid .full { grid-column: 1 / -1; }
 </style>
 </head>
 <body>
@@ -96,82 +123,159 @@
     <h2>项目</h2>
     <div class="card">
       <ul class="list" id="projectList"><li class="muted">加载中…</li></ul>
+      <a href="/"><button class="secondary small">＋ 新建项目</button></a>
     </div>
 
     <h2>对话</h2>
     <div class="card">
       <ul class="list" id="threadList"><li class="muted">请先选择一个项目。</li></ul>
       <div class="row">
-        <button class="small" onclick="newThread()">新建对话</button>
+        <button class="small" onclick="newThread()">新建</button>
         <button class="small secondary" onclick="renameThread()">重命名</button>
         <button class="small secondary" onclick="archiveThread()">归档</button>
       </div>
     </div>
   </div>
 
-  <!-- ============ 中栏：对话与决策 ============ -->
+  <!-- ============ 中栏：配置与操作 ============ -->
   <div class="middle">
     <div id="qcNotice" class="notice hidden">
-      <b>QC 检查点（框架 6.1）</b>：fastp QC 已完成。请审阅后确认，进入 STAR 比对。
-      <button onclick="resumeQc()">确认 QC，继续</button>
+      <b>QC 检查点</b>：fastp QC 已完成。请审阅后确认，进入后续阶段。
+      <button class="secondary small" onclick="resumeQc()">确认 QC，继续</button>
     </div>
 
-    <h2>当前对话</h2>
-    <div class="card">
-      <div class="muted" id="threadTitle">（未选择对话）</div>
-      <div id="messages" class="muted"></div>
-    </div>
-
-    <h2>新建项目草稿</h2>
+    <!-- 新建项目草稿 -->
+    <h2>新建分析草稿</h2>
     <div class="card">
       <div class="row">
-        <div><label>项目 ID</label><input id="projectId" placeholder="demo_001"></div>
-        <div><label>项目名称</label><input id="title" placeholder="Bulk RNA 差异分析"></div>
-        <div><label>癌种</label><input id="cancerType" value="pan_cancer"></div>
+        <div><label>项目 ID</label><input id="projectId" placeholder="crc_01"></div>
+        <div><label>项目名称</label><input id="title" placeholder="CRC 差异表达"></div>
+        <div><label>癌种 <span class="hint">CMS 仅 CRC</span></label>
+          <input id="cancerType" list="cancerOpts" value="pan_cancer">
+          <datalist id="cancerOpts">
+            <option value="pan_cancer">泛癌（不支持 CMS）</option>
+            <option value="crc">结直肠癌 CRC</option>
+            <option value="coad">结肠腺癌 COAD</option>
+            <option value="read">直肠腺癌 READ</option>
+          </datalist>
+        </div>
       </div>
       <div class="row">
-        <div><label>实验设计</label><input id="design" value="independent_two_group"></div>
-        <div><label>本地 FASTQ 目录</label><input id="fastqDir" value="outputs/mvp_demo_data"></div>
+        <div><label>实验设计</label>
+          <select id="design">
+            <option value="independent_two_group">独立两组（组间差异）</option>
+            <option value="single_group">单组队列</option>
+          </select>
+        </div>
+        <div><label>测序布局</label>
+          <select id="layout">
+            <option value="paired">双端 paired-end</option>
+            <option value="single">单端 single-end</option>
+          </select>
+        </div>
         <div><label>负责人</label><input id="owner" value="local_user"></div>
       </div>
-      <label>样本（sample_id, condition, R1, R2, batch[可选]）</label>
-      <div class="sample-input">
-        <input class="s-id" placeholder="ctrl_1"><input class="s-cond" placeholder="control">
-        <input class="s-r1" placeholder="ctrl_1_R1.fastq.gz"><input class="s-r2" placeholder="ctrl_1_R2.fastq.gz">
-        <input class="s-batch" placeholder="batch">
+
+      <label>数据来源</label>
+      <div class="seg">
+        <button type="button" id="srcLocal" class="active" onclick="setDataSource('local_upload')">本地上传 FASTQ</button>
+        <button type="button" id="srcRemote" onclick="setDataSource('remote_path')">服务器已有 FASTQ</button>
       </div>
-      <div class="sample-input">
-        <input class="s-id" placeholder="trt_1"><input class="s-cond" placeholder="treatment">
-        <input class="s-r1" placeholder="trt_1_R1.fastq.gz"><input class="s-r2" placeholder="trt_1_R2.fastq.gz">
-        <input class="s-batch" placeholder="batch">
+      <div class="seg-hint" id="sourceHint"></div>
+      <div id="localDirRow" class="row">
+        <div><label>本地 FASTQ 目录 <span class="hint">绝对路径，示例：D:/data/rnaseq/raw</span></label>
+          <input id="fastqDir" placeholder="D:/data/rnaseq/raw_fastq"></div>
       </div>
+      <div id="remoteDirRow" class="hidden row">
+        <div><label>服务器 FASTQ 目录 <span class="hint">HPC 上已存在的绝对路径，直接读取不再上传</span></label>
+          <input id="remoteFastqDir" placeholder="/data/users/you/crc_raw"></div>
+      </div>
+
+      <div class="row">
+        <div><label>参考文件：GTF 注释</label><input id="gtf" placeholder="/ref/gencode.v47.gtf"></div>
+        <div><label>参考文件：基因组 FASTA</label><input id="genomeFasta" placeholder="/ref/GRCh38.fa"></div>
+        <div><label>STAR 索引目录</label><input id="starIndex" placeholder="/ref/star_2.7.11b"></div>
+        <div><label>RSEM 索引前缀</label><input id="rsemPrefix" placeholder="/ref/rsem/rsem_gencode_v47"></div>
+      </div>
+
+      <label>样本表 <span class="hint">至少一行。R1/R2 填写 FASTQ 文件名（相对上面目录）。</span></label>
+      <div class="sample-head">
+        <span>样本 ID</span><span>条件 condition</span><span>R1 文件名</span><span>R2 文件名（双端）</span><span>批次 batch（可选）</span><span></span>
+      </div>
+      <div id="sampleRows"></div>
+      <button class="add-row" onclick="addSampleRow()">＋ 增加一行样本</button>
+
       <button onclick="createDraft()">创建项目草稿</button>
+      <span id="draftErr" class="err"></span>
     </div>
 
-    <h2>流程</h2>
+    <!-- counts 直入 -->
+    <h2>Counts 直接分析</h2>
     <div class="card">
-      <div id="planSteps" class="muted">尚未生成计划。创建项目草稿后点击「生成执行计划」。</div>
+      <p class="muted" style="margin:0 0 6px">不经过 FASTQ 处理：直接上传表达计数矩阵，运行差异表达（DESeq2）或 CMS 分子分型（CMScaller）。</p>
+      <input type="file" id="countsFile" accept=".tsv,.csv,.txt" style="padding:4px">
+      <div class="row">
+        <div>
+          <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
+            <input type="checkbox" id="countsDe" style="width:auto"> DESeq2 差异表达
+          </label>
+          <input id="countsRef" placeholder="参考组 condition，如 control">
+        </div>
+        <div>
+          <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
+            <input type="checkbox" id="countsCms" style="width:auto"> CMS 结直肠癌分型
+          </label>
+          <input id="countsCancer" placeholder="癌种，CMS 需 crc">
+        </div>
+      </div>
+      <button onclick="runCounts()">上传矩阵并创建分析</button>
+      <span id="countsErr" class="err"></span>
+    </div>
+
+    <!-- 流程控制 -->
+    <h2>流程控制</h2>
+    <div class="card">
+      <div id="planSteps" class="muted">尚未生成计划。创建草稿后点击「生成执行计划」。</div>
       <div class="row">
         <button onclick="doPlan()">生成执行计划</button>
         <button id="confirmBtn" class="secondary" onclick="doConfirm()">确认并冻结契约</button>
         <button class="secondary" onclick="doRollback()">回滚</button>
       </div>
+      <div id="flowStatus" class="step"></div>
     </div>
 
-    <h2>差异表达（条件开放）</h2>
-    <div class="card">
-      <div id="degStatus" class="muted">DESeq2 两组对比。需要样本满足设计门禁（两组、每组 ≥3、batch 不混杂）才能启用。</div>
-      <div class="row">
-        <button class="secondary" onclick="toggleDeg(true)">启用差异表达</button>
-        <button class="secondary" onclick="toggleDeg(false)">关闭差异表达</button>
-        <button class="secondary" onclick="degGate()">查看 DEG 门禁</button>
+    <!-- 条件开放能力 -->
+    <h2>条件开放：差异表达与分型</h2>
+    <div class="row">
+      <div class="card" style="flex:1">
+        <h3>差异表达 <span class="tag">DESeq2</span></h3>
+        <div id="degStatus" class="muted">未启用。两组独立设计（每组 ≥3 生物学重复、无混杂）时可启用。</div>
+        <div id="degRefRow" class="hidden">
+          <label>参考组 condition</label>
+          <input id="degRef" placeholder="control">
+        </div>
+        <div class="row">
+          <button class="secondary small" onclick="degGate()">查看门禁</button>
+          <button class="secondary small" onclick="toggleDeg(true)">启用</button>
+          <button class="secondary small" onclick="toggleDeg(false)">关闭</button>
+        </div>
+      </div>
+      <div class="card" style="flex:1">
+        <h3>CMS 分子分型 <span class="tag">CMScaller</span></h3>
+        <div id="cmsStatus" class="muted">未启用。仅结直肠癌（CRC），样本 ≥ 30，依赖 counts。</div>
+        <div class="row">
+          <button class="secondary small" onclick="cmsGate()">查看门禁</button>
+          <button class="secondary small" onclick="toggleCms(true)">启用</button>
+          <button class="secondary small" onclick="toggleCms(false)">关闭</button>
+        </div>
       </div>
     </div>
 
+    <!-- 对话与决策 -->
     <h2>对话与决策</h2>
     <div class="card">
       <textarea id="chatInput" rows="3"
-        placeholder="向 Agent 提问，例如：请解释当前流程的 QC 阈值"></textarea>
+        placeholder="向 Agent 提问，例如：请解释当前流程的 QC 阈值、把线程改成 16、以 control 为对照跑差异表达"></textarea>
       <button onclick="sendChat()">发送</button>
       <div id="chatReply" class="muted" style="margin-top:10px"></div>
     </div>
@@ -214,7 +318,6 @@ async function api(method, path, body) {
   return resp.json();
 }
 
-// 旧的单项目会话端点：把当前选中的项目作为 ``?project=`` 带上。
 function legacy(path) {
   if (!currentProject) return path;
   return path + (path.indexOf("?") >= 0 ? "&" : "?") + "project=" + encodeURIComponent(currentProject);
@@ -229,7 +332,8 @@ function setState(state) {
   const badge = document.getElementById("stateBadge");
   const s = String(state || "");
   badge.textContent = s;
-  badge.className = "state " + s.toLowerCase().replace("waiting_user", "waiting");
+  const cls = s.toLowerCase();
+  badge.className = "state " + cls;
   document.getElementById("confirmBtn").disabled = s !== "planned";
 }
 
@@ -260,6 +364,8 @@ function selectProject(id) {
   url.searchParams.set("project", id);
   history.pushState({}, "", url);
   document.getElementById("projectName").textContent = id;
+  document.getElementById("projectId").value = id;
+  document.getElementById("title").placeholder = id;
   loadProjects();
   loadThreads();
   refreshAll();
@@ -300,6 +406,7 @@ function selectThread(tid) {
 
 function loadMessages() {
   const el = document.getElementById("messages");
+  if (!el) return;
   if (!currentProject || !currentThread) { el.innerHTML = ""; return; }
   api("GET", "/api/projects/" + encodeURIComponent(currentProject) + "/threads/"
     + encodeURIComponent(currentThread) + "/messages").then(d => {
@@ -316,7 +423,9 @@ function newThread() {
   api("POST", "/api/projects/" + encodeURIComponent(currentProject) + "/threads",
     { title: title || "" }).then(d => {
       if (d.error) { alert(d.error); return; }
-      selectThread(d.thread_id);
+      currentThread = d.thread_id;
+      loadThreads();
+      document.getElementById("threadTitle").textContent = d.title;
     });
 }
 
@@ -340,15 +449,51 @@ function archiveThread() {
       if (d.error) { alert(d.error); return; }
       currentThread = "";
       document.getElementById("threadTitle").textContent = "（未选择对话）";
-      document.getElementById("messages").innerHTML = "";
+      const el = document.getElementById("messages");
+      if (el) el.innerHTML = "";
       loadThreads();
     });
 }
 
-/* ---------- 中栏：会话操作（全部绑定当前 project） ---------- */
-function createDraft() {
+/* ---------- 数据源与样本行 ---------- */
+let dataSource = "local_upload";
+function setDataSource(src) {
+  dataSource = src;
+  document.getElementById("srcLocal").classList.toggle("active", src === "local_upload");
+  document.getElementById("srcRemote").classList.toggle("active", src === "remote_path");
+  document.getElementById("localDirRow").classList.toggle("hidden", src !== "local_upload");
+  document.getElementById("remoteDirRow").classList.toggle("hidden", src !== "remote_path");
+  const hint = document.getElementById("sourceHint");
+  if (src === "local_upload") {
+    hint.textContent = "从你的电脑上传 FASTQ 到分析服务器（填本地目录 + 样本表里的文件）。";
+  } else {
+    hint.textContent = "FASTQ 已存放在服务器（填服务器目录 + 样本表里的文件名），不上传、不校验本地文件。";
+  }
+}
+
+function sampleRowHTML(sample) {
+  return `<div class="sample-row">
+    <input class="s-id" value="${escapeHtml(sample.sample_id || '')}" placeholder="ctrl_1">
+    <input class="s-cond" value="${escapeHtml(sample.condition || '')}" placeholder="control">
+    <input class="s-r1" value="${escapeHtml(sample.fastq_1 || '')}" placeholder="ctrl_1_R1.fastq.gz">
+    <input class="s-r2" value="${escapeHtml(sample.fastq_2 || '')}" placeholder="ctrl_1_R2.fastq.gz">
+    <input class="s-batch" value="${escapeHtml(sample.batch || '')}" placeholder="（可留空）">
+    <button class="icon-btn" onclick="removeSampleRow(this)" title="删除行">×</button>
+  </div>`;
+}
+
+function addSampleRow(sample) {
+  const wrap = document.getElementById("sampleRows");
+  wrap.insertAdjacentHTML("beforeend", sampleRowHTML(sample || {}));
+}
+function removeSampleRow(btn) {
+  const rows = document.querySelectorAll("#sampleRows .sample-row");
+  if (rows.length <= 1) { alert("至少保留一行样本。"); return; }
+  btn.closest(".sample-row").remove();
+}
+function collectSamples() {
   const samples = [];
-  document.querySelectorAll(".sample-input").forEach(row => {
+  document.querySelectorAll("#sampleRows .sample-row").forEach(row => {
     const id = row.querySelector(".s-id").value.trim();
     const cond = row.querySelector(".s-cond").value.trim();
     const r1 = row.querySelector(".s-r1").value.trim();
@@ -356,17 +501,42 @@ function createDraft() {
     const batch = row.querySelector(".s-batch").value.trim();
     if (id && cond && r1) samples.push({ sample_id: id, condition: cond, fastq_1: r1, fastq_2: r2, batch: batch || undefined });
   });
-  api("POST", legacy("/api/new"), {
-    project_id: document.getElementById("projectId").value || currentProject,
-    title: document.getElementById("title").value,
-    cancer_type: document.getElementById("cancerType").value,
+  return samples;
+}
+
+/* ---------- 中栏：创建草稿（绑定 current project 或新项目） ---------- */
+function draftErr(msg) {
+  document.getElementById("draftErr").textContent = msg || "";
+}
+
+function createDraft() {
+  const samples = collectSamples();
+  if (!samples.length) { draftErr("请至少填写一行样本（样本 ID、条件、R1）。"); return; }
+  const body = {
+    project_id: document.getElementById("projectId").value.trim() || currentProject,
+    title: document.getElementById("title").value.trim(),
+    cancer_type: document.getElementById("cancerType").value.trim(),
     design: document.getElementById("design").value,
-    fastq_dir: document.getElementById("fastqDir").value,
-    owner: document.getElementById("owner").value,
+    layout: document.getElementById("layout").value,
+    owner: document.getElementById("owner").value.trim(),
+    data_source: dataSource,
+    fastq_dir: document.getElementById("fastqDir").value.trim(),
+    remote_fastq_dir: document.getElementById("remoteFastqDir").value.trim(),
+    gtf: document.getElementById("gtf").value.trim(),
+    genome_fasta: document.getElementById("genomeFasta").value.trim(),
+    star_index: document.getElementById("starIndex").value.trim(),
+    rsem_prefix: document.getElementById("rsemPrefix").value.trim(),
     samples,
-  }).then(d => {
-    if (d.error) { alert(d.error); return; }
+  };
+  if (!body.project_id) { draftErr("请填写项目 ID。"); return; }
+  draftErr("");
+  api("POST", legacy("/api/new"), body).then(d => {
+    if (d.error) { draftErr(d.error); return; }
     setState(d.state);
+    if (!currentProject && body.project_id) {
+      window.location.href = "/workbench?project=" + encodeURIComponent(body.project_id);
+      return;
+    }
     refreshAll();
   });
 }
@@ -377,6 +547,7 @@ function doPlan() {
     document.getElementById("planSteps").innerHTML =
       (d.steps || []).map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
     setState(d.state);
+    refreshAll();
   });
 }
 
@@ -404,6 +575,7 @@ function resumeQc() {
     });
 }
 
+/* ---------- 差异表达面板 ---------- */
 function renderDeg(d) {
   const el = document.getElementById("degStatus");
   if (d.error) { el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
@@ -417,10 +589,15 @@ function renderDeg(d) {
     (d.gate_reasons || []).forEach(r => lines.push(`<div class="step">- ${escapeHtml(r)}</div>`));
   }
   el.innerHTML = lines.join("<br>");
+  document.getElementById("degRefRow").classList.toggle("hidden", !d.requested);
+  document.getElementById("degRef").value = (d.design && d.design.reference_condition) || "";
 }
 
 function toggleDeg(enabled) {
-  api("POST", legacy("/api/deg"), { enabled }).then(d => {
+  const reference = document.getElementById("degRef").value.trim();
+  const payload = { enabled };
+  if (reference) payload.reference_condition = reference;
+  api("POST", legacy("/api/deg"), payload).then(d => {
     if (d.error) { alert(d.error); return; }
     renderDeg(d);
     if (d.state) setState(d.state);
@@ -432,6 +609,73 @@ function degGate() {
   api("POST", legacy("/api/deg"), {}).then(d => renderDeg(d));
 }
 
+/* ---------- CMS 面板 ---------- */
+function renderCms(d) {
+  const el = document.getElementById("cmsStatus");
+  if (d.error) { el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
+  const lines = [];
+  lines.push(d.requested ? `状态：已启用（run_mode=${escapeHtml(d.run_mode || "pipeline")}）` : "状态：未启用");
+  if (d.design) lines.push(`模板：${escapeHtml(d.design.template)} · nPerm=${d.design.n_perm} · FDR=${d.design.fdr}`);
+  if (d.gate_ok) {
+    lines.push(`<span class="ok">门禁通过</span>`);
+  } else {
+    lines.push(`<span class="err">门禁未通过：</span>`);
+    (d.gate_reasons || []).forEach(r => lines.push(`<div class="step">- ${escapeHtml(r)}</div>`));
+  }
+  el.innerHTML = lines.join("<br>");
+}
+
+function toggleCms(enabled) {
+  api("POST", legacy("/api/cms"), { enabled }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    renderCms(d);
+    if (d.state) setState(d.state);
+    refreshState();
+  });
+}
+
+function cmsGate() {
+  api("POST", legacy("/api/cms"), {}).then(d => renderCms(d));
+}
+
+/* ---------- counts 直入 ---------- */
+function runCounts() {
+  const fileInput = document.getElementById("countsFile");
+  const file = fileInput.files && fileInput.files[0];
+  if (!file) { document.getElementById("countsErr").textContent = "请先选择 counts 矩阵文件。"; return; }
+  const de = document.getElementById("countsDe").checked;
+  const cms = document.getElementById("countsCms").checked;
+  const reference = document.getElementById("countsRef").value.trim();
+  const cancer = document.getElementById("countsCancer").value.trim();
+  if (!de && !cms) { document.getElementById("countsErr").textContent = "请至少勾选差异表达或 CMS 分型。"; return; }
+  if (de && !reference) { document.getElementById("countsErr").textContent = "差异表达需要参考组 condition。"; return; }
+  const form = new FormData();
+  form.append("file", file);
+  form.append("enabled_diffexp", de ? "1" : "0");
+  form.append("enabled_cms", cms ? "1" : "0");
+  if (reference) form.append("reference_condition", reference);
+  if (cancer) form.append("cancer_type", cancer);
+  document.getElementById("countsErr").textContent = "";
+  const path = currentProject
+    ? "/api/projects/" + encodeURIComponent(currentProject) + "/counts"
+    : "/api/projects/" + encodeURIComponent(document.getElementById("projectId").value.trim()) + "/counts";
+  if (!currentProject && !document.getElementById("projectId").value.trim()) {
+    document.getElementById("countsErr").textContent = "还没有项目：请在页面顶部「新建项目」登记，或先在左侧选择项目。";
+    return;
+  }
+  fetch(path, { method: "POST", headers: { "x-session-token": TOKEN }, body: form })
+    .then(r => r.json()).then(d => {
+      if (d.error) { document.getElementById("countsErr").textContent = d.error; return; }
+      const msg = "已创建 counts 分析：差异表达" + (de ? "（参考组 " + reference + "）" : "") + (cms ? "、CMS 分型" : "");
+      document.getElementById("countsErr").innerHTML = `<span class="ok">${escapeHtml(msg)}</span>`;
+      if (d.state) setState(d.state);
+      refreshAll();
+    }).catch(err => {
+      document.getElementById("countsErr").textContent = "上传失败：" + err;
+    });
+}
+
+/* ---------- 对话 ---------- */
 function sendChat() {
   const q = document.getElementById("chatInput").value.trim();
   if (!q) return;
@@ -452,6 +696,7 @@ function sendChat() {
   });
 }
 
+/* ---------- 状态与右栏 ---------- */
 function setQc(waiting) {
   document.getElementById("qcNotice").classList.toggle("hidden", !waiting);
 }
@@ -468,6 +713,7 @@ function refreshGraph() {
   api("GET", "/api/projects/" + encodeURIComponent(currentProject) + "/graph/state").then(d => {
     if (d.error) { setQc(false); return; }
     setQc(d.state === "WAITING_USER");
+    loadFlowPanel();
   });
 }
 
@@ -477,7 +723,6 @@ function refreshAll() {
   loadTab(activeTab);
 }
 
-/* ---------- 右栏：项目上下文（四个页签） ---------- */
 function switchTab(name) {
   activeTab = name;
   ["flow", "samples", "runs", "results"].forEach(t => {
@@ -513,6 +758,10 @@ function loadFlow() {
     if (Array.isArray(gs.steps)) lines.push(gs.steps.map(s => `<div class="step">- ${escapeHtml(s)}</div>`).join(""));
     el.innerHTML = lines.join("");
   });
+}
+
+function loadFlowPanel() {
+  if (activeTab === "flow") loadFlow();
 }
 
 function loadSamples() {
@@ -558,13 +807,17 @@ function loadResults() {
     el.innerHTML =
       `<div class="step">运行结果：<b>${escapeHtml(status)}</b></div>`
       + (gs.message ? `<div class="step">${escapeHtml(gs.message)}</div>` : "")
-      + `<div class="muted" style="margin-top:8px">结果产物链接将在执行完成后由运行面板提供。</div>`;
+      + `<div class="muted" style="margin-top:8px">结果产物由运行面板提供（result_manifest）。</div>`;
   });
 }
 
 /* ---------- 初始化 ---------- */
 document.getElementById("projectId").value = currentProject;
 document.getElementById("projectName").textContent = currentProject || "未选择项目";
+document.getElementById("title").placeholder = currentProject || "";
+addSampleRow({ sample_id: "ctrl_1", condition: "control", fastq_1: "ctrl_1_R1.fastq.gz", fastq_2: "ctrl_1_R2.fastq.gz", batch: "" });
+addSampleRow({ sample_id: "trt_1", condition: "treatment", fastq_1: "trt_1_R1.fastq.gz", fastq_2: "trt_1_R2.fastq.gz", batch: "" });
+setDataSource("local_upload");
 loadProjects();
 loadThreads();
 refreshAll();

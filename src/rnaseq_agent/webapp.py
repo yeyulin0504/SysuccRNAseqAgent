@@ -815,7 +815,6 @@ def create_app(
         return message
 
     # -- graph API (LangGraph control plane, thread_id == project_id) ----
-
     @app.post("/api/projects/{project_id}/graph/run")
     async def api_graph_run(project_id: str, request: Request):
         """Start the control-plane graph; returns immediately, runs in background."""
@@ -856,11 +855,180 @@ def create_app(
             return {"error": "该项目的图运行已在执行中。"}
         return {"project_id": project_id, "state": "running", "resume": decision}
 
+    # -- counts 直入（DE / CMS 一级入口）--------------------------------
+
+    @app.post("/api/projects/{project_id}/counts")
+    async def api_projects_counts(project_id: str, request: Request):
+        """Create / refresh the counts 直入 analysis session for a project.
+
+        Uploads ``counts_matrix.tsv`` next to the project, then builds an
+        analysis session whose diffexp / cms stages read the matrix directly
+        (no FASTQ pipeline). Body is ``multipart/form-data``:
+
+        - ``file``: count matrix TSV/CSV (first column = gene id);
+        - ``enabled_diffexp`` / ``enabled_cms``: "1" to open the stage;
+        - ``reference_condition``: DEG reference group (diffexp required);
+        - ``cancer_type`` / ``design`` / ``gtf`` / ``genome_fasta`` /
+          ``star_index`` / ``rsem_prefix``: optional metadata.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        form = await request.form()
+
+        # -- persist the uploaded matrix ---------------------------------
+        upload = form.get("file")
+        if upload is None:
+            return {"error": "缺少 counts 矩阵文件（file）。"}
+        content = await upload.read()
+        if not content:
+            return {"error": "上传的 counts 矩阵为空。"}
+        uploads_dir = project_dir / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        counts_path = uploads_dir / "counts_matrix.tsv"
+        counts_path.write_bytes(content)
+
+        enabled_diffexp = str(form.get("enabled_diffexp") or "").strip() == "1"
+        enabled_cms = str(form.get("enabled_cms") or "").strip() == "1"
+        if not enabled_diffexp and not enabled_cms:
+            return {"error": "请至少启用差异表达（DE）或 CMS 分型之一。"}
+        reference = str(form.get("reference_condition") or "").strip()
+        if enabled_diffexp and not reference:
+            return {"error": "启用差异表达必须显式提供 reference_condition。"}
+
+        samples: list[dict[str, Any]] = []
+        sample_ids = [str(v) for v in form.getlist("sample_id") if str(v).strip()]
+        conditions = [str(v) for v in form.getlist("condition") if str(v).strip()]
+        for index, sample_id in enumerate(sample_ids):
+            condition = conditions[index] if index < len(conditions) else ""
+            if sample_id and condition:
+                samples.append({"sample_id": sample_id, "condition": condition})
+
+        base = _default_config(project_dir, {"project_id": project_id})
+        # counts 直入固定参考路径由表单覆盖（用户可手填服务器路径）。
+        for key, form_key in (
+            ("remote_gtf_path", "gtf"),
+            ("remote_genome_fasta_path", "genome_fasta"),
+            ("star_index_dir", "star_index"),
+            ("rsem_index_prefix", "rsem_prefix"),
+        ):
+            value = str(form.get(form_key) or "").strip()
+            if value:
+                base["reference"][key] = value
+
+        base["samples"] = {
+            "source": "counts_upload",
+            "local_data_dir": str(uploads_dir),
+            "remote_data_dir": "AUTO",
+            "counts_path": str(counts_path),
+            "items": samples,
+        }
+        base["pipeline"].update(
+            {
+                # counts 直入：关闭 FASTQ 主流程，只保留下游条件开放阶段。
+                "fastp": {"enabled": False, "version": "0.24.1"},
+                "star": {"enabled": False, "version": "2.7.11b"},
+                "arriba": {"enabled": False, "version": "2.5.0"},
+                "featurecounts": {"enabled": False, "version": "Subread 2.1.1"},
+                "rsem": {"enabled": False, "version": "1.2.28"},
+                "diffexp": {"enabled": enabled_diffexp, "version": "DESeq2 1.40+ (R 4.2+)"},
+                "cms": {"enabled": enabled_cms, "version": "CMScaller 2.0"},
+            }
+        )
+        base["cms"] = {
+            "run_mode": "counts",
+            "n_perm": 1000,
+            "fdr": 0.05,
+            "seed": 20260907,
+            "do_plot": False,
+            "min_samples": 30,
+        }
+        base["study"].update(
+            {
+                "cancer_type": str(form.get("cancer_type") or "").strip() or "pan_cancer",
+                "design": str(form.get("design") or "").strip() or "independent_two_group",
+            }
+        )
+        if enabled_diffexp:
+            base["diffexp"] = {
+                "reference_condition": reference,
+                "formula": "~ condition",
+                "min_replicates_per_group": 3,
+            }
+
+        session = ProjectSession(project_dir)
+        gate = session.new_project(base)
+        workspace.touch(project_id, session.state)
+        return {
+            "state": session.state,
+            "counts_path": str(counts_path),
+            "gate": gate.formatted(),
+            "cms_counts": True,
+        }
+
+    @app.post("/api/cms")
+    async def api_cms(request: Request):
+        """CMS（条件开放）状态与启用：CMScaller 分型门禁结果回读。
+
+        框架 15.3：CMS 是 counts/TPM 之后的*条件开放*已注册分型模型。该端点
+        让 UI 查看当前项目是否满足冻结模板（癌种=CRC / 样本≥30 / featureCounts
+        前置）并切换开关。
+        """
+        _guard(request)
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001 - empty body = status-only read
+            payload = {}
+        session = _session_for(_legacy_dir_for(request, payload))
+        if session.config is None:
+            return {"error": "当前还没有项目，请先创建。"}
+        try:
+            from .cms import (
+                CMS_DEFAULT_FDR,
+                CMS_DEFAULT_N_PERM,
+                cms_design_checks,
+                cms_design_of,
+                cms_is_requested,
+            )
+
+            enabled = bool(payload.get("enabled"))
+            run_mode = str(payload.get("run_mode") or "").strip()
+            patch: dict[str, Any] = {}
+            if enabled or run_mode:
+                patch["pipeline"] = {"cms": {"enabled": enabled}}
+                cms_patch: dict[str, Any] = {}
+                if run_mode in {"pipeline", "counts"}:
+                    cms_patch["run_mode"] = run_mode
+                if enabled:
+                    cms_patch.setdefault("n_perm", CMS_DEFAULT_N_PERM)
+                    cms_patch.setdefault("fdr", CMS_DEFAULT_FDR)
+                if cms_patch:
+                    patch["cms"] = cms_patch
+                session.edit(patch, note="Web CMS 面板" + (f" run_mode={run_mode}" if run_mode else ""))
+            requested = cms_is_requested(session.config)
+            reasons = cms_design_checks(session.config) if requested else []
+            return {
+                "state": session.state,
+                "requested": requested,
+                "run_mode": str(session.config.get("cms", {}).get("run_mode", "pipeline")),
+                "gate_ok": not reasons,
+                "gate_reasons": reasons,
+                "design": cms_design_of(session.config) if requested else None,
+            }
+        except Exception as exc:  # noqa: BLE001 - surface session errors
+            return {"error": str(exc)}
+
     return app
 
 
 def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
-    """Build a minimal config from web form payload (MVP scope)."""
+    """Build a config from the web form payload (2026-09-08 form).
+
+    The form collects a *data source* (``local_upload`` = upload local FASTQs,
+    ``remote_path`` = files already staged under a remote directory), four
+    reference paths (GTF / genome FASTA / STAR index / RSEM prefix), the
+    sample table, and optionally a counts 直入 entry (DE / CMS from an
+    uploaded count matrix — see ``/api/counts/projects``).
+    """
     from datetime import datetime
 
     project_id = str(payload.get("project_id") or f"{datetime.now():%Y%m%d_%H%M%S}")
@@ -877,6 +1045,24 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
         if raw.get("batch"):
             item["batch"] = raw["batch"]
         items.append(item)
+
+    # 数据来源：local_upload（本地上传）/ remote_path（服务器已有 reads）。
+    source = str(payload.get("data_source") or "local_upload").strip()
+    if source not in {"local_upload", "remote_path"}:
+        source = "local_upload"
+    local_data_dir = str(payload.get("fastq_dir") or "").strip() or str(
+        Path("outputs/mvp_demo_data")
+    )
+    remote_data_dir = str(payload.get("remote_fastq_dir") or "").strip()
+    samples_block = {
+        "source": source,
+        "local_data_dir": local_data_dir,
+        # remote_path 模式：FASTQ 已存在于该远端目录，不再本地上传。
+        "remote_data_dir": remote_data_dir or "AUTO",
+        "items": items,
+    }
+    if source == "remote_path" and remote_data_dir:
+        samples_block["remote_prestaged"] = True
 
     return {
         "schema_version": 1,
@@ -896,18 +1082,17 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
         },
         "reference": {
             "name": "GENCODE_R47_GRCh38p14_ALL",
-            "remote_gtf_path": payload.get("gtf") or "/ref/gencode.v47.gtf",
-            "remote_genome_fasta_path": payload.get("genome_fasta") or "/ref/GRCh38.fa",
-            "star_index_dir": payload.get("star_index") or "/ref/star",
-            "rsem_index_prefix": payload.get("rsem_prefix") or "/ref/rsem",
+            "remote_gtf_path": str(payload.get("gtf") or "/ref/gencode.v47.gtf"),
+            "remote_genome_fasta_path": str(payload.get("genome_fasta") or "/ref/GRCh38.fa"),
+            "star_index_dir": str(payload.get("star_index") or "/ref/star"),
+            "rsem_index_prefix": str(payload.get("rsem_prefix") or "/ref/rsem"),
         },
-        "sequencing": {"layout": "paired", "reads_per_sample_million": 40, "strandedness": "auto"},
-        "samples": {
-            "source": "local_upload",
-            "local_data_dir": payload.get("fastq_dir") or str(Path("outputs/mvp_demo_data")),
-            "remote_data_dir": "AUTO",
-            "items": items,
+        "sequencing": {
+            "layout": str(payload.get("layout") or "paired"),
+            "reads_per_sample_million": 40,
+            "strandedness": "auto",
         },
+        "samples": samples_block,
         "pipeline": {
             "fastp": {"enabled": True, "version": "0.24.1"},
             "star": {"enabled": True, "version": "2.7.11b"},

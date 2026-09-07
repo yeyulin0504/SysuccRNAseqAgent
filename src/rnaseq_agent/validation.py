@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from .configuration import is_counts_entry_config
 from .container import container_errors
 from .safety import identifier_error, relative_filename_error
 
@@ -28,6 +29,16 @@ def validate_local_fastqs(
     paired = config.get("sequencing", {}).get("layout", "paired") == "paired"
     missing: list[Path] = []
     checked = 0
+    # counts 直入（DE/CMS 读上传矩阵）没有 FASTQ 输入，跳过本地 FASTQ 校验，
+    # 只保留样本表的元数据完整性与 counts_path 可读性检查。
+    if is_counts_entry_config(config):
+        errors = _counts_entry_errors(config)
+        return ValidationResult(
+            ok=not missing and not errors,
+            checked_files=0,
+            missing_files=missing,
+            errors=errors,
+        )
     errors = _sample_errors(config)
 
     existing_samples: list[tuple[str, Path, Path | None]] = []
@@ -185,6 +196,52 @@ def _read_id(header: str) -> str:
     if read_id.endswith(("/1", "/2")):
         read_id = read_id[:-2]
     return read_id
+
+
+def _counts_entry_errors(config: dict[str, Any]) -> list[str]:
+    """Metadata checks for a counts 直入 project (no FASTQ input).
+
+    Keeps the sample-table and server checks that still apply (project id,
+    at least one sample, valid sample ids, remote workdir) plus the presence
+    of the uploaded matrix path recorded under ``samples.counts_path``.
+    """
+    errors: list[str] = []
+    samples = config.get("samples", {})
+    items = samples.get("items", [])
+
+    project_id_error = identifier_error(config.get("project", {}).get("id"), "project.id")
+    if project_id_error:
+        errors.append(project_id_error)
+
+    if not items:
+        errors.append("At least one sample is required.")
+
+    counts_path = str(samples.get("counts_path") or "").strip()
+    if counts_path and not Path(counts_path).is_file():
+        errors.append(f"counts 直入需要本地上传矩阵文件：{counts_path}")
+    elif not counts_path:
+        errors.append("counts 直入缺少 samples.counts_path（本地上传矩阵）。")
+
+    seen_ids: set[str] = set()
+    for index, sample in enumerate(items, start=1):
+        sample_id = sample.get("sample_id")
+        if not sample_id:
+            errors.append(f"Sample {index} is missing sample_id.")
+        elif sample_id in seen_ids:
+            errors.append(f"Duplicate sample_id: {sample_id}")
+        else:
+            seen_ids.add(sample_id)
+        sample_id_error = identifier_error(sample_id, f"samples.items[{index - 1}].sample_id")
+        if sample_id_error:
+            errors.append(sample_id_error)
+        if not str(sample.get("condition", "")).strip():
+            errors.append(f"Sample {sample_id or index} is missing condition.")
+
+    server = config.get("server", {})
+    if not server.get("remote_workdir"):
+        errors.append("Missing server.remote_workdir.")
+
+    return errors
 
 
 def _sample_errors(config: dict[str, Any]) -> list[str]:

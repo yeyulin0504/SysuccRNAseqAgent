@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .capability import Capability, ExecutionPlan, GateResult, build_execution_plan
+from .configuration import is_counts_entry_config
 from .pipeline import (
     render_env_setup_script,
     render_remote_pipeline_script,
@@ -76,6 +77,34 @@ def adapter_inspect(
 
     layout = str(config.get("sequencing", {}).get("layout", "paired")).strip()
     items = config.get("samples", {}).get("items", [])
+    counts_entry = is_counts_entry_config(config)
+
+    # counts 直入没有 FASTQ：跳过 paired/R2、样本 fastq 字段与参考路径检查，
+    # 只验证样本表元数据 + 上传矩阵存在。
+    if counts_entry:
+        for index, sample in enumerate(items, start=1):
+            missing = [f for f in ("sample_id", "condition") if not sample.get(f)]
+            if missing:
+                failures.append(f"样本 {index} 缺少 {', '.join(missing)}")
+        counts_path = str(config.get("samples", {}).get("counts_path") or "").strip()
+        if counts_path:
+            if not Path(counts_path).is_file():
+                failures.append(f"counts 直入矩阵文件不存在：{counts_path}")
+            else:
+                checks.append(f"counts 矩阵存在：{Path(counts_path).name}")
+        else:
+            failures.append("counts 直入缺少 samples.counts_path。")
+        if not failures:
+            checks.append(f"{len(items)} samples, counts 直入元数据完整")
+        for error in validation_errors or []:
+            failures.append(error)
+        for missing in missing_files or []:
+            failures.append(f"缺少输入文件：{missing}")
+        if failures:
+            findings = failures
+            return InspectResult(ok=False, checks=checks, findings=findings)
+        findings.append("预检通过：counts 直入数据语义满足 Adapter 输入契约。")
+        return InspectResult(ok=True, checks=checks, findings=findings)
 
     # Layout consistency: single layout does not need R2.
     if layout == "paired":
@@ -175,6 +204,19 @@ def adapter_materialize(
     scripts_dir = project_dir / "generated_scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
 
+    # counts 直入：没有 FASTQ 主流程，materialize 只生成环境准备脚本；
+    # DESeq2/CMScaller 的 R 脚本由执行层按 counts 阶段渲染并上传。
+    if is_counts_entry_config(config):
+        rendered: dict[str, str] = {
+            "env_setup.sh": render_env_setup_script(config),
+        }
+        paths: dict[str, Path] = {}
+        for name, content in rendered.items():
+            path = scripts_dir / name
+            path.write_text(content, encoding="utf-8")
+            paths[name] = path
+        return paths
+
     rendered = {
         "env_setup.sh": render_env_setup_script(config),
         "run_pipeline.sh": render_remote_pipeline_script(config),
@@ -186,7 +228,7 @@ def adapter_materialize(
         rendered["diffexp_deseq2.R"] = render_diffexp_script(config)
         rendered["colData.tsv"] = render_colData(config)
 
-    paths: dict[str, Path] = {}
+    paths = {}
     for name, content in rendered.items():
         path = scripts_dir / name
         path.write_text(content, encoding="utf-8")

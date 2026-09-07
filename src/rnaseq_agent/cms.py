@@ -66,6 +66,31 @@ CMS_RESULT_FILES = (
     "cms/cms_summary.json",     # CMS1-4 frequency + frozen parameters
 )
 
+# cms 的两种输入来源（UI 2026-09-08）：
+#   PIPELINE_ENTRY  —— 随 FASTQ 主流程跑完后接 featurecounts/gene_counts.txt；
+#   COUNTS_ENTRY    —— 直接上传 counts 矩阵，仅跑 CMScaller（下游一级入口）。
+PIPELINE_ENTRY = "pipeline"
+COUNTS_ENTRY = "counts"
+COUNTS_MATRIX_NAME = "counts_matrix.tsv"
+
+
+def cms_run_mode(config: dict[str, Any]) -> str:
+    """Resolve the CMS input mode: ``pipeline`` (featureCounts) or ``counts``.
+
+    ``config.cms.run_mode`` may be set by the web UI's counts entry; anything
+    that is not the literal ``"counts"`` keeps the frozen pipeline contract
+    (featurecounts/gene_counts.txt), so existing configs are unchanged.
+    """
+    mode = str(config.get("cms", {}).get("run_mode", "")).strip().lower()
+    return COUNTS_ENTRY if mode == COUNTS_ENTRY else PIPELINE_ENTRY
+
+
+def cms_is_counts_entry(config: dict[str, Any]) -> bool:
+    """Whether CMS should run from an uploaded count matrix, not FASTQ results."""
+    return bool(config.get("pipeline", {}).get("cms", {}).get("enabled")) and cms_run_mode(
+        config
+    ) == COUNTS_ENTRY
+
 
 def cms_is_requested(config: dict[str, Any]) -> bool:
     """Whether the user asked for the conditional CMS classification stage."""
@@ -98,7 +123,11 @@ def cms_design_checks(config: dict[str, Any]) -> list[str]:
             f"当前为 {len(samples)} 个。"
         )
 
-    if not config.get("pipeline", {}).get("featurecounts", {}).get("enabled"):
+    # 依赖说明：pipeline 模式读 featureCounts 产物；counts 直入读上传矩阵，
+    # 不再要求 featurecounts/STAR 作为前置。
+    if not cms_is_counts_entry(config) and not config.get("pipeline", {}).get(
+        "featurecounts", {}
+    ).get("enabled"):
         reasons.append(
             "CMS 分型依赖 featureCounts 原始 counts 输入，"
             "当前 pipeline.featurecounts.enabled 为 False。"
@@ -142,6 +171,59 @@ def render_cms_script(config: dict[str, Any]) -> str:
     the ``Geneid`` column itself), renames samples in registration order, and
     runs the frozen ``CMScaller`` call. Outputs land in ``<workdir>/cms/``.
     """
+    counts_source = "featurecounts/gene_counts.txt"
+    is_counts_entry = cms_is_counts_entry(config)
+    if is_counts_entry:
+        # counts 直入：config.samples 携带样本列，counts 由执行层上传到工作区根目录。
+        counts_source = "counts_matrix.tsv"
+    return _render_cms_r_script(
+        config,
+        counts_source=counts_source,
+        input_desc=counts_source,
+        read_comment=(
+            "# counts 直入模式：读取上传的 counts_matrix.tsv（首列 Geneid/rowname，"
+            "其后每列为一个样本的原始 counts）"
+            if is_counts_entry
+            else "# 读取 featureCounts gene_counts.txt（首列 Geneid = Ensembl 带版本号）"
+        ),
+        drop_annotation_cols=not is_counts_entry,
+        strip_version=True,
+    )
+
+
+def render_cms_counts_script(config: dict[str, Any]) -> str:
+    """Render the CMScaller script for the *counts 直入* entry.
+
+    The uploaded count matrix is placed at ``<workdir>/counts_matrix.tsv``;
+    ``config.samples.items`` declare per-column sample metadata. The gene id
+    column may be the literal ``Geneid`` (featureCounts export) or the first
+    column with no header, matching the CMScaller row-name contract
+    (Ensembl ids with a version suffix are stripped).
+    """
+    return _render_cms_r_script(
+        config,
+        counts_source="counts_matrix.tsv",
+        input_desc="counts_matrix.tsv (uploaded)",
+        read_comment=(
+            "# counts 直入：读取用户上传的 counts_matrix.tsv（首列基因 id，"
+            "其后每列一个样本的原始 counts）"
+        ),
+        # counts 直入矩阵没有 featureCounts 注释列：首列固定为基因 id，
+        # 其余列全部是样本，不做 Chr/Start/Length 之类的删除。
+        drop_annotation_cols=False,
+        strip_version=True,
+    )
+
+
+def _render_cms_r_script(
+    config: dict[str, Any],
+    *,
+    counts_source: str,
+    input_desc: str,
+    read_comment: str,
+    drop_annotation_cols: bool,
+    strip_version: bool,
+) -> str:
     design = cms_design_of(config)
     n_perm = design["n_perm"]
     fdr = design["fdr"]
@@ -154,6 +236,24 @@ def render_cms_script(config: dict[str, Any]) -> str:
         if str(sample.get("sample_id", "")).strip()
     ]
     sample_ids_r = "c(" + ", ".join(_r_quote(s) for s in sample_ids) + ")"
+    annot_drop = (
+        """
+meta_cols <- intersect(c("Chr", "Start", "End", "Strand", "Length", "Geneid"), colnames(tab))
+count_cols <- setdiff(colnames(tab), meta_cols)
+"""
+        if drop_annotation_cols
+        else """
+# counts 直入矩阵无 featureCounts 注释列，直接保留所有样本列。
+count_cols <- setdiff(colnames(tab), colnames(tab)[1])
+"""
+    )
+    version_strip = (
+        """
+gene_ids <- sub("\\\\..*$", "", gene_ids)
+"""
+        if strip_version
+        else ""
+    )
 
     return f"""#!/usr/bin/env Rscript
 # 冻结模板 cmscaller_ntp_crc（框架 15.3 条件开放：已注册分型模型）
@@ -162,20 +262,17 @@ suppressMessages({{ library(CMScaller) }})
 suppressMessages({{ library(jsonlite) }})
 
 args <- commandArgs(trailingOnly = TRUE)
-counts_file <- if (length(args) >= 1) args[[1]] else "featurecounts/gene_counts.txt"
+counts_file <- if (length(args) >= 1) args[[1]] else "{counts_source}"
 out_prefix  <- if (length(args) >= 2) args[[2]] else "cms/cms"
 
 dir.create("cms", showWarnings = FALSE, recursive = TRUE)
 
 tab <- read.delim(counts_file, check.names = FALSE, stringsAsFactors = FALSE)
 
-# 行名：去 Ensembl 版本号（ENSG00000186092.4 -> ENSG00000186092）
-gene_ids <- sub("\\\\..*$", "", tab[[1]])
-
-# counts 列：排除第一列(Geneid)与 featureCounts 注释列
-meta_cols <- c("Chr", "Start", "End", "Strand", "Length")
-count_cols <- setdiff(colnames(tab), meta_cols)
-count_cols <- setdiff(count_cols, colnames(tab)[1])
+{read_comment}
+gene_ids <- tab[[1]]
+{version_strip}
+{annot_drop}
 emat <- as.matrix(tab[, count_cols, drop = FALSE])
 rownames(emat) <- gene_ids
 mode(emat) <- "numeric"
@@ -204,7 +301,7 @@ colnames(freq) <- c("subtype", "n")
 summary_json <- list(
   tool = "CMScaller",
   template = "cmscaller_ntp_crc",
-  input = "featurecounts/gene_counts.txt (raw counts)",
+  input = "{input_desc} (raw counts)",
   rna_seq = TRUE,
   row_names = "ensg",
   n_perm = {n_perm},

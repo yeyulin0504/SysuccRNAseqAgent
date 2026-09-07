@@ -25,6 +25,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
+from .configuration import is_counts_entry_config
 from .defaults import DEFAULT_PIPELINE
 from .workflow_profiles import DEFAULT_WORKFLOW_PROFILE, WORKFLOW_PROFILES
 
@@ -204,6 +205,12 @@ def gate_a_check(
             )
 
     required_fields = capability.input_contract["required_sample_fields"]
+    if is_counts_entry_config(config):
+        # counts 直入没有 FASTQ：样本表只需 sample_id + condition，参考路径
+        # 与 STAR/featureCounts 前置检查交给下游 counts 阶段，不在此要求。
+        required_fields = [
+            field for field in required_fields if field not in {"fastq_1", "fastq_2"}
+        ]
     for index, sample in enumerate(items, start=1):
         missing_fields = [field for field in required_fields if not sample.get(field)]
         if missing_fields:
@@ -213,7 +220,11 @@ def gate_a_check(
             )
 
     reference = config.get("reference", {})
-    for key in capability.requires_reference_keys:
+    if is_counts_entry_config(config):
+        requires_reference_keys: list[str] = []
+    else:
+        requires_reference_keys = capability.requires_reference_keys
+    for key in requires_reference_keys:
         if not reference.get(key):
             reasons.append(f"能力 {capability.capability_id} 需要参考设置 {key}，当前未配置。")
 
@@ -231,6 +242,7 @@ def gate_a_check(
 
     # 框架 15.3：cms 同为条件开放阶段 —— 请求启用时必须满足 CMS 门禁
     # （癌种=CRC / 样本≥30 / featureCounts 前置），否则 NOT_EVALUABLE。
+    # counts 直入时 featureCounts 前置由 cms_design_checks 内部豁免。
     if config.get("pipeline", {}).get("cms", {}).get("enabled"):
         from .cms import cms_design_checks
 

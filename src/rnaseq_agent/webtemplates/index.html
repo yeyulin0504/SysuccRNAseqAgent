@@ -6,47 +6,67 @@
 <title>SYSU 多组学分析 Agent — 项目首页</title>
 <style>
   :root {
-    --bg: #0f1420; --panel: #1a2130; --border: #2b3550;
-    --text: #e6e9f0; --muted: #8b94a8; --accent: #4da3ff;
-    --ok: #3ecf8e; --warn: #f0b429; --err: #e05c5c;
+    --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --accent-weak: #ddf4ff; --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    --shadow: 0 1px 2px rgba(31,35,40,.06);
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
          background: var(--bg); color: var(--text); }
   header { padding: 14px 24px; border-bottom: 1px solid var(--border);
-           display: flex; align-items: center; gap: 16px; }
+           display: flex; align-items: center; gap: 16px; background: var(--panel); }
   header h1 { font-size: 17px; margin: 0; font-weight: 600; }
   nav { margin-left: auto; display: flex; gap: 10px; }
   nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  nav a:hover { text-decoration: underline; }
   .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px;
-           border: 1px solid var(--border); color: var(--muted); }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 24px; }
-  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase;
-       letter-spacing: .5px; margin: 22px 0 10px; }
-  .card { background: var(--panel); border: 1px solid var(--border);
-          border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+           border: 1px solid var(--border); color: var(--muted); background: var(--bg); }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 24px; }
+  h2 { font-size: 15px; color: var(--text); margin: 26px 0 10px;
+       padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  .card { background: var(--bg); border: 1px solid var(--border);
+          border-radius: 10px; padding: 18px; margin-bottom: 14px;
+          box-shadow: var(--shadow); }
   .row { display: flex; gap: 10px; flex-wrap: wrap; }
-  .row > div { flex: 1; min-width: 140px; }
-  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 4px; }
-  input { width: 100%; background: var(--bg); border: 1px solid var(--border);
+  .row > div { flex: 1; min-width: 160px; }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--text); margin: 10px 0 4px; }
+  .hint { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .field-hint { font-size: 12px; color: var(--muted); margin: 2px 0 0; }
+  input, select { width: 100%; background: var(--bg); border: 1px solid var(--border);
         border-radius: 6px; color: var(--text); padding: 8px 10px; font-size: 13px; }
+  input:focus, select:focus { outline: none; border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(9,105,218,.15); }
   button { background: var(--accent); color: #fff; border: none; border-radius: 6px;
-           padding: 8px 16px; font-size: 13px; cursor: pointer; margin-top: 12px; }
-  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+           padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  button.secondary { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+  button.secondary:hover { background: var(--panel); }
+  button.small { padding: 4px 10px; font-size: 12px; margin-top: 6px; }
   .proj { display: flex; align-items: center; gap: 12px; padding: 12px 0;
           border-bottom: 1px solid var(--border); }
   .proj:last-child { border-bottom: none; }
-  .proj .title { font-size: 14px; }
+  .proj .title { font-size: 14px; font-weight: 600; }
   .proj .meta { font-size: 12px; color: var(--muted); }
-  .state { font-size: 11px; padding: 2px 8px; border-radius: 12px; }
-  .state.drafting { background: rgba(139,148,168,.15); color: var(--muted); }
-  .state.planned { background: rgba(77,163,255,.15); color: var(--accent); }
-  .state.confirmed { background: rgba(62,207,142,.15); color: var(--ok); }
-  .state.waiting_user { background: rgba(240,180,41,.18); color: var(--warn); }
-  .state.completed { background: rgba(62,207,142,.15); color: var(--ok); }
-  .state.failed { background: rgba(224,92,92,.15); color: var(--err); }
+  .state { font-size: 11px; padding: 2px 8px; border-radius: 12px; white-space: nowrap; }
+  .state.drafting { background: rgba(101,109,118,.15); color: var(--muted); }
+  .state.planned { background: rgba(9,105,218,.12); color: var(--accent); }
+  .state.confirmed { background: rgba(26,127,55,.12); color: var(--ok); }
+  .state.waiting_user, .state.waiting { background: rgba(154,103,0,.14); color: var(--warn); }
+  .state.completed { background: rgba(26,127,55,.12); color: var(--ok); }
+  .state.failed, .state.error { background: rgba(207,34,46,.12); color: var(--err); }
   .muted { color: var(--muted); font-size: 12px; }
-  .err { color: var(--err); }
+  .err { color: var(--err); font-size: 13px; }
+  .ok { color: var(--ok); }
+  .seg { display: flex; gap: 6px; margin: 4px 0 2px; }
+  .seg button { flex: 1; background: var(--panel); border: 1px solid var(--border);
+                color: var(--muted); padding: 8px 6px; margin-top: 4px; font-weight: 500; }
+  .seg button.active { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+  .seg-hint { font-size: 12px; color: var(--muted); margin: 2px 0 6px; }
+  .section-title { font-size: 13px; font-weight: 600; margin: 14px 0 4px; }
+  .sample-head, .sample-row { display: grid; grid-template-columns: 1fr 1fr 1.4fr 1.4fr 1fr 36px; gap: 6px; align-items: center; }
+  .sample-head { font-size: 12px; color: var(--muted); font-weight: 600; margin-bottom: 4px; }
+  .hidden { display: none !important; }
+  .ref-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
 </style>
 </head>
 <body>
@@ -62,16 +82,40 @@
 <div class="wrap">
   <h2>新建项目</h2>
   <div class="card">
+    <p class="muted" style="margin:0 0 6px">先登记项目，再在工作台里配置样本、参考文件并创建分析草稿；或者直接上传 counts 矩阵开始差异表达 / CMS 分型。</p>
+
     <div class="row">
-      <div><label>项目 ID</label><input id="projectId" placeholder="demo_001"></div>
-      <div><label>项目名称</label><input id="title" placeholder="Bulk RNA 差异分析"></div>
+      <div><label>项目 ID <span class="hint">唯一标识，仅限字母/数字/._-</span></label>
+        <input id="projectId" placeholder="例如 crc_cohort_01"></div>
+      <div><label>项目名称</label><input id="title" placeholder="例如 CRC 队列差异表达"></div>
       <div><label>负责人</label><input id="owner" placeholder="local_user"></div>
     </div>
+
+    <label>研究目标（描述）</label>
+    <input id="description" placeholder="例如：比较两组结直肠癌肿瘤样本的基因表达差异，并进行 CMS 分子分型">
+
     <div class="row">
-      <div style="flex:3"><label>研究目标（描述）</label><input id="description" placeholder="比较两组肿瘤样本的差异表达与融合基因"></div>
+      <div><label>癌种 <span class="hint">CMS 分型仅支持 CRC</span></label>
+        <input id="cancerType" list="cancerOptions" value="pan_cancer">
+        <datalist id="cancerOptions">
+          <option value="pan_cancer">泛癌（不支持 CMS）</option>
+          <option value="crc">结直肠癌 CRC</option>
+        </datalist></div>
+      <div><label>实验设计</label>
+        <select id="design">
+          <option value="independent_two_group">独立两组（control vs treatment）</option>
+          <option value="single_group">单组队列</option>
+        </select></div>
+      <div><label>测序布局</label>
+        <select id="layout">
+          <option value="paired">双端 paired-end</option>
+          <option value="single">单端 single-end</option>
+        </select></div>
     </div>
+
     <button onclick="createProject()">创建项目</button>
     <span id="createErr" class="err"></span>
+    <div class="ok hidden" id="createOk"></div>
   </div>
 
   <h2>项目列表</h2>
@@ -89,7 +133,8 @@ async function api(path, method, body) {
   return resp.json();
 }
 function stateClass(s) {
-  return "state " + String(s || "drafting").toLowerCase().replace("waiting_user", "waiting_user");
+  const st = String(s || "drafting").toLowerCase();
+  return "state " + st;
 }
 function renderProjects(rows) {
   const el = document.getElementById("projects");
@@ -103,8 +148,8 @@ function renderProjects(rows) {
       <div><span class="${stateClass(p.state)}">${escapeHtml(p.state)}</span></div>
       <div class="meta">${p.thread_count || 0} 对话</div>
       <div>
-        <a href="/workbench?project=${encodeURIComponent(p.project_id)}"><button class="secondary">打开</button></a>
-        <button class="secondary" onclick="archiveProject('${escapeHtml(p.project_id)}')">归档</button>
+        <a href="/workbench?project=${encodeURIComponent(p.project_id)}"><button class="secondary small">打开</button></a>
+        <button class="secondary small" onclick="archiveProject('${escapeHtml(p.project_id)}')">归档</button>
       </div>
     </div>`).join("");
 }
@@ -115,15 +160,19 @@ function loadProjects() {
 function createProject() {
   const body = {
     project_id: document.getElementById("projectId").value.trim(),
-    title: document.getElementById("title").value.trim(),
+    title: document.getElementById("title").value.trim() || document.getElementById("projectId").value.trim(),
     owner: document.getElementById("owner").value.trim(),
     description: document.getElementById("description").value.trim(),
   };
   if (!body.project_id) { document.getElementById("createErr").textContent = "请填写项目 ID。"; return; }
   document.getElementById("createErr").textContent = "";
+  document.getElementById("createOk").classList.add("hidden");
   api("/api/projects", "POST", body).then(d => {
     if (d.error) { document.getElementById("createErr").textContent = d.error; return; }
-    loadProjects();
+    const okEl = document.getElementById("createOk");
+    okEl.textContent = "已创建 " + d.project_id + "，正在跳转到分析工作台…";
+    okEl.classList.remove("hidden");
+    window.location.href = "/workbench?project=" + encodeURIComponent(d.project_id);
   });
 }
 function archiveProject(id) {

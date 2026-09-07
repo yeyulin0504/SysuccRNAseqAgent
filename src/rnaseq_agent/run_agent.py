@@ -352,21 +352,35 @@ def run_stage_project(
     try:
         # 上传本地 FASTQ 只发生在第一个 stage（qc）；后续 stage 复用远程 raw。
         if stage == STAGE_QC:
-            validation = validate_local_fastqs(run_config)
-            if not validation.ok:
-                parts = []
-                if validation.missing_files:
-                    parts.append(f"{len(validation.missing_files)} files missing")
-                if validation.errors:
-                    parts.append("; ".join(validation.errors))
-                message = "Local FASTQ validation failed: " + ", ".join(parts)
-                _update_status(config_path, "validation_failed", message)
-                _log_event(logs_dir, "validation_failed", {"stage": stage, "message": message})
-                raise RuntimeError(message)
+            if not _fastqs_prestaged(run_config):
+                validation = validate_local_fastqs(run_config)
+                if not validation.ok:
+                    parts = []
+                    if validation.missing_files:
+                        parts.append(f"{len(validation.missing_files)} files missing")
+                    if validation.errors:
+                        parts.append("; ".join(validation.errors))
+                    message = "Local FASTQ validation failed: " + ", ".join(parts)
+                    _update_status(config_path, "validation_failed", message)
+                    _log_event(logs_dir, "validation_failed", {"stage": stage, "message": message})
+                    raise RuntimeError(message)
             _update_status(config_path, "validated", "Local FASTQ validation passed.", stage=stage)
             transport = create_remote_transport(run_config)
-            _upload_fastqs(run_config, logs_dir, transport)
-            _update_status(config_path, "uploaded", "Local FASTQ files uploaded.", stage=stage)
+            if not _fastqs_prestaged(run_config):
+                _upload_fastqs(run_config, logs_dir, transport)
+                _update_status(config_path, "uploaded", "Local FASTQ files uploaded.", stage=stage)
+            else:
+                _update_status(
+                    config_path,
+                    "uploaded",
+                    "FASTQ 已存在于服务器（remote_path 数据源），跳过上传。",
+                    stage=stage,
+                )
+        elif stage == "counts":
+            # counts 直入（2026-09-08）：把上传的 counts_matrix.tsv 上传到
+            # 远程工作区根目录，diffexp/cms R 脚本直接读它。
+            transport = create_remote_transport(run_config)
+            _upload_counts_matrix(run_config, config_path, logs_dir, transport)
         else:
             transport = create_remote_transport(run_config)
 
@@ -491,6 +505,36 @@ def _upload_fastqs(
             )
             result = transport.execute(f"chmod 600 {uploaded}")
             _log_command(logs_dir, "Restrict uploaded FASTQ permissions", result)
+
+
+def _upload_counts_matrix(
+    config: dict[str, Any],
+    config_path: Path,
+    logs_dir: Path,
+    transport: RemoteTransport,
+) -> None:
+    """Upload the counts 直入 matrix to the remote workdir root.
+
+    The web entry stores the uploaded matrix inside the project directory and
+    records its absolute path under ``samples.counts_path``; this helper ships
+    it to ``<remote_workdir>/counts_matrix.tsv`` (the fixed name the diffexp /
+    cms R scripts read).
+    """
+    samples = config.get("samples", {})
+    local_counts = Path(str(samples.get("counts_path") or "")).expanduser()
+    remote_workdir = config["server"]["remote_workdir"]
+    if not local_counts.is_file():
+        raise RuntimeError(
+            f"counts 直入需要本地上传矩阵，但 samples.counts_path={local_counts!s} 不是文件。"
+        )
+    mkdir_command = f"umask 077 && mkdir -p {shell_quote(remote_workdir)}"
+    result = transport.execute(mkdir_command)
+    _log_command(logs_dir, "Create remote workdir", result)
+    remote_target = f"{remote_workdir.rstrip('/')}/counts_matrix.tsv"
+    result = transport.upload([local_counts], remote_workdir)
+    _log_command(logs_dir, "Upload counts matrix", result)
+    result = transport.execute(f"chmod 600 {shell_quote(remote_target)}")
+    _log_command(logs_dir, "Restrict counts matrix permissions", result)
 
 
 def _prepare_remote_scripts(
@@ -630,19 +674,59 @@ def _prepare_stage_scripts(
 
     rendered_paths = [env_setup_script, run_script, submit_script]
     if stage == "de":
-        from .differential import render_colData, render_diffexp_script
+        from .differential import (
+            render_colData,
+            render_diffexp_counts_script,
+            render_diffexp_script,
+        )
 
-        diffexp_script = scripts_dir / "diffexp_deseq2.R"
-        diffexp_script.write_text(render_diffexp_script(config), encoding="utf-8", newline="\n")
-        col_data = scripts_dir / "colData.tsv"
-        col_data.write_text(render_colData(config), encoding="utf-8", newline="\n")
-        rendered_paths.extend([diffexp_script, col_data])
+        if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+            diffexp_script = scripts_dir / "diffexp_deseq2.R"
+            col_data = scripts_dir / "colData.tsv"
+            # counts 直入：脚本读上传矩阵；否则读 featurecounts 产物。
+            if _counts_entry(config):
+                diffexp_script.write_text(
+                    render_diffexp_counts_script(config), encoding="utf-8", newline="\n"
+                )
+            else:
+                diffexp_script.write_text(
+                    render_diffexp_script(config), encoding="utf-8", newline="\n"
+                )
+            col_data.write_text(render_colData(config), encoding="utf-8", newline="\n")
+            rendered_paths.extend([diffexp_script, col_data])
     elif stage == "cms":
-        from .cms import render_cms_script
+        from .cms import render_cms_counts_script, render_cms_script
 
         cms_script = scripts_dir / "cms_cmscaller.R"
-        cms_script.write_text(render_cms_script(config), encoding="utf-8", newline="\n")
+        # counts 直入：读上传矩阵；否则读 featurecounts 产物。
+        if _counts_entry(config):
+            cms_script.write_text(
+                render_cms_counts_script(config), encoding="utf-8", newline="\n"
+            )
+        else:
+            cms_script.write_text(render_cms_script(config), encoding="utf-8", newline="\n")
         rendered_paths.append(cms_script)
+    elif stage == "counts":
+        # counts 直入（2026-09-08）：DESeq2 / CMScaller 共用同一上传矩阵，
+        # 各自的 R 脚本与 colData 一并渲染，由 run_stage_counts.sh 调用。
+        from .cms import render_cms_counts_script
+        from .differential import render_colData, render_diffexp_counts_script
+
+        if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+            diffexp_script = scripts_dir / "diffexp_counts_deseq2.R"
+            diffexp_script.write_text(
+                render_diffexp_counts_script(config), encoding="utf-8", newline="\n"
+            )
+            rendered_paths.append(diffexp_script)
+        if config.get("pipeline", {}).get("cms", {}).get("enabled"):
+            cms_script = scripts_dir / "cms_counts_cmscaller.R"
+            cms_script.write_text(
+                render_cms_counts_script(config), encoding="utf-8", newline="\n"
+            )
+            rendered_paths.append(cms_script)
+        col_data = scripts_dir / "colData.tsv"
+        col_data.write_text(render_colData(config), encoding="utf-8", newline="\n")
+        rendered_paths.append(col_data)
 
     _log_event(logs_dir, "stage_scripts_rendered", {"stage": stage, "paths": [str(path) for path in rendered_paths]})
     return rendered_paths
@@ -736,7 +820,7 @@ def _download_results(
     pack_cmd = (
         f"umask 077 && cd {shell_quote(remote_workdir)} && "
         "paths=(); "
-        "for d in scripts logs fastp star arriba featurecounts rsem diffexp cms status; do "
+        "for d in scripts logs fastp star arriba featurecounts rsem diffexp cms counts_matrix.tsv status; do "
         'if [ -e "$d" ]; then paths+=("$d"); fi; '
         "done; "
         f"tar -czf {shell_quote(remote_tar)} \"${{paths[@]}}\""
@@ -833,7 +917,15 @@ def _config_for_new_attempt(config: dict[str, Any], run_id: str) -> dict[str, An
     remote_run_workdir = f"{project_workdir}/attempts/{run_id}"
     server["project_workdir"] = project_workdir
     server["remote_workdir"] = remote_run_workdir
-    runtime.setdefault("samples", {})["remote_data_dir"] = f"{remote_run_workdir}/raw"
+    samples_block = runtime.setdefault("samples", {})
+    if _fastqs_prestaged(runtime):
+        # remote_path：reads 在用户服务器已有目录，保持原样并在 run 里登记。
+        remote_data_dir = str(samples_block.get("remote_data_dir") or "").strip()
+        if not remote_data_dir or remote_data_dir == "AUTO":
+            remote_data_dir = f"{remote_run_workdir}/raw"
+    else:
+        remote_data_dir = f"{remote_run_workdir}/raw"
+    samples_block["remote_data_dir"] = remote_data_dir
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     runtime["run"] = {
         "id": run_id,
@@ -855,6 +947,35 @@ def _config_for_active_attempt(config: dict[str, Any]) -> dict[str, Any]:
     if remote_run_workdir:
         active.setdefault("server", {})["remote_workdir"] = remote_run_workdir
     return active
+
+
+def _counts_entry(config: dict[str, Any]) -> bool:
+    """Whether the project runs DE/CMS from an uploaded count matrix.
+
+    The web counts 直入 entry flips ``pipeline.cms.enabled`` plus
+    ``cms.run_mode == "counts"`` (and / or the same for diffexp); configs
+    created through the classic FASTQ wizard keep ``run_mode`` empty and stay
+    on the featureCounts contract.
+    """
+    cms = config.get("cms", {})
+    counts_mode = str(cms.get("run_mode", "")).strip().lower() == "counts"
+    diffexp_wants_counts = bool(
+        config.get("study", {}).get("input", {}).get("counts_matrix")
+    )
+    return counts_mode or diffexp_wants_counts
+
+
+def _fastqs_prestaged(config: dict[str, Any]) -> bool:
+    """Whether reads already live on the server (no local upload needed).
+
+    The web form's ``remote_path`` data source records the remote FASTQ
+    directory the user owns; this flag makes the QC/quant pipeline read
+    ``$INPUTDIR`` on the server instead of uploading local files.
+    """
+    samples = config.get("samples", {})
+    return bool(samples.get("remote_prestaged")) or (
+        str(samples.get("source", "")).strip() == "remote_path"
+    )
 
 
 def _write_run_manifest(

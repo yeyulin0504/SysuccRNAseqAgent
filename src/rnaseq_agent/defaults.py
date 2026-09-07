@@ -35,6 +35,8 @@ DEFAULT_CMS = {
     "seed": 20260907,     # 固定 seed 保证 p 值可复现
     "do_plot": False,     # 不生成 subHeatmap，只出结果表
     "min_samples": 30,    # CMScaller 低于 30 样本提示高方差
+    "run_mode": "pipeline",  # "pipeline"= 接 featurecounts 跑完整 FASTQ 流程；"counts"= 直接上传 counts 矩阵即跑 CMS
+    "reference_condition": "",  # counts 直入时用于分组富集分析的参考组（可选）
 }
 
 # 框架 15.3 黄金路线 A：diffexp 为“条件开放”阶段 ——

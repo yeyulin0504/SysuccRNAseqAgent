@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .configuration import normalize_config
+from .configuration import is_counts_entry_config, normalize_config
 from .pipeline import render_env_setup_script, render_remote_pipeline_script, render_submit_script
 from .storage import load_json, save_json
 from .validation import validate_local_fastqs
@@ -327,6 +327,22 @@ def _input_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
     samples = config.get("samples", {})
     root = Path(str(samples.get("local_data_dir", ""))).resolve()
     paired = config.get("sequencing", {}).get("layout", "paired") == "paired"
+
+    # counts 直入：唯一输入是用户上传的 counts 矩阵。
+    if is_counts_entry_config(config):
+        counts_path = Path(str(samples.get("counts_path") or "")).resolve()
+        if counts_path.is_file():
+            return [
+                {
+                    "sample_id": "*",
+                    "role": "counts",
+                    "logical_name": counts_path.name,
+                    "size_bytes": counts_path.stat().st_size,
+                    "sha256": sha256_file(counts_path),
+                }
+            ]
+        return []
+
     artifacts: list[dict[str, Any]] = []
     for sample in samples.get("items", []):
         roles = (("R1", "fastq_1"), ("R2", "fastq_2")) if paired else (("R1", "fastq_1"),)
@@ -354,11 +370,18 @@ def _input_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
 def _script_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
     scheduler = config.get("server", {}).get("scheduler", "local")
     submit_name = "submit.sbatch" if scheduler == "slurm" else "submit.pbs" if scheduler == "pbs" else "submit.sh"
-    rendered = {
-        "env_setup.sh": render_env_setup_script(config),
-        "run_pipeline.sh": render_remote_pipeline_script(config),
-        submit_name: render_submit_script(config),
-    }
+    if is_counts_entry_config(config):
+        # counts 直入无 FASTQ 主流程：只冻结环境准备脚本，阶段脚本由
+        # 执行层按 counts 阶段渲染（与契约的 workflow/cms/diffexp 快照一致）。
+        rendered = {
+            "env_setup.sh": render_env_setup_script(config),
+        }
+    else:
+        rendered = {
+            "env_setup.sh": render_env_setup_script(config),
+            "run_pipeline.sh": render_remote_pipeline_script(config),
+            submit_name: render_submit_script(config),
+        }
     return [
         {
             "name": name,

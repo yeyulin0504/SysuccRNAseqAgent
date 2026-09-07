@@ -274,9 +274,13 @@ def node_execute_qc(state: BulkRNAState) -> BulkRNAState:
     still queued/running returns ``WAITING_HPC`` (edge loops back into the QC
     checkpoint so polling-driven resumes converge on the same attempt). On a
     terminal QC the node records the attempt binding for the checkpoint.
+
+    Counts 直入：项目没有 FASTQ 主流程，改执行 ``counts`` 阶段
+    （DESeq2/CMScaller 读取上传的 counts_matrix.tsv）。
     """
     session = _session(state)
-    # Reuse an existing QC stage submission when one is already mid-flight.
+    stage = "counts" if _is_counts_entry_state(state) else "qc"
+    # Reuse an existing stage submission when one is already mid-flight.
     status_payload = load_json(session.project_dir / "project.json").get("status", {})
     current_state = str(status_payload.get("state") or "")
     run_id = str(status_payload.get("run_id") or "")
@@ -284,19 +288,19 @@ def node_execute_qc(state: BulkRNAState) -> BulkRNAState:
     if current_state in {"submitted", "running", "queued", "preparing"}:
         return {
             "status": WAITING_HPC,
-            "message": f"QC 作业已提交（{status_payload.get('job_id', '')}），等待 HPC 完成。",
+            "message": f"{stage} 作业已提交（{status_payload.get('job_id', '')}），等待 HPC 完成。",
             "run_id": run_id,
             "attempt_dir": attempt_dir,
         }
     if current_state in {"stage_completed", "remote_completed", "results_verified"}:
         return {
             "status": WAITING_HPC,
-            "message": f"QC 阶段已到达终态（{current_state}），等待人工确认。",
+            "message": f"{stage} 阶段已到达终态（{current_state}），等待结果校验。",
             "run_id": run_id,
             "attempt_dir": attempt_dir,
         }
     try:
-        outcome = session.execute_stage("qc", wait=True)
+        outcome = session.execute_stage(stage, wait=True)
     except SessionError as exc:
         return {"status": FAIL, "message": str(exc)}
     status_payload = load_json(session.project_dir / "project.json").get("status", {})
@@ -319,7 +323,7 @@ def node_execute_qc(state: BulkRNAState) -> BulkRNAState:
         }
     return {
         "status": FAIL,
-        "message": outcome.get("message", "QC 阶段未成功完成。"),
+        "message": outcome.get("message", f"{stage} 阶段未成功完成。"),
         "run_id": run_id,
         "attempt_dir": attempt_dir,
     }
@@ -442,14 +446,39 @@ def _edge_after_diffexp_gate(state: BulkRNAState) -> str:
 
 
 def _edge_after_contract(state: BulkRNAState) -> str:
-    """Contract frozen -> execute the QC stage first (说明书 §5.1)."""
+    """Contract frozen -> execute the QC stage first (说明书 §5.1).
+
+    Counts 直入（cms.run_mode == "counts" / study.input.counts_matrix）没有
+    FASTQ 主流程；直接执行 ``counts`` 阶段（DESeq2/CMScaller 读上传矩阵）。
+    """
     if state.get("status") == CONFIRMED:
         return "execute_qc"
     return "end_fail"
 
 
+def _is_counts_entry_state(state: BulkRNAState) -> bool:
+    """Whether the bound project is a counts 直入 project (no FASTQ stages)."""
+    try:
+        session = _session(state)
+        config = session.config
+    except Exception:  # noqa: BLE001 - no config yet -> default FASTQ path
+        return False
+    if config is None:
+        return False
+    from .run_agent import _counts_entry
+
+    return _counts_entry(config)
+
+
 def _edge_after_execute_qc(state: BulkRNAState) -> str:
-    """QC stage reached a terminal state -> QC checkpoint / halt."""
+    """QC stage reached a terminal state -> QC checkpoint / halt.
+
+    Counts 直入项目没有 FASTQ QC 检查点；counts 阶段完成后直接校验产物。
+    """
+    if _is_counts_entry_state(state):
+        if state.get("status") in {"PASS", "WAITING_HPC"}:
+            return "validate_output"
+        return "end_fail"
     if state.get("status") in {PASS, "WAITING_HPC"}:
         return "wait_qc"
     return "end_fail"
