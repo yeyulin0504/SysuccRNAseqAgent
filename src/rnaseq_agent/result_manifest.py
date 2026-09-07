@@ -24,8 +24,16 @@ def create_result_manifest(
     config: dict[str, Any],
     extracted_dir: Path,
     output_path: Path,
+    *,
+    stage: str | None = None,
 ) -> ResultManifestSummary:
-    """Inventory downloaded artifacts and validate required workflow outputs."""
+    """Inventory downloaded artifacts and validate required workflow outputs.
+
+    ``stage`` restricts validation to the artifacts that this stage actually
+    produces (``qc`` -> fastp only, ``quant`` -> STAR/quant/fusion outputs,
+    ``de`` -> diffexp). The monolithic validation covers every stage and is
+    used by the single-shot ``run_project`` flow.
+    """
 
     extracted_dir = extracted_dir.resolve()
     files: list[dict[str, Any]] = []
@@ -41,7 +49,7 @@ def create_result_manifest(
                 }
             )
 
-    errors = _validate_required_outputs(config, extracted_dir)
+    errors = _validate_required_outputs(config, extracted_dir, stage=stage)
     files_sha256 = canonical_sha256(files)
     scientific_files = [item for item in files if item["category"] == "scientific"]
     body = {
@@ -67,23 +75,36 @@ def create_result_manifest(
 
 def _artifact_category(relative_path: str) -> str:
     top_level = relative_path.split("/", 1)[0]
-    if top_level in {"fastp", "star", "arriba", "featurecounts", "rsem", "diffexp"}:
+    if top_level in {"fastp", "star", "arriba", "featurecounts", "rsem", "diffexp", "cms"}:
         return "scientific"
     return "audit"
 
 
-def _validate_required_outputs(config: dict[str, Any], root: Path) -> list[str]:
+def _validate_required_outputs(
+    config: dict[str, Any],
+    root: Path,
+    *,
+    stage: str | None = None,
+) -> list[str]:
     expected: list[tuple[str, bool]] = [
         ("status/completed.flag", True),
         ("status/state.txt", False),
     ]
+    # Stage-scoped validation (说明书 §5 分阶段)。None = 全流程单次运行。
+    from .pipeline import STAGE_CMS, STAGE_DE, STAGE_QC, STAGE_QUANT
+
+    def _enabled(step: str) -> bool:
+        if stage is None:
+            return bool(config.get("pipeline", {}).get(step, {}).get("enabled"))
+        return True
+
     paired = config.get("sequencing", {}).get("layout", "paired") == "paired"
     pipeline = config.get("pipeline", {})
     samples = config.get("samples", {}).get("items", [])
 
     for sample in samples:
         sample_id = str(sample.get("sample_id", ""))
-        if pipeline.get("fastp", {}).get("enabled"):
+        if _enabled("fastp") and (stage is None or stage == STAGE_QC):
             expected.extend(
                 [
                     (f"fastp/{sample_id}.R1.fastq.gz", False),
@@ -93,21 +114,21 @@ def _validate_required_outputs(config: dict[str, Any], root: Path) -> list[str]:
             )
             if paired:
                 expected.append((f"fastp/{sample_id}.R2.fastq.gz", False))
-        if pipeline.get("star", {}).get("enabled"):
+        if _enabled("star") and (stage is None or stage == STAGE_QUANT):
             expected.extend(
                 [
                     (f"star/{sample_id}.Aligned.sortedByCoord.out.bam", False),
                     (f"star/{sample_id}.Log.final.out", False),
                 ]
             )
-        if pipeline.get("arriba", {}).get("enabled"):
+        if _enabled("arriba") and (stage is None or stage == STAGE_QUANT):
             expected.extend(
                 [
                     (f"arriba/{sample_id}.fusions.tsv", False),
                     (f"arriba/{sample_id}.fusions.discarded.tsv", False),
                 ]
             )
-        if pipeline.get("rsem", {}).get("enabled"):
+        if _enabled("rsem") and (stage is None or stage == STAGE_QUANT):
             expected.extend(
                 [
                     (f"rsem/{sample_id}.genes.results", False),
@@ -115,7 +136,7 @@ def _validate_required_outputs(config: dict[str, Any], root: Path) -> list[str]:
                 ]
             )
 
-    if pipeline.get("featurecounts", {}).get("enabled"):
+    if _enabled("featurecounts") and (stage is None or stage == STAGE_QUANT):
         expected.extend(
             [
                 ("featurecounts/gene_counts.txt", False),
@@ -123,11 +144,19 @@ def _validate_required_outputs(config: dict[str, Any], root: Path) -> list[str]:
             ]
         )
 
-    if pipeline.get("diffexp", {}).get("enabled"):
+    if _enabled("diffexp") and (stage is None or stage == STAGE_DE):
         expected.extend(
             [
                 ("diffexp/deseq2_results.tsv", False),
                 ("diffexp/deseq2_summary.json", False),
+            ]
+        )
+
+    if _enabled("cms") and (stage is None or stage == STAGE_CMS):
+        expected.extend(
+            [
+                ("cms/cms_result.csv", False),
+                ("cms/cms_summary.json", False),
             ]
         )
 

@@ -48,6 +48,12 @@ DIFFEXP_OUTPUT_ARTIFACTS: dict[str, str] = {
     "diffexp/deseq2_summary.json": "DESeq2 design/contrast summary",
 }
 
+# 框架 15.3 条件开放阶段：CMScaller CMS 分型（仅在 cms 启用后要求）。
+CMS_OUTPUT_ARTIFACTS: dict[str, str] = {
+    "cms/cms_result.csv": "CMScaller CMS prediction + distances + p.value/FDR",
+    "cms/cms_summary.json": "CMScaller CMS subtype frequencies + frozen parameters",
+}
+
 
 @dataclass(frozen=True)
 class Capability:
@@ -104,6 +110,9 @@ def register_builtin_capabilities() -> dict[str, Capability]:
     # 框架 15.3 条件开放：启用 diffexp 时才把 DE 产物列为必需输出。
     if pipeline.get("diffexp", {}).get("enabled"):
         output_artifacts.update(DIFFEXP_OUTPUT_ARTIFACTS)
+    # 框架 15.3 条件开放：启用 cms 时才把 CMS 产物列为必需输出。
+    if pipeline.get("cms", {}).get("enabled"):
+        output_artifacts.update(CMS_OUTPUT_ARTIFACTS)
 
     return {
         # 框架 15.2：workflow.bulk_rna.grch38_pe_expression_fusion 1.0.0
@@ -220,6 +229,13 @@ def gate_a_check(
 
         reasons.extend(diffexp_design_checks(config))
 
+    # 框架 15.3：cms 同为条件开放阶段 —— 请求启用时必须满足 CMS 门禁
+    # （癌种=CRC / 样本≥30 / featureCounts 前置），否则 NOT_EVALUABLE。
+    if config.get("pipeline", {}).get("cms", {}).get("enabled"):
+        from .cms import cms_design_checks
+
+        reasons.extend(cms_design_checks(config))
+
     if reasons:
         return GateResult(verdict=NOT_EVALUABLE, reasons=reasons)
     return GateResult(verdict=PASS)
@@ -258,6 +274,17 @@ def build_execution_plan(capability: Capability, config: dict[str, Any]) -> Exec
             f"（{DEG_DESIGN_FORMULA}，reference={design['reference_condition']}）"
         )
         summary += f" 条件开放：DESeq2 差异表达（{design['contrast']}）。"
+
+    # 框架 15.3 条件开放：启用 cms 时把冻结分型模型写入计划。
+    if config.get("pipeline", {}).get("cms", {}).get("enabled"):
+        from .cms import cms_design_of
+
+        design = cms_design_of(config)
+        steps.append(
+            f"CMS 分型：CMScaller（RNAseq=TRUE, rowNames=ensg, "
+            f"nPerm={design['n_perm']}, FDR={design['fdr']}）"
+        )
+        summary += " 条件开放：CMScaller CMS 结直肠癌分子分型。"
 
     return ExecutionPlan(
         capability_id=capability.capability_id,

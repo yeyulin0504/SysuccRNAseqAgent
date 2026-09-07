@@ -211,6 +211,7 @@ class ExecutionModesIntegrationTests(unittest.TestCase):
             config["pipeline"]["featurecounts"]["enabled"] = True
             config["pipeline"]["rsem"]["enabled"] = False
             config["pipeline"]["diffexp"] = {"enabled": True, "version": "DESeq2"}
+            config["diffexp"] = {"reference_condition": "control"}  # M1.6
             config_path = root / "project" / "project.json"
             save_json(config_path, config)
 

@@ -1,17 +1,28 @@
 """Localhost web workbench for the auditable bulk RNA golden route.
 
-Framework section 11 / 15.8 step 1: single-user localhost web UI
-(127.0.0.1), project / flow / chat / decision panels, plus the QC
-checkpoint interrupt (WAITING_USER) surfaced as a resume button.
+Framework section 11 / 15.8 + UI design (2026-09-07): a single-user
+localhost (127.0.0.1) three-page workbench — project home, analysis
+workbench, settings — over a multi-project workspace.
 
-Built on FastAPI + Jinja2. The web layer only drives ProjectSession and
-the LangGraph control plane; it never executes shell commands directly.
+M1 (2026-09-07): the app now drives the real multi-project/thread model
+and the LangGraph control plane:
+
+- ``Workspace`` owns the project registry (create / open / archive);
+- ``threads`` owns Project -> Thread -> Message persistence;
+- the graph is invoked with ``thread_id == project_id`` so a QC interrupt
+  resumes from disk (checkpointer) instead of a browser session.
+
+The web layer never executes shell commands directly; it drives
+ProjectSession and the graph. The existing single-project ``/api/*``
+endpoints are preserved for the default project so the original workbench
+stays usable while the three-page surface is introduced.
 """
 
 from __future__ import annotations
 
 import secrets
 import socket
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -21,9 +32,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .agent_graph import build_bulk_rna_graph
+from .agent_graph import build_bulk_rna_graph, sqlite_checkpointer_for
 from .session import (
     CONFIRMED,
+    DEFAULT_CAPABILITY_ID,
     DRAFTING,
     PLANNED,
     WAITING_USER,
@@ -31,14 +43,26 @@ from .session import (
     SessionError,
     _load_changesets,
 )
+from .storage import load_json
+from .threads import (
+    ThreadError,
+    append_message,
+    archive_thread,
+    create_thread,
+    get_thread,
+    list_threads,
+    messages,
+    rename_thread,
+)
 from .webchat import execute_intent, route_intent
+from .workspace import Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
 TEMPLATES_DIR = Path(__file__).resolve().parent / "webtemplates"
 
 
-def _default_project_dir() -> Path:
-    return Path("runs/mvp_web")
+def _default_workspace_dir() -> Path:
+    return Path("runs/workspace")
 
 
 def _session_for(project_dir: Path) -> ProjectSession:
@@ -48,6 +72,7 @@ def _session_for(project_dir: Path) -> ProjectSession:
 
 
 def _session_view(session: ProjectSession) -> dict[str, Any]:
+    config = session.config
     return {
         "project_dir": str(session.project_dir),
         "state": session.state,
@@ -55,7 +80,9 @@ def _session_view(session: ProjectSession) -> dict[str, Any]:
         "summary": session.summary_lines(),
         "history": _load_changesets(session.changeset_path)[-8:],
         # Web-editable connection / LLM configuration (secrets redacted).
-        "config": _editable_config(session.config) if session.config is not None else None,
+        "config": _editable_config(config) if config is not None else None,
+        # 样本表（右栏「样本」页签用）；项目尚未创建时为 []。
+        "samples": list((config or {}).get("samples", {}).get("items", [])),
     }
 
 
@@ -130,10 +157,59 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
         return None
 
 
-def create_app(*, project_dir: Path | None = None) -> FastAPI:
+def _interrupt_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract the JSON-safe payload(s) of a LangGraph interrupt result.
+
+    ``invoke`` returns a state dict carrying ``__interrupt__`` as a list of
+    ``Interrupt`` objects; each ``.value`` holds the payload passed to
+    ``interrupt(...)``. We normalise that so the web layer never sees the
+    runtime objects.
+    """
+    raw = result.get("__interrupt__") or []
+    payloads: list[dict[str, Any]] = []
+    for item in raw:
+        value = getattr(item, "value", item)
+        payloads.append(value if isinstance(value, dict) else {"value": value})
+    return payloads
+
+
+def _result_view(result: dict[str, Any]) -> dict[str, Any]:
+    """A JSON-safe view of a graph run result (drops runtime objects)."""
+    view = {k: v for k, v in result.items() if k != "__interrupt__"}
+    view["interrupts"] = _interrupt_payloads(result)
+    return view
+
+
+def _new_thread_id() -> str:
+    """A collision-resistant thread id (all-alphanumeric, threads-safe)."""
+    from datetime import datetime, timezone
+
+    return "thread_" + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+
+
+def create_app(
+    *,
+    project_dir: Path | None = None,
+    workspace_dir: Path | None = None,
+) -> FastAPI:
     # Single-user localhost: bind loopback only, random session token.
-    project_dir = Path(project_dir or _default_project_dir()).resolve()
+    workspace_root = Path(
+        workspace_dir or (project_dir.parent if project_dir else _default_workspace_dir())
+    ).resolve()
+    workspace = Workspace(workspace_root)
+    # The single-project ``/api/*`` endpoints keep operating on one "default"
+    # project directory so the original workbench stays usable; the three-page
+    # surface addresses projects by id via the Workspace registry instead.
+    legacy_project_dir = (
+        Path(project_dir).resolve() if project_dir else workspace_root / "default"
+    )
     token = secrets.token_urlsafe(16)
+
+    # In-memory graph run bookkeeping keyed by project_id. The graph itself
+    # persists to the per-project SQLite checkpointer; this dict only tracks
+    # the in-flight invoke so the HTTP layer can release while a job runs.
+    _graph_runs: dict[str, dict[str, Any]] = {}
+    _graph_lock = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -162,18 +238,195 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
                 return JSONResponse({"error": "forbidden"}, status_code=403)
         return await call_next(request)
 
+    # -- workspace / thread / graph helpers -----------------------------
+
+    def _project_dir_or_404(project_id: str) -> Path:
+        if workspace.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"项目 {project_id!r} 不存在。")
+        return workspace.project_dir(project_id)
+
+    def _bound_project_id(request: Request, body: dict[str, Any] | None = None) -> str | None:
+        """Resolve an optional workspace project binding for a legacy ``/api/*`` call.
+
+        M1.5: the single-project session endpoints gain a project binding so the
+        three-pane workbench can drive any registered project. ``?project=<id>``
+        (query) or ``project_id`` (JSON body) names the project; only ids that
+        actually exist in the workspace registry bind, so ``/api/new``'s
+        ``project_id`` field (the config's ``project.id``) never collides. Any
+        unbound call keeps operating on the default legacy project directory.
+        """
+        project_id = str(request.query_params.get("project") or "").strip()
+        if not project_id and isinstance(body, dict):
+            project_id = str(body.get("project_id") or "").strip()
+        if project_id and workspace.get_project(project_id) is not None:
+            return project_id
+        return None
+
+    def _legacy_dir_for(request: Request, body: dict[str, Any] | None = None) -> Path:
+        """Directory a legacy ``/api/*`` endpoint should operate on.
+
+        Binds to the named workspace project when present, else falls back to
+        the default legacy directory (backward compatible with the original
+        single-project workbench).
+        """
+        project_id = _bound_project_id(request, body)
+        return _project_dir_or_404(project_id) if project_id is not None else legacy_project_dir
+
+    def _capability_id_for(project_dir: Path) -> str:
+        """Prefer the capability bound in session.json, else the frozen slot."""
+        session_path = project_dir / "session.json"
+        if session_path.is_file():
+            try:
+                payload = load_json(session_path)
+            except (OSError, ValueError):
+                payload = {}
+            capability_id = str(payload.get("capability_id") or "").strip()
+            if capability_id:
+                return capability_id
+        return DEFAULT_CAPABILITY_ID
+
+    def _start_graph_run(
+        project_id: str,
+        project_dir: Path,
+        *,
+        resume: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Drive the graph in a background thread and return its bookkeeping entry.
+
+        The HTTP request returns immediately; the graph continues in a daemon
+        thread and its durable state lands in the per-project SQLite
+        checkpointer (``thread_id == project_id``). Returns ``{"conflict": ...}``
+        when a run is already in flight.
+        """
+        with _graph_lock:
+            existing = _graph_runs.get(project_id)
+            if existing is not None:
+                return {"conflict": True, "state": existing.get("state", "running")}
+
+        entry: dict[str, Any] = {
+            "project_id": project_id,
+            "state": "running",
+            "result": None,
+            "error": None,
+        }
+        with _graph_lock:
+            _graph_runs[project_id] = entry
+
+        def _drive() -> None:
+            try:
+                with sqlite_checkpointer_for(project_dir) as checkpointer:
+                    graph = build_bulk_rna_graph(checkpointer)
+                    config = {"configurable": {"thread_id": project_id}}
+                    if resume is not None:
+                        from langgraph.types import Command
+
+                        result = graph.invoke(Command(resume=resume), config=config)
+                    else:
+                        result = graph.invoke(
+                            {
+                                "project_dir": str(project_dir),
+                                "capability_id": _capability_id_for(project_dir),
+                                "status": "",
+                                "message": "",
+                            },
+                            config=config,
+                        )
+                entry["result"] = _result_view(result)
+                interrupts = _interrupt_payloads(result)
+                if interrupts:
+                    entry["state"] = WAITING_USER
+                    entry["interrupt"] = interrupts[0]
+                else:
+                    entry["state"] = str(result.get("status") or "completed")
+            except Exception as exc:  # noqa: BLE001 - surface the error to the UI
+                entry["state"] = "error"
+                entry["error"] = str(exc)
+            finally:
+                with _graph_lock:
+                    _graph_runs.pop(project_id, None)
+
+        threading.Thread(target=_drive, daemon=True, name=f"graph:{project_id}").start()
+        return entry
+
+    def _graph_snapshot(project_id: str, project_dir: Path) -> dict[str, Any]:
+        """Read the durable graph state from the per-project checkpointer."""
+        with _graph_lock:
+            in_flight = _graph_runs.get(project_id)
+        if in_flight is not None:
+            return {
+                "project_id": project_id,
+                "state": in_flight.get("state", "running"),
+                "in_flight": True,
+                "error": in_flight.get("error"),
+            }
+        try:
+            with sqlite_checkpointer_for(project_dir) as checkpointer:
+                tup = checkpointer.get_tuple(
+                    config={"configurable": {"thread_id": project_id}}
+                )
+        except Exception as exc:  # noqa: BLE001
+            return {"project_id": project_id, "state": "error", "error": str(exc)}
+        if tup is None:
+            return {"project_id": project_id, "state": "idle", "in_flight": False}
+
+        checkpoint = tup.checkpoint or {}
+        channels = dict(checkpoint.get("channel_values", {}) or {})
+        # Unstructured ``dict`` state nests the whole state under ``__root__``;
+        # a TypedDict schema (BulkRNAState) stores one channel per key.
+        if "__root__" in channels and isinstance(channels["__root__"], dict):
+            graph_state = dict(channels["__root__"])
+        else:
+            graph_state = channels
+        interrupts: list[dict[str, Any]] = []
+        for _task_id, channel, value in (tup.pending_writes or []):
+            if channel == "__interrupt__":
+                for item in value:
+                    interrupts.append(getattr(item, "value", item))
+        status = str(graph_state.get("status") or "")
+        state = WAITING_USER if interrupts else (status or "completed")
+        return {
+            "project_id": project_id,
+            "state": state,
+            "in_flight": False,
+            "graph_state": graph_state,
+            "interrupt": interrupts[0] if interrupts else None,
+        }
+
     # -- pages -----------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
-        session = _session_for(project_dir)
         return templates.TemplateResponse(
             request,
             "index.html",
             {
                 "token": token,
+                "workspace_root": str(workspace.root),
+            },
+        )
+
+    @app.get("/workbench", response_class=HTMLResponse)
+    async def workbench(request: Request):
+        # M1.5: ``?project=<id>`` 让三栏工作台直接绑定到指定项目；未提供或
+        # 未注册时页面仍正常渲染，由前端在左栏列出项目供选择。
+        project_id = str(request.query_params.get("project") or "").strip()
+        if project_id and workspace.get_project(project_id) is None:
+            project_id = ""
+        return templates.TemplateResponse(
+            request,
+            "workbench.html",
+            {"token": token, "project_id": project_id},
+        )
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings(request: Request):
+        session = _session_for(legacy_project_dir)
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            {
+                "token": token,
                 "session": _session_view(session),
-                "capabilities": [c.capability_id for c in __import__("rnaseq_agent.capability", fromlist=["list_capabilities"]).list_capabilities()],
             },
         )
 
@@ -182,18 +435,23 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     @app.post("/api/new")
     async def api_new(request: Request):
         _guard(request)
+        payload = await request.json()
+        project_dir = _legacy_dir_for(request, payload)
         if (project_dir / "session.json").is_file():
             return {"error": "项目已存在，请先打开或删除。"}
-        payload = await request.json()
         config = _default_config(project_dir, payload)
         session = ProjectSession(project_dir)
         gate = session.new_project(config)
+        # 若该目录对应一个已注册的 workspace 项目，同步注册表里的状态。
+        project_id = _bound_project_id(request, payload)
+        if project_id is not None:
+            workspace.touch(project_id, session.state)
         return {"state": session.state, "gate": gate.formatted()}
 
     @app.post("/api/plan")
     async def api_plan(request: Request):
         _guard(request)
-        session = _session_for(project_dir)
+        session = _session_for(_legacy_dir_for(request))
         try:
             plan = session.plan()
             return {"state": session.state, "steps": plan.steps, "summary": plan.summary}
@@ -203,7 +461,7 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     @app.post("/api/confirm")
     async def api_confirm(request: Request):
         _guard(request)
-        session = _session_for(project_dir)
+        session = _session_for(_legacy_dir_for(request))
         try:
             contract = session.confirm()
             return {"state": session.state, "contract_id": contract["contract_id"]}
@@ -214,7 +472,7 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     async def api_resume(request: Request):
         """Resume from the QC checkpoint: user confirmed fastp QC, continue."""
         _guard(request)
-        session = _session_for(project_dir)
+        session = _session_for(_legacy_dir_for(request))
         if session.state != WAITING_USER:
             return {"error": f"当前状态 {session.state} 不在 QC 检查点。"}
         # Move on: after a resume the plan stays confirmed; we simulate the
@@ -224,14 +482,14 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     @app.get("/api/state")
     async def api_state(request: Request):
         _guard(request)
-        session = _session_for(project_dir)
+        session = _session_for(_legacy_dir_for(request))
         return _session_view(session)
 
     @app.post("/api/edit")
     async def api_edit(request: Request):
         _guard(request)
-        session = _session_for(project_dir)
         payload = await request.json()
+        session = _session_for(_legacy_dir_for(request, payload))
         try:
             gate = session.edit(payload.get("patch", {}), note=payload.get("note", ""))
             return {"state": session.state, "gate": gate.formatted()}
@@ -247,16 +505,25 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
         （两组、每组生物学重复阈值、batch 与 condition 不混杂）。
         """
         _guard(request)
-        session = _session_for(project_dir)
         payload = await request.json()
+        session = _session_for(_legacy_dir_for(request, payload))
         enabled = bool(payload.get("enabled"))
         if session.config is None:
             return {"error": "当前还没有项目，请先创建。"}
         try:
-            if enabled:
+            # reference_condition 与设计开关一同提交（M1.6 显式确认）。
+            diffexp_patch: dict[str, Any] = {}
+            reference = str(payload.get("reference_condition") or "").strip()
+            if reference:
+                diffexp_patch["reference_condition"] = reference
+            if diffexp_patch or enabled:
                 session.edit(
-                    {"pipeline": {"diffexp": {"enabled": True}}},
-                    note="Web DEG 面板启用 diffexp",
+                    {
+                        "pipeline": {"diffexp": {"enabled": enabled}},
+                        **({"diffexp": diffexp_patch} if diffexp_patch else {}),
+                    },
+                    note="Web DEG 面板启用 diffexp"
+                    + (f"，reference={reference}" if reference else ""),
                 )
             from .differential import (
                 DEG_DESIGN_FORMULA,
@@ -283,8 +550,8 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     @app.post("/api/rollback")
     async def api_rollback(request: Request):
         _guard(request)
-        session = _session_for(project_dir)
         payload = await request.json()
+        session = _session_for(_legacy_dir_for(request, payload))
         try:
             session.rollback(payload.get("target_index"))
             return {"state": session.state}
@@ -295,7 +562,7 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     async def api_config_get(request: Request):
         """Read back the web-editable connection / LLM settings (api_key masked)."""
         _guard(request)
-        session = _session_for(project_dir)
+        session = _session_for(_legacy_dir_for(request))
         if session.config is None:
             return {"config": None}
         return {"config": _editable_config(session.config)}
@@ -304,8 +571,8 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
     async def api_config_post(request: Request):
         """Edit connection (server.*) or LLM settings through the audited session."""
         _guard(request)
-        session = _session_for(project_dir)
         payload = await request.json()
+        session = _session_for(_legacy_dir_for(request, payload))
         patch: dict[str, Any] = {}
         note_parts: list[str] = []
 
@@ -369,7 +636,7 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
         if not text:
             return {"reply": "请输入想做的事。"}
 
-        session = _session_for(project_dir)
+        session = _session_for(_legacy_dir_for(request, payload))
         config = session.config
 
         # 1) LLM path (when enabled and reachable).
@@ -403,6 +670,191 @@ def create_app(*, project_dir: Path | None = None) -> FastAPI:
         elif "reply" not in result:
             result["reply"] = intent.message
         return result
+
+    # -- workspace API (multi-project registry) --------------------------
+
+    @app.get("/api/projects")
+    async def api_projects_list(request: Request):
+        _guard(request)
+        include_archived = request.query_params.get("include_archived") == "1"
+        return {"projects": workspace.list_projects(include_archived=include_archived)}
+
+    @app.post("/api/projects")
+    async def api_projects_create(request: Request):
+        """Create a project entry and its default 「主分析流程」 thread.
+
+        The analysis session (session.json) is created later on the workbench
+        via ``/api/new``; this endpoint only owns the registry + directory +
+        conversation scaffolding (UI doc section 4).
+        """
+        _guard(request)
+        payload = await request.json()
+        project_id = str(payload.get("project_id") or "").strip()
+        if not project_id:
+            return {"error": "缺少 project_id。"}
+        try:
+            meta = workspace.create_project(
+                project_id,
+                title=str(payload.get("title") or ""),
+                owner=str(payload.get("owner") or ""),
+                description=str(payload.get("description") or ""),
+            )
+        except WorkspaceError as exc:
+            return {"error": str(exc)}
+        project_dir = workspace.project_dir(project_id)
+        # Auto-create the main analysis thread (idempotent).
+        try:
+            create_thread(project_dir, "main", title="主分析流程")
+        except ThreadError:
+            pass
+        workspace.set_thread_count(project_id, len(list_threads(project_dir)))
+        return meta
+
+    @app.post("/api/projects/{project_id}/archive")
+    async def api_projects_archive(project_id: str, request: Request):
+        _guard(request)
+        try:
+            return workspace.archive_project(project_id)
+        except WorkspaceError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/unarchive")
+    async def api_projects_unarchive(project_id: str, request: Request):
+        _guard(request)
+        try:
+            return workspace.unarchive_project(project_id)
+        except WorkspaceError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # -- threads API (per-project conversations) -------------------------
+
+    @app.get("/api/projects/{project_id}/threads")
+    async def api_threads_list(project_id: str, request: Request):
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        return {"threads": list_threads(project_dir)}
+
+    @app.post("/api/projects/{project_id}/threads")
+    async def api_threads_create(project_id: str, request: Request):
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        thread_id = str(payload.get("thread_id") or "").strip()
+        if not thread_id:
+            thread_id = _new_thread_id()
+        try:
+            thread = create_thread(project_dir, thread_id, title=str(payload.get("title") or ""))
+        except ThreadError as exc:
+            return {"error": str(exc)}
+        workspace.set_thread_count(project_id, len(list_threads(project_dir)))
+        return thread
+
+    @app.get("/api/projects/{project_id}/threads/{thread_id}")
+    async def api_threads_get(project_id: str, thread_id: str, request: Request):
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        try:
+            return get_thread(project_dir, thread_id)
+        except ThreadError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.patch("/api/projects/{project_id}/threads/{thread_id}")
+    async def api_threads_rename(project_id: str, thread_id: str, request: Request):
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return {"error": "缺少 title。"}
+        try:
+            return rename_thread(project_dir, thread_id, title)
+        except ThreadError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/projects/{project_id}/threads/{thread_id}")
+    async def api_threads_archive(project_id: str, thread_id: str, request: Request):
+        """Archive a thread; inputs/runs/artifacts are never touched (UI doc 3.6)."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        try:
+            return archive_thread(project_dir, thread_id)
+        except ThreadError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/projects/{project_id}/threads/{thread_id}/messages")
+    async def api_threads_messages(project_id: str, thread_id: str, request: Request):
+        """Only this thread's messages; no cross-thread reads (UI doc 3.5)."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        try:
+            return {"messages": messages(project_dir, thread_id)}
+        except ThreadError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/projects/{project_id}/threads/{thread_id}/messages")
+    async def api_threads_append(project_id: str, thread_id: str, request: Request):
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        role = str(payload.get("role") or "user")
+        if role not in {"user", "agent"}:
+            return {"error": "role 只能是 user 或 agent。"}
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            return {"error": "缺少 content。"}
+        try:
+            message = append_message(
+                project_dir,
+                thread_id,
+                role=role,
+                content=content,
+                references=payload.get("references"),
+            )
+        except ThreadError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return message
+
+    # -- graph API (LangGraph control plane, thread_id == project_id) ----
+
+    @app.post("/api/projects/{project_id}/graph/run")
+    async def api_graph_run(project_id: str, request: Request):
+        """Start the control-plane graph; returns immediately, runs in background."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        entry = _start_graph_run(project_id, project_dir)
+        if entry.get("conflict"):
+            return {"error": "该项目的图运行已在执行中。", "state": entry.get("state")}
+        return {"project_id": project_id, "state": "running"}
+
+    @app.get("/api/projects/{project_id}/graph/state")
+    async def api_graph_state(project_id: str, request: Request):
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        return _graph_snapshot(project_id, project_dir)
+
+    @app.post("/api/projects/{project_id}/graph/resume")
+    async def api_graph_resume(project_id: str, request: Request):
+        """Resume from the QC checkpoint (fastp QC decision).
+
+        The decision is recorded against the same attempt via the graph's
+        ``wait_qc`` node, so every dialogue reads one artifact/checkpoint.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        snapshot = _graph_snapshot(project_id, project_dir)
+        if snapshot.get("state") != WAITING_USER:
+            return {"error": f"当前状态 {snapshot.get('state')} 不在 QC 检查点，无法恢复。"}
+        payload = await request.json()
+        decision = {
+            "approved": bool(payload.get("approved", True)),
+            "user": str(payload.get("user") or ""),
+            "thread_id": str(payload.get("thread_id") or project_id),
+            "note": str(payload.get("note") or ""),
+        }
+        entry = _start_graph_run(project_id, project_dir, resume=decision)
+        if entry.get("conflict"):
+            return {"error": "该项目的图运行已在执行中。"}
+        return {"project_id": project_id, "state": "running", "resume": decision}
 
     return app
 

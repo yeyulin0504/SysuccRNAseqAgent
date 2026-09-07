@@ -293,8 +293,34 @@ def _workflow_snapshot(config: dict[str, Any]) -> dict[str, Any]:
             "items": sample_items,
         },
         "pipeline": deepcopy(config.get("pipeline", {})),
-        "diffexp": deepcopy(config.get("diffexp", {})),
+        "diffexp": _diffexp_snapshot(config),
+        "cms": _cms_snapshot(config),
     }
+
+
+def _diffexp_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the diffexp settings, plus the resolved design/contrast when enabled.
+
+    M1.6 (缺口5): the contrast direction must be explicitly confirmed, and the
+    frozen ``diffexp_design_of`` descriptor is embedded into the workflow
+    snapshot so the contract records exactly what was run.
+    """
+    snapshot = deepcopy(config.get("diffexp", {}))
+    if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+        from .differential import diffexp_design_of
+
+        snapshot["design"] = diffexp_design_of(config)
+    return snapshot
+
+
+def _cms_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the CMS settings, plus the resolved frozen descriptor when enabled."""
+    snapshot = deepcopy(config.get("cms", {}))
+    if config.get("pipeline", {}).get("cms", {}).get("enabled"):
+        from .cms import cms_design_of
+
+        snapshot["design"] = cms_design_of(config)
+    return snapshot
 
 
 def _input_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:

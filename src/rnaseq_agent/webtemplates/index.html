@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SYSU 多组学分析 Agent MVP</title>
+<title>SYSU 多组学分析 Agent — 项目首页</title>
 <style>
   :root {
     --bg: #0f1420; --panel: #1a2130; --border: #2b3550;
@@ -16,376 +16,128 @@
   header { padding: 14px 24px; border-bottom: 1px solid var(--border);
            display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  nav { margin-left: auto; display: flex; gap: 10px; }
+  nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
   .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px;
            border: 1px solid var(--border); color: var(--muted); }
-  .state { font-size: 12px; padding: 3px 10px; border-radius: 20px; }
-  .state.planned { background: rgba(77,163,255,.15); color: var(--accent); }
-  .state.confirmed { background: rgba(62,207,142,.15); color: var(--ok); }
-  .state.waiting { background: rgba(240,180,41,.18); color: var(--warn); }
-  .state.drafting { background: rgba(139,148,168,.15); color: var(--muted); }
-  .layout { display: grid; grid-template-columns: 260px 1fr; height: calc(100vh - 60px); }
-  .sidebar { border-right: 1px solid var(--border); padding: 16px; overflow: auto; }
-  .main { padding: 16px 24px; overflow: auto; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px; }
   h2 { font-size: 14px; color: var(--muted); text-transform: uppercase;
-       letter-spacing: .5px; margin: 18px 0 10px; }
+       letter-spacing: .5px; margin: 22px 0 10px; }
   .card { background: var(--panel); border: 1px solid var(--border);
           border-radius: 10px; padding: 16px; margin-bottom: 14px; }
-  .card h3 { margin: 0 0 10px; font-size: 15px; }
-  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
-  input, textarea { width: 100%; background: var(--bg); border: 1px solid var(--border);
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 4px; }
+  input { width: 100%; background: var(--bg); border: 1px solid var(--border);
         border-radius: 6px; color: var(--text); padding: 8px 10px; font-size: 13px; }
-  textarea { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
   button { background: var(--accent); color: #fff; border: none; border-radius: 6px;
            padding: 8px 16px; font-size: 13px; cursor: pointer; margin-top: 12px; }
   button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  .row { display: flex; gap: 10px; }
+  .proj { display: flex; align-items: center; gap: 12px; padding: 12px 0;
+          border-bottom: 1px solid var(--border); }
+  .proj:last-child { border-bottom: none; }
+  .proj .title { font-size: 14px; }
+  .proj .meta { font-size: 12px; color: var(--muted); }
+  .state { font-size: 11px; padding: 2px 8px; border-radius: 12px; }
+  .state.drafting { background: rgba(139,148,168,.15); color: var(--muted); }
+  .state.planned { background: rgba(77,163,255,.15); color: var(--accent); }
+  .state.confirmed { background: rgba(62,207,142,.15); color: var(--ok); }
+  .state.waiting_user { background: rgba(240,180,41,.18); color: var(--warn); }
+  .state.completed { background: rgba(62,207,142,.15); color: var(--ok); }
+  .state.failed { background: rgba(224,92,92,.15); color: var(--err); }
   .muted { color: var(--muted); font-size: 12px; }
-  .mono { font-family: ui-monospace, Consolas, monospace; }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
-  .step { font-size: 12px; color: var(--muted); padding: 2px 0; }
-  .sample-input { display: grid; grid-template-columns: 1fr 1fr 1.2fr 1.2fr 1fr; gap: 8px; margin-bottom: 6px; }
-  #history li { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  .notice { background: rgba(240,180,41,.12); border: 1px solid rgba(240,180,41,.4);
-            color: var(--warn); padding: 10px 12px; border-radius: 8px; font-size: 13px; }
-  .notice.ok { background: rgba(62,207,142,.12); border-color: rgba(62,207,142,.4); color: var(--ok); }
-  .hidden { display: none; }
+  .err { color: var(--err); }
 </style>
 </head>
 <body>
 <header>
   <h1>SYSU 多组学分析 Agent</h1>
   <span class="badge">localhost</span>
-  <span id="stateBadge" class="state">{{ session.state }}</span>
-  <span id="capBadge" class="badge">{{ session.capability_id }}</span>
+  <nav>
+    <a href="/workbench">分析工作台</a>
+    <a href="/settings">设置</a>
+  </nav>
 </header>
 
-<div class="layout">
-  <!-- 左侧：项目/状态/审计 -->
-  <div class="sidebar">
-    <h2>项目</h2>
-    <div class="card">
-      <div class="muted" id="projectDir">{{ session.project_dir }}</div>
-      <div id="summary">
-        {% for line in session.summary %}<div class="step">{{ line }}</div>{% endfor %}
-      </div>
+<div class="wrap">
+  <h2>新建项目</h2>
+  <div class="card">
+    <div class="row">
+      <div><label>项目 ID</label><input id="projectId" placeholder="demo_001"></div>
+      <div><label>项目名称</label><input id="title" placeholder="Bulk RNA 差异分析"></div>
+      <div><label>负责人</label><input id="owner" placeholder="local_user"></div>
     </div>
-
-    <h2>审计记录</h2>
-    <div class="card">
-      <ul id="history">
-        {% for entry in session.history %}
-        <li>#{{ entry.index }} {{ entry.event }} <span class="muted">{{ entry.timestamp }}</span></li>
-        {% endfor %}
-      </ul>
+    <div class="row">
+      <div style="flex:3"><label>研究目标（描述）</label><input id="description" placeholder="比较两组肿瘤样本的差异表达与融合基因"></div>
     </div>
-
-    <h2>操作</h2>
-    <div class="card">
-      <button class="secondary" onclick="refreshState()">刷新状态</button>
-      <button id="rollbackBtn" class="secondary" onclick="doRollback()">回滚最后一次变更</button>
-    </div>
+    <button onclick="createProject()">创建项目</button>
+    <span id="createErr" class="err"></span>
   </div>
 
-  <!-- 右侧：流程 / 对话决策 -->
-  <div class="main">
-    <div id="qcNotice" class="notice hidden">
-      <b>QC 检查点（框架 6.1）</b>：fastp QC 已完成。请审阅后确认，进入 STAR 比对。
-      <button id="resumeBtn" onclick="resumeQc()">确认 QC，继续</button>
-    </div>
-
-    <h2>新建项目</h2>
-    <div class="card">
-      <div class="row">
-        <div style="flex:1"><label>项目 ID</label><input id="projectId" placeholder="demo_001"></div>
-        <div style="flex:1"><label>项目名称</label><input id="title" placeholder="Bulk RNA 差异分析"></div>
-        <div style="flex:1"><label>癌种</label><input id="cancerType" value="pan_cancer"></div>
-      </div>
-      <div class="row">
-        <div style="flex:1"><label>实验设计</label>
-          <input id="design" value="independent_two_group"></div>
-        <div style="flex:1"><label>本地 FASTQ 目录</label>
-          <input id="fastqDir" value="outputs/mvp_demo_data"></div>
-        <div style="flex:1"><label>负责人</label><input id="owner" value="local_user"></div>
-      </div>
-      <label>样本（sample_id, condition, R1, R2, batch[可选]）</label>
-      <div class="sample-input">
-        <input class="s-id" placeholder="ctrl_1"><input class="s-cond" placeholder="control">
-        <input class="s-r1" placeholder="ctrl_1_R1.fastq.gz"><input class="s-r2" placeholder="ctrl_1_R2.fastq.gz">
-        <input class="s-batch" placeholder="batch">
-      </div>
-      <div class="sample-input">
-        <input class="s-id" placeholder="trt_1"><input class="s-cond" placeholder="treatment">
-        <input class="s-r1" placeholder="trt_1_R1.fastq.gz"><input class="s-r2" placeholder="trt_1_R2.fastq.gz">
-        <input class="s-batch" placeholder="batch">
-      </div>
-      <button onclick="createProject()">创建项目草稿</button>
-    </div>
-
-    <h2>服务器与执行</h2>
-    <div class="card">
-      <div class="row">
-        <div style="flex:1"><label>主机</label><input id="srvHost" placeholder="login.hpc"></div>
-        <div style="flex:1"><label>用户名</label><input id="srvUser" placeholder="user"></div>
-        <div style="flex:1"><label>调度器</label>
-          <input id="srvScheduler" placeholder="slurm / local"></div>
-      </div>
-      <div class="row">
-        <div style="flex:1"><label>线程数</label><input id="srvThreads" placeholder="8"></div>
-        <div style="flex:1"><label>内存 (GB)</label><input id="srvMemory" placeholder="32"></div>
-        <div style="flex:1"><div class="muted" style="margin-top:22px" id="srvRemoteDir"></div></div>
-      </div>
-      <div class="row">
-        <button class="secondary" onclick="saveServerConfig()">保存服务器配置</button>
-        <div class="muted" style="margin-top:18px">远程工作目录在项目创建时固定，如需变更请回滚后重建。</div>
-      </div>
-    </div>
-
-    <h2>大模型接入</h2>
-    <div class="card">
-      <div class="row">
-        <div style="flex:1"><label>API Base</label><input id="llmBase" placeholder="https://api.openai.com/v1"></div>
-        <div style="flex:1"><label>模型</label><input id="llmModel" placeholder="gpt-4o-mini"></div>
-        <div style="flex:1"><label>提供商（可选）</label><input id="llmProvider" placeholder="openai / deepseek / ..."></div>
-      </div>
-      <div class="row">
-        <div style="flex:1"><label>API Key <span class="muted" id="llmKeyState"></span></label>
-          <input id="llmKey" type="password" placeholder="sk-..."></div>
-        <div style="flex:1"><label>&nbsp;</label>
-          <label style="display:flex;align-items:center;gap:6px;margin-top:2px">
-            <input type="checkbox" id="llmEnabled" style="width:auto"> 启用大模型对话
-          </label>
-        </div>
-        <div style="flex:1"></div>
-      </div>
-      <div class="row">
-        <button class="secondary" onclick="saveLlmConfig()">保存大模型配置</button>
-        <button class="secondary" onclick="clearLlmKey()">清除 API Key</button>
-        <div class="muted" style="margin-top:18px">未启用或请求失败时，对话自动回退本地规则路由。</div>
-      </div>
-    </div>
-
-    <h2>流程</h2>
-    <div class="card">
-      <div id="planSteps" class="muted">尚未生成计划。创建项目后点击「生成执行计划」。</div>
-      <div class="row">
-        <button onclick="doPlan()">生成执行计划</button>
-        <button id="confirmBtn" class="secondary" onclick="doConfirm()">确认并冻结契约</button>
-      </div>
-    </div>
-
-    <h2>差异表达（条件开放）</h2>
-    <div class="card">
-      <div id="degStatus" class="muted">DESeq2 两组对比。需要样本满足设计门禁（两组、每组 ≥3、batch 不混杂）才能启用。</div>
-      <div class="row">
-        <button class="secondary" onclick="toggleDeg(true)">启用差异表达</button>
-        <button class="secondary" onclick="toggleDeg(false)">关闭差异表达</button>
-        <button class="secondary" onclick="degGate()">查看 DEG 门禁</button>
-      </div>
-    </div>
-
-    <h2>对话与决策</h2>
-    <div class="card">
-      <textarea id="chatInput" rows="3"
-        placeholder="向 Agent 提问，例如：请解释当前流程的 QC 阈值"></textarea>
-      <button onclick="sendChat()">发送</button>
-      <div id="chatReply" class="muted" style="margin-top:10px"></div>
-    </div>
+  <h2>项目列表</h2>
+  <div class="card" id="projects">
+    <div class="muted">加载中…</div>
   </div>
 </div>
 
 <script>
 const TOKEN = "{{ token }}";
-async function api(path, body) {
-  const opts = { method: "POST", headers: { "content-type": "application/json", "x-session-token": TOKEN } };
+async function api(path, method, body) {
+  const opts = { method: method || "GET", headers: { "content-type": "application/json", "x-session-token": TOKEN } };
   if (body) opts.body = JSON.stringify(body);
   const resp = await fetch(path, opts);
   return resp.json();
 }
-function setState(state) {
-  const badge = document.getElementById("stateBadge");
-  badge.textContent = state;
-  badge.className = "state " + state.toLowerCase().replace("waiting_user", "waiting");
-  const qc = document.getElementById("qcNotice");
-  qc.classList.toggle("hidden", state !== "WAITING_USER");
-  document.getElementById("confirmBtn").disabled = state !== "planned";
+function stateClass(s) {
+  return "state " + String(s || "drafting").toLowerCase().replace("waiting_user", "waiting_user");
 }
-function refreshState() {
-  fetch("/api/state", { headers: { "x-session-token": TOKEN } })
-    .then(r => r.json()).then(data => {
-      setState(data.state);
-      document.getElementById("summary").innerHTML =
-        data.summary.map(l => `<div class="step">${l}</div>`).join("");
-    });
-} 
+function renderProjects(rows) {
+  const el = document.getElementById("projects");
+  if (!rows || !rows.length) { el.innerHTML = "<div class='muted'>还没有项目。在上方新建一个。</div>"; return; }
+  el.innerHTML = rows.map(p => `
+    <div class="proj">
+      <div style="flex:2">
+        <div class="title">${escapeHtml(p.title)}</div>
+        <div class="meta">${escapeHtml(p.project_id)} · ${escapeHtml(p.owner || "—")} · 更新 ${escapeHtml(p.updated_at || "—")}</div>
+      </div>
+      <div><span class="${stateClass(p.state)}">${escapeHtml(p.state)}</span></div>
+      <div class="meta">${p.thread_count || 0} 对话</div>
+      <div>
+        <a href="/workbench?project=${encodeURIComponent(p.project_id)}"><button class="secondary">打开</button></a>
+        <button class="secondary" onclick="archiveProject('${escapeHtml(p.project_id)}')">归档</button>
+      </div>
+    </div>`).join("");
+}
+function loadProjects() {
+  api("/api/projects").then(d => renderProjects(d.projects || []))
+    .catch(() => { document.getElementById("projects").innerHTML = "<div class='err'>加载失败</div>"; });
+}
 function createProject() {
-  const samples = [];
-  document.querySelectorAll(".sample-input").forEach(row => {
-    const id = row.querySelector(".s-id").value.trim();
-    const cond = row.querySelector(".s-cond").value.trim();
-    const r1 = row.querySelector(".s-r1").value.trim();
-    const r2 = row.querySelector(".s-r2").value.trim();
-    const batch = row.querySelector(".s-batch").value.trim();
-    if (id && cond && r1) samples.push({ sample_id: id, condition: cond, fastq_1: r1, fastq_2: r2, batch: batch || undefined });
-  });
-  api("/api/new", {
-    project_id: document.getElementById("projectId").value,
-    title: document.getElementById("title").value,
-    cancer_type: document.getElementById("cancerType").value,
-    design: document.getElementById("design").value,
-    fastq_dir: document.getElementById("fastqDir").value,
-    owner: document.getElementById("owner").value,
-    host: document.getElementById("srvHost").value.trim() || undefined,
-    user: document.getElementById("srvUser").value.trim() || undefined,
-    scheduler: document.getElementById("srvScheduler").value.trim() || undefined,
-    threads: Number(document.getElementById("srvThreads").value) || undefined,
-    memory_gb: Number(document.getElementById("srvMemory").value) || undefined,
-    samples,
-  }).then(d => { if (d.error) { alert(d.error); } else { setState(d.state); refreshState(); degGate(); loadConfig(); } });
-}
-function doPlan() {
-  api("/api/plan").then(d => {
-    if (d.error) { document.getElementById("planSteps").innerHTML = `<span class="err">${d.error}</span>`; return; }
-    document.getElementById("planSteps").innerHTML =
-      d.steps.map(s => `<div class="step">${s}</div>`).join("");
-    setState(d.state);
-  });
-}
-function doConfirm() {
-  api("/api/confirm").then(d => {
-    if (d.error) { alert(d.error); return; }
-    document.getElementById("planSteps").innerHTML +=
-      `<div class="step ok">契约已冻结：${d.contract_id.slice(0, 24)}…</div>`;
-    setState(d.state);
-  });
-}
-function doRollback() {
-  api("/api/rollback", {}).then(d => { if (d.error) alert(d.error); else { setState(d.state); refreshState(); } });
-}
-function resumeQc() {
-  api("/api/resume").then(d => { if (d.error) alert(d.error); else { refreshState(); } });
-}
-function renderDeg(d) {
-  const el = document.getElementById("degStatus");
-  if (d.error) { el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
-  const lines = [];
-  lines.push(d.requested ? `状态：已启用（${escapeHtml(d.formula)}）` : "状态：未启用");
-  if (d.design) lines.push(`对比：${escapeHtml(d.design.contrast)}（reference=${escapeHtml(d.design.reference_condition)}）`);
-  if (d.gate_ok) {
-    lines.push(`<span class="ok">设计门禁通过</span>`);
-  } else {
-    lines.push(`<span class="err">设计门禁未通过：</span>`);
-    (d.gate_reasons || []).forEach(r => lines.push(`<div class="step">- ${escapeHtml(r)}</div>`));
-  }
-  el.innerHTML = lines.join("<br>");
-}
-function toggleDeg(enabled) {
-  api("/api/deg", { enabled }).then(d => {
-    if (d.error) { alert(d.error); return; }
-    renderDeg(d);
-    if (d.state) setState(d.state);
-    refreshState();
-  });
-}
-function degGate() {
-  api("/api/deg", {}).then(d => renderDeg(d));
-}
-function loadConfig() {
-  fetch("/api/config", { headers: { "x-session-token": TOKEN } })
-    .then(r => r.json()).then(d => {
-      const c = d.config;
-      if (!c) return;
-      document.getElementById("srvHost").value = c.server.host || "";
-      document.getElementById("srvUser").value = c.server.user || "";
-      document.getElementById("srvScheduler").value = c.server.scheduler || "local";
-      document.getElementById("srvThreads").value = c.server.threads ?? "";
-      document.getElementById("srvMemory").value = c.server.memory_gb ?? "";
-      document.getElementById("srvRemoteDir").textContent = "远程目录：" + (c.server.remote_workdir || "");
-      document.getElementById("llmBase").value = c.llm.api_base || "";
-      document.getElementById("llmModel").value = c.llm.model || "";
-      document.getElementById("llmProvider").value = c.llm.provider || "";
-      document.getElementById("llmEnabled").checked = !!c.llm.enabled;
-      document.getElementById("llmKeyState").textContent = c.llm.api_key_set ? "（已设置）" : "（未设置）";
-      document.getElementById("llmKey").value = "";
-    });
-}
-function saveServerConfig() {
-  const server = {
-    host: document.getElementById("srvHost").value.trim(),
-    user: document.getElementById("srvUser").value.trim(),
-    scheduler: document.getElementById("srvScheduler").value.trim(),
-    threads: document.getElementById("srvThreads").value.trim(),
-    memory_gb: document.getElementById("srvMemory").value.trim(),
+  const body = {
+    project_id: document.getElementById("projectId").value.trim(),
+    title: document.getElementById("title").value.trim(),
+    owner: document.getElementById("owner").value.trim(),
+    description: document.getElementById("description").value.trim(),
   };
-  Object.keys(server).forEach(k => { if (server[k] === "") delete server[k]; });
-  if (server.threads) server.threads = Number(server.threads);
-  if (server.memory_gb) server.memory_gb = Number(server.memory_gb);
-  api("/api/config", { server }).then(d => {
-    if (d.error) { alert(d.error); return; }
-    setState(d.state); refreshState();
-    alert("服务器配置已保存。");
+  if (!body.project_id) { document.getElementById("createErr").textContent = "请填写项目 ID。"; return; }
+  document.getElementById("createErr").textContent = "";
+  api("/api/projects", "POST", body).then(d => {
+    if (d.error) { document.getElementById("createErr").textContent = d.error; return; }
+    loadProjects();
   });
 }
-function saveLlmConfig() {
-  const llm = {
-    provider: document.getElementById("llmProvider").value.trim(),
-    api_base: document.getElementById("llmBase").value.trim(),
-    model: document.getElementById("llmModel").value.trim(),
-    enabled: document.getElementById("llmEnabled").checked,
-  };
-  Object.keys(llm).forEach(k => { if (llm[k] === "") delete llm[k]; });
-  const key = document.getElementById("llmKey").value.trim();
-  if (key) llm.api_key = key;
-  api("/api/config", { llm }).then(d => {
-    if (d.error) { alert(d.error); return; }
-    if (d.config) {
-      document.getElementById("llmKeyState").textContent = d.config.llm.api_key_set ? "（已设置）" : "（未设置）";
-      document.getElementById("llmKey").value = "";
-      document.getElementById("llmEnabled").checked = !!d.config.llm.enabled;
-    }
-    setState(d.state); refreshState();
-    alert("大模型配置已保存。");
-  });
-}
-function clearLlmKey() {
-  api("/api/config", { llm: { api_key_clear: true } }).then(d => {
-    if (d.error) { alert(d.error); return; }
-    document.getElementById("llmKeyState").textContent = "（未设置）";
-    alert("API Key 已清除。");
-  });
-}
-function sendChat() {
-  const q = document.getElementById("chatInput").value.trim();
-  if (!q) return;
-  const reply = document.getElementById("chatReply");
-  reply.innerHTML = "<span class='muted'>你：</span>" + escapeHtml(q) + "<br><span class='muted'>Agent：处理中…</span>";
-  api("/api/chat", { message: q }).then(d => {
-    const head = "<span class='muted'>你：</span>" + escapeHtml(q) + "<br>";
-    if (d.steps) {
-      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
-        d.steps.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
-    } else if (d.summary) {
-      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
-        d.summary.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
-    } else if (d.gate && Array.isArray(d.gate)) {
-      reply.innerHTML = head + "<b>Agent：</b>" + escapeHtml(d.reply || "") + "<br>" +
-        d.gate.map(s => `<div class="step err">${escapeHtml(s)}</div>`).join("");
-    } else {
-      reply.innerHTML = head + "<b>Agent" + (d.via === "llm" ? "（大模型）" : "（规则）") + "：</b>" + escapeHtml(d.reply || d.error || "完成。");
-    }
-    if (d.state) setState(d.state);
-    refreshState();
-  }).catch(err => {
-    reply.innerHTML = "<span class='err'>请求失败：" + escapeHtml(String(err)) + "</span>";
+function archiveProject(id) {
+  if (!confirm("归档项目 " + id + "？分析数据不会删除，可随时恢复。")) return;
+  api(`/api/projects/${encodeURIComponent(id)}/archive`, "POST", {}).then(d => {
+    if (d.detail) { alert(d.detail); return; }
+    loadProjects();
   });
 }
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-setState("{{ session.state }}");
-{% if session.config %}degGate();
-loadConfig();{% endif %}
+loadProjects();
 </script>
 </body>
 </html>

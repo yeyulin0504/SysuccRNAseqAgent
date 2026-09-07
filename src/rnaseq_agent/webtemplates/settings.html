@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SYSU 多组学分析 Agent — 设置</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #1a2130; --border: #2b3550;
+    --text: #e6e9f0; --muted: #8b94a8; --accent: #4da3ff;
+    --ok: #3ecf8e; --warn: #f0b429; --err: #e05c5c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { padding: 14px 24px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  nav { margin-left: auto; display: flex; gap: 10px; }
+  nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px;
+           border: 1px solid var(--border); color: var(--muted); }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
+  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase;
+       letter-spacing: .5px; margin: 22px 0 10px; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+          border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0 4px; }
+  input { width: 100%; background: var(--bg); border: 1px solid var(--border);
+        border-radius: 6px; color: var(--text); padding: 8px 10px; font-size: 13px; }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 6px;
+           padding: 8px 16px; font-size: 13px; cursor: pointer; margin-top: 12px; }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .ok { color: var(--ok); }
+  .notice { background: rgba(62,207,142,.12); border: 1px solid rgba(62,207,142,.4);
+            color: var(--ok); padding: 10px 12px; border-radius: 8px; font-size: 13px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SYSU 多组学分析 Agent</h1>
+  <span class="badge">localhost</span>
+  <nav>
+    <a href="/">项目首页</a>
+    <a href="/workbench">分析工作台</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div id="savedNotice" class="notice hidden">已保存。</div>
+
+  <h2>HPC 连接</h2>
+  <div class="card">
+    <div class="row">
+      <div><label>主机</label><input id="srvHost" placeholder="login.hpc"></div>
+      <div><label>用户名</label><input id="srvUser" placeholder="user"></div>
+      <div><label>调度器</label><input id="srvScheduler" placeholder="slurm / local"></div>
+    </div>
+    <div class="row">
+      <div><label>线程数</label><input id="srvThreads" placeholder="8"></div>
+      <div><label>内存 (GB)</label><input id="srvMemory" placeholder="32"></div>
+      <div><label>远程工作目录</label><input id="srvRemoteDir" disabled></div>
+    </div>
+    <button onclick="saveServer()">保存 HPC 配置</button>
+    <div class="muted" style="margin-top:8px">远程目录在项目创建时固定，如需变更请回滚后重建。</div>
+  </div>
+
+  <h2>AI 模型接入</h2>
+  <div class="card">
+    <div class="row">
+      <div><label>API Base</label><input id="llmBase" placeholder="https://api.openai.com/v1"></div>
+      <div><label>模型</label><input id="llmModel" placeholder="gpt-4o-mini"></div>
+      <div><label>提供商（可选）</label><input id="llmProvider" placeholder="openai / deepseek / ..."></div>
+    </div>
+    <div class="row">
+      <div><label>API Key <span class="muted" id="llmKeyState"></span></label>
+        <input id="llmKey" type="password" placeholder="sk-..."></div>
+      <div><label>&nbsp;</label>
+        <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
+          <input type="checkbox" id="llmEnabled" style="width:auto"> 启用大模型对话
+        </label>
+      </div>
+    </div>
+    <button onclick="saveLlm()">保存 AI 配置</button>
+    <button class="secondary" onclick="clearKey()">清除 API Key</button>
+    <div class="muted" style="margin-top:8px">未启用或请求失败时，对话自动回退本地规则路由。</div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "{{ token }}";
+async function api(path, method, body) {
+  const opts = { method: method || "GET", headers: { "content-type": "application/json", "x-session-token": TOKEN } };
+  if (body) opts.body = JSON.stringify(body);
+  const resp = await fetch(path, opts);
+  return resp.json();
+}
+function flash() {
+  const el = document.getElementById("savedNotice");
+  el.classList.remove("hidden");
+  setTimeout(() => el.classList.add("hidden"), 2000);
+}
+function load() {
+  api("/api/config").then(d => {
+    const c = d.config;
+    if (!c) return;
+    document.getElementById("srvHost").value = c.server.host || "";
+    document.getElementById("srvUser").value = c.server.user || "";
+    document.getElementById("srvScheduler").value = c.server.scheduler || "local";
+    document.getElementById("srvThreads").value = c.server.threads ?? "";
+    document.getElementById("srvMemory").value = c.server.memory_gb ?? "";
+    document.getElementById("srvRemoteDir").value = c.server.remote_workdir || "";
+    document.getElementById("llmBase").value = c.llm.api_base || "";
+    document.getElementById("llmModel").value = c.llm.model || "";
+    document.getElementById("llmProvider").value = c.llm.provider || "";
+    document.getElementById("llmEnabled").checked = !!c.llm.enabled;
+    document.getElementById("llmKeyState").textContent = c.llm.api_key_set ? "（已设置）" : "（未设置）";
+  });
+}
+function saveServer() {
+  const server = {
+    host: document.getElementById("srvHost").value.trim(),
+    user: document.getElementById("srvUser").value.trim(),
+    scheduler: document.getElementById("srvScheduler").value.trim(),
+    threads: document.getElementById("srvThreads").value.trim(),
+    memory_gb: document.getElementById("srvMemory").value.trim(),
+  };
+  Object.keys(server).forEach(k => { if (server[k] === "") delete server[k]; });
+  if (server.threads) server.threads = Number(server.threads);
+  if (server.memory_gb) server.memory_gb = Number(server.memory_gb);
+  api("/api/config", "POST", { server }).then(d => { if (d.error) alert(d.error); else flash(); });
+}
+function saveLlm() {
+  const llm = {
+    provider: document.getElementById("llmProvider").value.trim(),
+    api_base: document.getElementById("llmBase").value.trim(),
+    model: document.getElementById("llmModel").value.trim(),
+    enabled: document.getElementById("llmEnabled").checked,
+  };
+  Object.keys(llm).forEach(k => { if (llm[k] === "") delete llm[k]; });
+  const key = document.getElementById("llmKey").value.trim();
+  if (key) llm.api_key = key;
+  api("/api/config", "POST", { llm }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    document.getElementById("llmKey").value = "";
+    flash();
+  });
+}
+function clearKey() {
+  api("/api/config", "POST", { llm: { api_key_clear: true } }).then(d => {
+    if (d.error) alert(d.error); else { document.getElementById("llmKeyState").textContent = "（未设置）"; flash(); }
+  });
+}
+{% if session.config %}load();{% endif %}
+</script>
+</body>
+</html>

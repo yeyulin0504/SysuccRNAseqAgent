@@ -147,8 +147,12 @@ class TestWebApp:
         status = client.post("/api/deg", json={}, headers=_headers(token)).json()
         assert status["requested"] is False
 
-        # 启用：2 样本 1v1 会触发设计门禁失败。
-        status = client.post("/api/deg", json={"enabled": True}, headers=_headers(token)).json()
+        # 启用：2 样本 1v1 会触发设计门禁失败；同时显式声明参考组（M1.6）。
+        status = client.post(
+            "/api/deg",
+            json={"enabled": True, "reference_condition": "ctrl"},
+            headers=_headers(token),
+        ).json()
         assert status["requested"] is True
         assert status["gate_ok"] is False
         assert any("重复" in reason or "单样本" in reason for reason in status["gate_reasons"])

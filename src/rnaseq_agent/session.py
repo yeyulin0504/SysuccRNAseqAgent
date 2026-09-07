@@ -363,6 +363,79 @@ class ProjectSession:
         self._save_session()
         return {"state": outcome.state, "message": outcome.message}
 
+    def execute_stage(self, stage: str, *, wait: bool = True) -> dict[str, Any]:
+        """Execute one scientific stage of the frozen project (说明书 §5).
+
+        Stage ids come from :mod:`rnaseq_agent.pipeline` (``qc`` / ``quant`` /
+        ``de``). Each stage shares the same logical attempt created by its
+        first stage, so stage-1 ``fastp/`` outputs feed stage-2 inputs. The
+        session state is saved before and after, mirroring :meth:`execute`.
+        """
+        from .pipeline import ALL_STAGES
+        from .run_agent import run_stage_project
+
+        if stage not in ALL_STAGES:
+            raise SessionError(f"未知执行阶段：{stage!r}。允许：{ALL_STAGES}")
+        self._require_state(CONFIRMED, EXECUTING)
+        self.state = EXECUTING
+        self._save_session()
+        outcome = run_stage_project(self.config_path, stage, wait=wait)
+        self.state = outcome.state
+        self._log(
+            "execution_finished",
+            {"stage": stage, "state": outcome.state, "message": outcome.message},
+        )
+        self._save_session()
+        return {"state": outcome.state, "message": outcome.message}
+
+    def record_qc_decision(
+        self,
+        *,
+        approved: bool,
+        checkpoint: str = "fastp_qc",
+        user: str = "",
+        thread_id: str = "",
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Persist a QC checkpoint decision against the live project.
+
+        The decision is written into ``project.json``'s ``status.qc`` block so
+        every dialogue (not just the deciding thread) reads the same artifact
+        binding and outcome (UI doc section 5 / section 6). A ChangeSet is
+        logged for the audit trail; scientific results are untouched.
+        """
+        from .run_agent import _update_status  # local import avoids cycle
+
+        assert self.config is not None
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        decision = {
+            "checkpoint": checkpoint,
+            "approved": bool(approved),
+            "decided_at": now,
+            "user": user,
+            "thread_id": thread_id,
+            "note": note,
+        }
+        self._log(
+            "qc_decision",
+            {
+                "checkpoint": checkpoint,
+                "approved": bool(approved),
+                "user": user,
+                "thread_id": thread_id,
+            },
+        )
+        # Keep the live state word intact; only attach the QC decision block.
+        config = load_json(self.config_path)
+        current_state = str(config.get("status", {}).get("state") or self.state)
+        _update_status(
+            self.config_path,
+            current_state,
+            config.get("status", {}).get("message", "QC 检查点已记录。"),
+            qc=decision,
+        )
+        return decision
+
     def refresh_status(self) -> dict[str, Any]:
         from .run_agent import refresh_status
 

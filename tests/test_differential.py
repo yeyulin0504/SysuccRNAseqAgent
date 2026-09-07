@@ -76,6 +76,8 @@ def _config(
     return {
         "study": {"design": design},
         "samples": {"items": items},
+        # M1.6：reference_condition 必须显式声明，helper 默认填 control。
+        "diffexp": {"reference_condition": "control"},
     }
 
 
@@ -117,6 +119,15 @@ class TestDegGate:
         gate = deg_gate(config)
         assert not gate.ok
         assert any("冻结公式" in reason for reason in gate.reasons)
+
+    def test_missing_reference_condition_refused(self) -> None:
+        # M1.6：reference_condition 必须显式声明，不能留空取字典序最小。
+        config = _config()
+        config["diffexp"] = {"reference_condition": ""}
+        gate = deg_gate(config)
+        assert not gate.ok
+        assert gate.verdict == NOT_EVALUABLE
+        assert any("显式声明" in reason for reason in gate.reasons)
 
     def test_fully_confounded_batches_refused(self) -> None:
         # control 全部 batch=B1, treatment 全部 batch=B2 => 完全混杂。

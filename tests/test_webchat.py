@@ -121,8 +121,7 @@ def _make_deg_session(tmp_path: Path):
             "profile": "mvp_local",
             "host": "localhost",
             "user": "t",
-            "remote_base_dir": f"{project_dir}/remote",
-            "remote_workdir": f"{project_dir}/remote/w",
+            "remote_base_dir": f"{project_dir}/remote",            "remote_workdir": f"{project_dir}/remote/w",
             "scheduler": "local",
             "threads": 4,
             "memory_gb": 16,
@@ -151,6 +150,8 @@ def _make_deg_session(tmp_path: Path):
             "rsem": {"enabled": False, "version": "1.2.28"},
             "diffexp": {"enabled": False, "version": "DESeq2"},
         },
+        # M1.6：reference_condition 显式声明（control 为参考组）。
+        "diffexp": {"reference_condition": "control"},
         "polling": {"interval_seconds": 300, "timeout_hours": 24},
         "notification": {"email_enabled": False},
     }

@@ -91,9 +91,15 @@ def diffexp_design_checks(config: dict[str, Any]) -> list[str]:
         reasons.append(f"首期仅冻结公式 {DEG_DESIGN_FORMULA!r}，当前 formula={formula!r}。")
         return reasons
 
-    # 对比方向：reference/对照组在 design 中以 reference_condition 指定；
-    # 未指定时取字典序较小者，并记录在对比描述中。
-    reference = _reference_condition(config)
+    # 对比方向：reference_condition 必须显式声明（M1.6 缺口5）。
+    # 不再默默取字典序较小者；留空即 NOT_EVALUABLE，提示需显式确认参考组。
+    reference = str(config.get("diffexp", {}).get("reference_condition", "")).strip()
+    if not reference:
+        reasons.append(
+            "diffexp 启用时必须显式声明 diffexp.reference_condition（对比的参考组），"
+            "不能留空默认取字典序最小。"
+        )
+        return reasons
     if reference not in conditions:
         reasons.append(f"reference_condition={reference!r} 不在样本 condition 中：{conditions}。")
         return reasons

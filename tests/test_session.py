@@ -19,6 +19,7 @@ from rnaseq_agent.session import (
     SessionError,
     _load_changesets,
 )
+from rnaseq_agent.storage import load_json
 
 
 def _write_fastq(path: Path, sequence: str = "ACGT") -> None:
@@ -269,3 +270,42 @@ class TestChangesetAudit:
         session.edit({"pipeline": {"fastp": {"enabled": False}}}, note="skip fastp")
         entries = _load_changesets(session.changeset_path)
         assert [entry["index"] for entry in entries] == [1, 2]
+
+
+class TestQcDecisionPersistence:
+    """M1: a QC checkpoint decision is bound to the live project, not a thread."""
+
+    def test_record_qc_decision_writes_project_status(
+        self, session: ProjectSession, project_dir: Path, tmp_path: Path
+    ) -> None:
+        session.new_project(_valid_config(tmp_path))
+        session.plan()
+        session.confirm()
+        decision = session.record_qc_decision(
+            approved=True,
+            user="alice",
+            thread_id="thread-qc-1",
+            note="reads retention > 0.9",
+        )
+        assert decision["approved"] is True
+        assert decision["checkpoint"] == "fastp_qc"
+        # The live project.json carries the decision for every dialogue.
+        project = load_json(project_dir / "project.json")
+        assert project["status"]["qc"]["approved"] is True
+        assert project["status"]["qc"]["user"] == "alice"
+        assert project["status"]["qc"]["thread_id"] == "thread-qc-1"
+        # And it is on the audit trail.
+        events = [e["event"] for e in _load_changesets(session.changeset_path)]
+        assert "qc_decision" in events
+
+    def test_record_qc_decision_keeps_live_state_intact(
+        self, session: ProjectSession, project_dir: Path, tmp_path: Path
+    ) -> None:
+        session.new_project(_valid_config(tmp_path))
+        session.plan()
+        session.confirm()
+        before = load_json(project_dir / "project.json")["status"]["state"]
+        session.record_qc_decision(approved=False, user="bob", note="redo fastp")
+        project = load_json(project_dir / "project.json")
+        assert project["status"]["state"] == before
+        assert project["status"]["qc"]["approved"] is False
