@@ -54,6 +54,19 @@ def route_intent(text: str) -> ChatIntent | None:
     if not lowered:
         return None
 
+    # Read-only remote sample discovery.  The executor owns SSH and command
+    # construction; the router only extracts an optional absolute path.
+    if _has(lowered, ["浏览", "扫描", "查找", "找样本", "找我的样本", "browse", "scan"] ) and _has(
+        lowered, ["目录", "服务器", "样本", "fastq", "rna-seq", "rnaseq", "directory"]
+    ):
+        path_match = re.search(r"(/[a-zA-Z0-9._~+\-/]+)", text)
+        params = {"path": path_match.group(1).rstrip(".,，。") } if path_match else {}
+        return ChatIntent(
+            "browse_samples",
+            message="正在只读扫描服务器目录并识别 FASTQ 配对。",
+            params=params,
+        )
+
     # Roll back / 撤销
     if _has(lowered, ["回滚", "撤销", "取消刚才", "undo", "rollback"]):
         return ChatIntent("rollback", message="准备回滚最后一次变更。")

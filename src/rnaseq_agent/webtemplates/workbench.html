@@ -725,12 +725,27 @@ function sendChat() {
     if (d.steps) body += "<br>" + d.steps.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
     if (d.summary) body += "<br>" + d.summary.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
     if (d.gate && Array.isArray(d.gate)) body += "<br>" + d.gate.map(s => `<div class="step err">${escapeHtml(s)}</div>`).join("");
+    if (d.action === "browse_samples" && Array.isArray(d.samples)) {
+      window.discoveredSamples = d.samples;
+      body += "<br>" + d.samples.map(s => `<div class="step">${escapeHtml(s.sample_id)}：${escapeHtml(s.fastq_1)} / ${escapeHtml(s.fastq_2)}</div>`).join("");
+      if (d.unmatched && d.unmatched.length) body += `<div class="step err">${d.unmatched.length} 个文件未配对</div>`;
+      body += `<button class="secondary" onclick="applyDiscoveredSamples()">应用到样本表</button>`;
+    }
     reply.innerHTML = head + "<b>Agent" + via + "：</b>" + body;
     if (d.state) setState(d.state);
     refreshState();
   }).catch(err => {
     reply.innerHTML = "<span class='err'>请求失败：" + escapeHtml(String(err)) + "</span>";
   });
+}
+
+function applyDiscoveredSamples() {
+  const samples = window.discoveredSamples || [];
+  if (!samples.length) return;
+  document.getElementById("sampleRows").innerHTML = "";
+  samples.forEach(s => addSampleRow({...s, condition: "待分组"}));
+  document.getElementById("bulkGroups").value = samples.map(s => s.sample_id + "\t").join("\n");
+  window.scrollTo({top: 0, behavior: "smooth"});
 }
 
 /* ---------- 状态与右栏 ---------- */

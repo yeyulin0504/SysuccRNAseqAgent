@@ -129,6 +129,28 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
     llm = config.get("llm", {})
     if not llm.get("enabled") or not llm.get("api_key") or not llm.get("api_base"):
         return None
+
+
+def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, Any]:
+    """Read a shallow FASTQ listing through the configured SSH transport."""
+    if not remote_dir.startswith("/") or any(ch in remote_dir for ch in ("\n", "\r", "\x00")):
+        return {"ok": False, "message": "远程样本目录必须是绝对 POSIX 路径"}
+    try:
+        transport = create_remote_transport(config)
+        command = (
+            "find " + shlex.quote(remote_dir)
+            + " -maxdepth 2 -type f \\( -name '*.fastq.gz' -o -name '*.fq.gz'"
+            + " -o -name '*.fastq' -o -name '*.fq' \\) -print"
+        )
+        result = transport.execute(command)
+        if result.returncode != 0:
+            return {"ok": False, "message": "远程目录扫描失败"}
+        detected = detect_fastq_pairs(
+            [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        )
+        return {"ok": True, "scanned_path": remote_dir, **detected}
+    except Exception as exc:  # noqa: BLE001 - sanitized response
+        return {"ok": False, "message": f"远程目录扫描失败：{type(exc).__name__}"}
     api_base = str(llm.get("api_base", "")).rstrip("/")
     model = str(llm.get("model", "")).strip() or "gpt-4o-mini"
     url = f"{api_base}/chat/completions"
@@ -856,16 +878,7 @@ def create_app(
         session = _session_for(_legacy_dir_for(request, payload))
         if not remote_dir or session.config is None:
             return {"ok": False, "message": "请先保存服务器配置并填写远程 FASTQ 目录"}
-        try:
-            transport = create_remote_transport(session.config)
-            command = "find " + shlex.quote(remote_dir) + " -maxdepth 1 -type f \\( -name '*.fastq.gz' -o -name '*.fq.gz' -o -name '*.fastq' -o -name '*.fq' \\) -print"
-            result = transport.execute(command)
-            if result.returncode != 0:
-                return {"ok": False, "message": "远程目录扫描失败"}
-            detected = detect_fastq_pairs([line.strip() for line in result.stdout.splitlines() if line.strip()])
-            return {"ok": True, **detected}
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "message": f"远程目录扫描失败：{type(exc).__name__}"}
+        return _scan_remote_samples(session.config, remote_dir)
 
     @app.post("/api/chat")
     async def api_chat(request: Request):
@@ -888,6 +901,28 @@ def create_app(
         session = _session_for(_legacy_dir_for(request, payload))
         config = session.config
 
+        # Deterministic tool intents take priority over free-form LLM replies.
+        # This prevents the model from inventing shell commands or claiming it
+        # browsed data that was never read through the SSH transport.
+        intent = route_intent(text)
+        if intent is not None and intent.action == "browse_samples":
+            if config is None:
+                return {"reply": "请先保存服务器连接配置。", "state": session.state}
+            remote_dir = str(intent.params.get("path") or config.get("server", {}).get("remote_workdir") or "").strip()
+            if not remote_dir:
+                return {"reply": "请告诉我要浏览的绝对目录，或先保存远程工作目录。", "state": session.state}
+            result = _scan_remote_samples(config, remote_dir)
+            if not result.get("ok"):
+                return {"reply": result.get("message", "远程目录扫描失败"), "state": session.state}
+            count = len(result["samples"])
+            return {
+                **result,
+                "action": "browse_samples",
+                "state": session.state,
+                "scanned_path": remote_dir,
+                "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。请检查后再应用到样本表。",
+            }
+
         # 1) LLM path (when enabled and reachable).
         if config is not None:
             llm_reply = _llm_reply_or_none(config, text)
@@ -895,7 +930,6 @@ def create_app(
                 return {"state": session.state, "reply": llm_reply, "via": "llm"}
 
         # 2) Local rule router fallback.
-        intent = route_intent(text)
         if intent is None:
             has_project = config is not None
             capabilities = ", ".join(

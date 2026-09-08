@@ -210,6 +210,16 @@ class TestRouteIntent:
     def test_unrecognized_returns_none(self) -> None:
         assert route_intent("你今天心情怎么样") is None
 
+    def test_browse_samples_with_explicit_remote_path(self) -> None:
+        intent = route_intent("浏览 /hwdata/home/yeyulin/rna 找我的 RNA-seq 样本")
+        assert intent is not None and intent.action == "browse_samples"
+        assert intent.params == {"path": "/hwdata/home/yeyulin/rna"}
+
+    def test_browse_samples_can_use_configured_default_path(self) -> None:
+        intent = route_intent("你可以浏览我的服务器目录找样本吗")
+        assert intent is not None and intent.action == "browse_samples"
+        assert intent.params == {}
+
 
 class TestExecuteIntent:
     def test_plan_updates_session(self, tmp_path: Path) -> None:

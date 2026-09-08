@@ -340,6 +340,38 @@ class TestWebApp:
         assert result["ok"] is True
         assert result["samples"][0]["sample_id"] == "A"
 
+    def test_chat_browses_remote_samples_before_calling_llm(self, client, monkeypatch) -> None:
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"server": {"remote_workdir": "/hwdata/home/yeyulin/rna"}},
+            headers=_headers(token),
+        )
+
+        calls = {}
+
+        class Transport:
+            def execute(self, command):
+                calls["command"] = command
+                return CommandResult([], 0, "/data/P1_R1.fastq.gz\n/data/P1_R2.fastq.gz\n", "")
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        monkeypatch.setattr(webapp, "_llm_reply_or_none", lambda config, text: (_ for _ in ()).throw(AssertionError("LLM must not handle tool intents")))
+        result = client.post(
+            "/api/chat",
+            json={"message": "浏览服务器目录找 RNA-seq 样本"},
+            headers=_headers(token),
+        ).json()
+
+        assert result["action"] == "browse_samples"
+        assert result["scanned_path"] == "/hwdata/home/yeyulin/rna"
+        assert result["samples"][0]["sample_id"] == "P1"
+        assert "find /hwdata/home/yeyulin/rna" in calls["command"]
+
     def test_chat_uses_llm_when_configured(self, client, tmp_path: Path, monkeypatch) -> None:
         import requests
 
