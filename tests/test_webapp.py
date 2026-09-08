@@ -229,6 +229,13 @@ class TestWebApp:
         assert result["config"]["llm"]["api_base"] == "https://llmapi.paratera.com/v1"
         assert result["config"]["llm"]["model"] == "Deepseek-V4-Flash"
 
+    def test_demo_config_can_initialize_idle_settings_session(self, client) -> None:
+        token = _token(client)
+        result = client.post("/api/config/demo", headers=_headers(token)).json()
+        assert "error" not in result
+        assert result["state"] == "drafting"
+        assert result["config"]["server"]["host"] == "10.30.24.1"
+
     def test_server_connection_endpoint_calls_real_probe(self, client, monkeypatch) -> None:
         import rnaseq_agent.webapp as webapp
         from rnaseq_agent.execution import CommandResult

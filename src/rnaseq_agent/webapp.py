@@ -723,22 +723,29 @@ def create_app(
     async def api_config_demo(request: Request):
         _guard(request)
         session = _session_for(_legacy_dir_for(request))
+        demo_patch = {
+            "server": {
+                "host": "10.30.24.1", "user": "yeyulin", "port": 22,
+                "scheduler": "slurm", "remote_base_dir": "/hwdata/home/yeyulin/",
+                "remote_workdir": "/hwdata/home/yeyulin/",
+            },
+            "llm": {
+                "enabled": True, "provider": "paratera",
+                "api_base": "https://llmapi.paratera.com/v1",
+                "model": "Deepseek-V4-Flash",
+            },
+        }
         try:
-            session.edit(
-                {
-                    "server": {
-                        "host": "10.30.24.1", "user": "yeyulin", "port": 22,
-                        "scheduler": "slurm", "remote_base_dir": "/hwdata/home/yeyulin/",
-                        "remote_workdir": "/hwdata/home/yeyulin/",
-                    },
-                    "llm": {
-                        "enabled": True, "provider": "paratera",
-                        "api_base": "https://llmapi.paratera.com/v1",
-                        "model": "Deepseek-V4-Flash",
-                    },
-                },
-                note="加载真实连接演示配置",
-            )
+            if session.config is None:
+                base = _default_config(session.project_dir, {
+                    "project_id": "demo_connection",
+                    "title": "演示连接配置",
+                })
+                base["server"].update(demo_patch["server"])
+                base["llm"].update(demo_patch["llm"])
+                session.new_project(base)
+            else:
+                session.edit(demo_patch, note="加载真实连接演示配置")
         except SessionError as exc:
             return {"error": str(exc)}
         return {"state": session.state, "config": _editable_config(session.config or {})}
