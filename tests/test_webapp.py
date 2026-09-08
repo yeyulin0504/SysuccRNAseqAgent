@@ -372,6 +372,43 @@ class TestWebApp:
         assert result["samples"][0]["sample_id"] == "P1"
         assert "find /hwdata/home/yeyulin/rna" in calls["command"]
 
+    def test_container_config_pull_and_test(self, client, monkeypatch) -> None:
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        _new_project(client, token)
+        container = {
+            "enabled": True,
+            "engine": "apptainer",
+            "image_uri": "docker://ghcr.io/sysucc/rnaseq-downstream:2026.09",
+            "image_path": "/hwdata/home/yeyulin/containers/rnaseq-downstream.sif",
+            "bind_paths": ["/hwdata/home/yeyulin/projects"],
+        }
+        saved = client.post("/api/config", json={"container": container}, headers=_headers(token)).json()
+        assert saved["config"]["container"] == container
+
+        commands = []
+
+        class Transport:
+            def execute(self, command):
+                commands.append(command)
+                output = "RNASEQ_DOWNSTREAM_OK\n" if "Rscript" in command else "pulled\n"
+                return CommandResult([], 0, output, "")
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        pulled = client.post("/api/container/pull", headers=_headers(token)).json()
+        tested = client.post("/api/container/test", headers=_headers(token)).json()
+        assert pulled["ok"] is True
+        assert tested["ok"] is True
+        assert "apptainer pull --force" in commands[0]
+        assert "exec --cleanenv" in commands[1]
+
+    def test_settings_page_has_container_controls(self, client) -> None:
+        page = client.get("/settings").text
+        for control_id in ("ctrEnabled", "ctrEngine", "ctrUri", "ctrPath", "ctrBinds", "pullContainer", "testContainer"):
+            assert f'id="{control_id}"' in page
+
     def test_chat_uses_llm_when_configured(self, client, tmp_path: Path, monkeypatch) -> None:
         import requests
 

@@ -58,6 +58,12 @@ from .threads import (
 from .webchat import execute_intent, route_intent
 from .remote_transport import create_remote_transport, test_server_connection
 from .sample_detection import detect_fastq_pairs, read_counts_samples
+from .container_service import (
+    ContainerSettingsError,
+    build_pull_command,
+    build_test_command,
+    validate_image_settings,
+)
 from .ssh_auth import get_ssh_credential, set_ssh_credential
 from .workspace import Workspace, WorkspaceError
 
@@ -116,6 +122,13 @@ def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
             "model": llm.get("model", ""),
             "api_key_set": bool(llm.get("api_key")),
         },
+        "container": {
+            "enabled": bool(config.get("container", {}).get("enabled")),
+            "engine": config.get("container", {}).get("engine", "apptainer"),
+            "image_uri": config.get("container", {}).get("image_uri", ""),
+            "image_path": config.get("container", {}).get("image_path", ""),
+            "bind_paths": list(config.get("container", {}).get("bind_paths", [])),
+        },
     }
 
 
@@ -129,28 +142,6 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
     llm = config.get("llm", {})
     if not llm.get("enabled") or not llm.get("api_key") or not llm.get("api_base"):
         return None
-
-
-def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, Any]:
-    """Read a shallow FASTQ listing through the configured SSH transport."""
-    if not remote_dir.startswith("/") or any(ch in remote_dir for ch in ("\n", "\r", "\x00")):
-        return {"ok": False, "message": "远程样本目录必须是绝对 POSIX 路径"}
-    try:
-        transport = create_remote_transport(config)
-        command = (
-            "find " + shlex.quote(remote_dir)
-            + " -maxdepth 2 -type f \\( -name '*.fastq.gz' -o -name '*.fq.gz'"
-            + " -o -name '*.fastq' -o -name '*.fq' \\) -print"
-        )
-        result = transport.execute(command)
-        if result.returncode != 0:
-            return {"ok": False, "message": "远程目录扫描失败"}
-        detected = detect_fastq_pairs(
-            [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        )
-        return {"ok": True, "scanned_path": remote_dir, **detected}
-    except Exception as exc:  # noqa: BLE001 - sanitized response
-        return {"ok": False, "message": f"远程目录扫描失败：{type(exc).__name__}"}
     api_base = str(llm.get("api_base", "")).rstrip("/")
     model = str(llm.get("model", "")).strip() or "gpt-4o-mini"
     url = f"{api_base}/chat/completions"
@@ -188,6 +179,26 @@ def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, A
         return None
 
 
+def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, Any]:
+    """Read a shallow FASTQ listing through the configured SSH transport."""
+    if not remote_dir.startswith("/") or any(ch in remote_dir for ch in ("\n", "\r", "\x00")):
+        return {"ok": False, "message": "远程样本目录必须是绝对 POSIX 路径"}
+    try:
+        transport = create_remote_transport(config)
+        command = (
+            "find " + shlex.quote(remote_dir)
+            + " -maxdepth 2 -type f \\( -name '*.fastq.gz' -o -name '*.fq.gz'"
+            + " -o -name '*.fastq' -o -name '*.fq' \\) -print"
+        )
+        result = transport.execute(command)
+        if result.returncode != 0:
+            return {"ok": False, "message": "远程目录扫描失败"}
+        detected = detect_fastq_pairs(
+            [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        )
+        return {"ok": True, "scanned_path": remote_dir, **detected}
+    except Exception as exc:  # noqa: BLE001 - sanitized response
+        return {"ok": False, "message": f"远程目录扫描失败：{type(exc).__name__}"}
 def _interrupt_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract the JSON-safe payload(s) of a LangGraph interrupt result.
 
@@ -729,6 +740,15 @@ def create_app(
                     "大模型接入：" + (f"启用 {llm_patch.get('model', '')}" if llm_patch.get("enabled") else "更新")
                 )
 
+        container = payload.get("container")
+        if isinstance(container, dict):
+            try:
+                container_patch = validate_image_settings(container)
+            except ContainerSettingsError as exc:
+                return {"error": str(exc)}
+            patch["container"] = container_patch
+            note_parts.append("下游容器配置")
+
         if not patch:
             return {"error": "没有可保存的字段。"}
         if session.config is not None:
@@ -809,6 +829,36 @@ def create_app(
             return {"ok": ok, "message": "SSH 连接成功" if ok else "SSH 连接失败"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"SSH 连接失败：{type(exc).__name__}"}
+
+    @app.post("/api/container/pull")
+    async def api_container_pull(request: Request):
+        _guard(request)
+        session = _session_for(_legacy_dir_for(request))
+        if session.config is None:
+            return {"ok": False, "message": "请先保存服务器和容器配置"}
+        try:
+            command = build_pull_command(session.config.get("container", {}))
+            result = create_remote_transport(session.config).execute(command)
+            return {
+                "ok": result.returncode == 0,
+                "message": "Apptainer 镜像拉取成功" if result.returncode == 0 else "Apptainer 镜像拉取失败",
+            }
+        except (ContainerSettingsError, Exception) as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"Apptainer 镜像拉取失败：{type(exc).__name__}"}
+
+    @app.post("/api/container/test")
+    async def api_container_test(request: Request):
+        _guard(request)
+        session = _session_for(_legacy_dir_for(request))
+        if session.config is None:
+            return {"ok": False, "message": "请先保存服务器和容器配置"}
+        try:
+            command = build_test_command(session.config.get("container", {}))
+            result = create_remote_transport(session.config).execute(command)
+            ok = result.returncode == 0 and "RNASEQ_DOWNSTREAM_OK" in result.stdout
+            return {"ok": ok, "message": "下游容器测试成功" if ok else "下游容器测试失败"}
+        except (ContainerSettingsError, Exception) as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"下游容器测试失败：{type(exc).__name__}"}
 
     def _configured_llm(request: Request) -> dict[str, Any] | None:
         session = _session_for(_legacy_dir_for(request))

@@ -46,6 +46,7 @@
   .seg button { flex: 1; background: var(--panel); border: 1px solid var(--border);
                 color: var(--muted); padding: 8px 6px; margin-top: 6px; font-weight: 500; }
   .seg button.active { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+  textarea, select { width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 8px 10px; }
 </style>
 </head>
 <body>
@@ -130,6 +131,22 @@
     <div id="llmTestResult" class="muted" style="margin-top:8px"></div>
     <div class="muted" style="margin-top:8px">未启用或请求失败时，对话自动回退本地规则路由。</div>
   </div>
+
+  <h2>下游分析容器</h2>
+  <div class="card">
+    <p class="muted" style="margin:0">用于 DESeq2 与 CMScaller。服务器会把 Docker/OCI 镜像转换为 Apptainer SIF。</p>
+    <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input id="ctrEnabled" type="checkbox" style="width:auto"> 启用下游容器</label>
+    <div class="row">
+      <div><label>服务器容器引擎</label><select id="ctrEngine"><option value="apptainer">Apptainer</option><option value="singularity">Singularity</option></select></div>
+      <div><label>Docker / OCI 镜像</label><input id="ctrUri" placeholder="docker://ghcr.io/...:tag"></div>
+    </div>
+    <label>服务器 SIF 路径</label><input id="ctrPath" placeholder="/hwdata/home/user/containers/downstream.sif">
+    <label>额外挂载目录 <span class="hint">每行一个绝对路径</span></label><textarea id="ctrBinds" rows="3" placeholder="/hwdata/home/user/projects"></textarea>
+    <button onclick="saveContainer()">保存容器配置</button>
+    <button id="pullContainer" class="secondary" onclick="pullContainer()">在服务器拉取/构建 SIF</button>
+    <button id="testContainer" class="secondary" onclick="testContainer()">测试容器</button>
+    <div id="containerResult" class="muted" style="margin-top:8px"></div>
+  </div>
 </div>
 
 <script>
@@ -172,6 +189,13 @@ function load() {
     document.getElementById("llmProvider").value = c.llm.provider || "";
     document.getElementById("llmEnabled").checked = !!c.llm.enabled;
     document.getElementById("llmKeyState").textContent = c.llm.api_key_set ? "（已设置）" : "（未设置）";
+    if (c.container) {
+      document.getElementById("ctrEnabled").checked = !!c.container.enabled;
+      document.getElementById("ctrEngine").value = c.container.engine || "apptainer";
+      document.getElementById("ctrUri").value = c.container.image_uri || "";
+      document.getElementById("ctrPath").value = c.container.image_path || "";
+      document.getElementById("ctrBinds").value = (c.container.bind_paths || []).join("\n");
+    }
   });
 }
 async function saveServer() {
@@ -212,6 +236,30 @@ async function saveLlm() {
     if (d.error) { alert(d.error); return d; }
     flash(); return d;
   });
+}
+async function saveContainer() {
+  const container = {
+    enabled: document.getElementById("ctrEnabled").checked,
+    engine: document.getElementById("ctrEngine").value,
+    image_uri: document.getElementById("ctrUri").value.trim(),
+    image_path: document.getElementById("ctrPath").value.trim(),
+    bind_paths: document.getElementById("ctrBinds").value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
+  };
+  const result = await api("/api/config", "POST", {container});
+  if (result.error) { alert(result.error); return result; }
+  flash(); return result;
+}
+async function pullContainer() {
+  const saved = await saveContainer(); if (!saved || saved.error) return;
+  const el = document.getElementById("containerResult"); el.textContent = "正在服务器拉取镜像…";
+  const result = await api("/api/container/pull", "POST", {});
+  el.textContent = result.message; el.className = result.ok ? "ok" : "err";
+}
+async function testContainer() {
+  const saved = await saveContainer(); if (!saved || saved.error) return;
+  const el = document.getElementById("containerResult"); el.textContent = "正在测试 Apptainer 和 R 包…";
+  const result = await api("/api/container/test", "POST", {});
+  el.textContent = result.message; el.className = result.ok ? "ok" : "err";
 }
 async function saveAndTestServer() {
   const saved = await saveServer(); if (!saved || saved.error) return;
