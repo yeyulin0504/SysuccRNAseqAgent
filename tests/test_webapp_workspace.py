@@ -68,6 +68,7 @@ class TestWorkspace:
     def test_home_and_pages_render(self, client) -> None:
         assert "SYSU" in client.get("/").text
         assert "const TOKEN" in client.get("/").text
+        assert client.get("/new-analysis").status_code == 200
         assert client.get("/workbench").status_code == 200
         assert client.get("/settings").status_code == 200
 

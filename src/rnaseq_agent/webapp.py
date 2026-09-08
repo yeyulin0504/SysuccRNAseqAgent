@@ -55,6 +55,7 @@ from .threads import (
     rename_thread,
 )
 from .webchat import execute_intent, route_intent
+from .remote_transport import test_server_connection
 from .workspace import Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
@@ -429,6 +430,91 @@ def create_app(
                 "session": _session_view(session),
             },
         )
+
+    @app.get("/new-analysis", response_class=HTMLResponse)
+    async def new_analysis(request: Request):
+        # 参考 OncoOmics 新建分析向导：能力卡片（Expression/Fusion/Splicing
+        # 及 counts 直入）在第 1 步选择，数据位置/样本/参考/计划逐步收尾。
+        # 页面本身是静态向导壳；提交走既有 /api/new、/api/plan、/api/confirm
+        # 与 /api/projects/{id}/counts，故此处只渲染空模板 + token。
+        # The project home already contains the tested new-analysis form.
+        # Reuse it here so both entry URLs stay functional during the MVP.
+        return templates.TemplateResponse(
+            request,
+            "index.html",
+            {"token": token, "workspace_root": str(workspace.root)},
+        )
+
+    @app.get("/api/overview")
+    async def api_overview(request: Request):
+        """Capability + connection overview for the app shell.
+
+        Provides the data the header badges and the New Analysis step 1 need:
+
+        - ``capabilities``: which RNA-seq analyses this build can actually run
+          today (expression = yes; fusion = Arriba calls + artifact, review by
+          human; splicing = deferred, STAR ``SJ.out.tab`` preserved as input).
+        - ``server``: connection state of the configured scheduler target so
+          the header can show ``院内 Slurm 已连接``-style state without a full
+          probe blocking page render.
+
+        The probe is best-effort: any failure reports ``unreachable`` instead
+        of raising, and ``local`` skips probing entirely.
+        """
+        _guard(request)
+        default_session = _session_for(legacy_project_dir)
+        config = _editable_config(default_session.config) if default_session.config else None
+        server_state = "unconfigured"
+        scheduler = ""
+        host = ""
+        if config and config.get("server"):
+            server = config["server"]
+            scheduler = str(server.get("scheduler") or "local")
+            host = str(server.get("host") or "")
+            if scheduler == "local" or host in {"", "localhost", "127.0.0.1"}:
+                server_state = "local"
+            else:
+                try:
+                    result = test_server_connection(default_session.config)
+                    server_state = "connected" if result.returncode == 0 else "unreachable"
+                except Exception:  # noqa: BLE001 - badge must never block
+                    server_state = "unreachable"
+        llm_enabled = bool(config and config.get("llm", {}).get("enabled"))
+        return {
+            "capabilities": [
+                {
+                    "id": "expression",
+                    "label": "Expression",
+                    "status": "available",
+                    "note": "表达定量（featureCounts counts + RSEM TPM）",
+                },
+                {
+                    "id": "fusion",
+                    "label": "Fusion",
+                    "status": "available",
+                    "note": "Arriba 融合调用与产物（人工审阅）",
+                },
+                {
+                    "id": "splicing",
+                    "label": "Splicing",
+                    "status": "deferred",
+                    "note": "差异剪接排期；已保留 STAR SJ.out.tab 作为输入",
+                },
+                {
+                    "id": "counts",
+                    "label": "Counts 直入",
+                    "status": "available",
+                    "note": "上传矩阵直跑差异表达 / CMS 分型",
+                },
+            ],
+            "server": {
+                "state": server_state,
+                "scheduler": scheduler,
+                "host": host,
+                "label": ("院内 " + scheduler.upper() + " 已连接") if server_state == "connected" else ("本地执行") if server_state == "local" else ("模型与服务器 → 未连接"),
+            },
+            "llm": {"enabled": llm_enabled},
+        }
 
     # -- session API -----------------------------------------------------
 

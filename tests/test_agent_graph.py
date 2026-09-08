@@ -107,6 +107,27 @@ def _write_attempt_manifest(project_dir: Path, *, ok: bool = True) -> Path:
     return attempt_dir
 
 
+def _counts_project_dir(root: Path) -> Path:
+    project_dir = _minimal_project_dir(root, "counts_project")
+    payload = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    payload["samples"] = {
+        "counts_path": str(project_dir / "uploads" / "counts_matrix.tsv"),
+        "items": [
+            {"sample_id": "A1", "condition": "control"},
+            {"sample_id": "A2", "condition": "control"},
+            {"sample_id": "B1", "condition": "case"},
+            {"sample_id": "B2", "condition": "case"},
+        ],
+    }
+    payload["pipeline"] = {
+        "diffexp": {"enabled": True},
+        "cms": {"enabled": False},
+    }
+    payload["cms"] = {"run_mode": "counts"}
+    _write_json(project_dir / "project.json", payload)
+    return project_dir
+
+
 class TestBulkRNAGraph:
     def test_compiles(self, graph) -> None:
         assert graph is not None
@@ -170,6 +191,25 @@ class TestM1RealizedCheckpointNodes:
         assert result["status"] in {PASS, FAIL_OUTPUT_CONTRACT}
         if result["status"] == FAIL_OUTPUT_CONTRACT:
             assert "result_manifest" not in result["message"]
+
+    def test_counts_validation_accepts_real_manifest_and_enabled_outputs(self, tmp_path) -> None:
+        project_dir = _counts_project_dir(tmp_path)
+        attempt_dir = project_dir / "attempts" / "run-1"
+        _write_json(
+            attempt_dir / "result_manifest.json",
+            {"schema_version": 1, "body": {"validation": {"ok": True, "errors": []}}},
+        )
+        for relative in (
+            "diffexp/deseq2_results.tsv",
+            "diffexp/deseq2_summary.json",
+        ):
+            target = attempt_dir / "downloads" / "extracted" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("verified\n", encoding="utf-8")
+
+        result = node_validate_output(self._state(project_dir))
+
+        assert result["status"] == PASS
 
 
 class TestM1DurableCheckpointer:

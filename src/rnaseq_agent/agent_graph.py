@@ -349,7 +349,11 @@ def _attempt_validation_report(
     if not manifest_path.is_file():
         raise ValidationFailure("attempt 未生成 result_manifest.json，输出契约校验失败。")
     manifest = load_json(manifest_path)
-    summary = manifest.get("summary", {})
+    # ``create_result_manifest`` stores the authoritative validation under
+    # body.validation.  Accept the legacy summary shape for old attempts.
+    summary = manifest.get("body", {}).get("validation")
+    if not isinstance(summary, dict):
+        summary = manifest.get("summary", {})
     if not summary.get("ok"):
         raise ValidationFailure(
             FAIL_OUTPUT_CONTRACT
@@ -363,11 +367,38 @@ def _attempt_validation_report(
     )
 
 
+def _required_artifacts_for_run(config: dict[str, Any], *, counts_entry: bool) -> dict[str, str]:
+    """Return only artifacts enabled in the frozen runtime configuration."""
+    pipeline = config.get("pipeline", {})
+    required: dict[str, str] = {}
+    if counts_entry:
+        if pipeline.get("diffexp", {}).get("enabled"):
+            required.update(
+                {
+                    "diffexp/deseq2_results.tsv": "DESeq2 complete result table",
+                    "diffexp/deseq2_summary.json": "DESeq2 run summary",
+                }
+            )
+        if pipeline.get("cms", {}).get("enabled"):
+            required.update(
+                {
+                    "cms/cms_result.csv": "CMS classification result",
+                    "cms/cms_summary.json": "CMS run summary",
+                }
+            )
+        return required
+    # The legacy FASTQ graph still validates its registered workflow contract.
+    return {}
+
+
 def node_validate_output(state: BulkRNAState) -> BulkRNAState:
     """Output Validator: schema/hash checks on the real attempt artifacts."""
     session = _session(state)
     project_dir = session.project_dir
-    required = getattr(session.capability, "output_artifacts", {}) or {}
+    if _is_counts_entry_state(state):
+        required = _required_artifacts_for_run(session.config or {}, counts_entry=True)
+    else:
+        required = getattr(session.capability, "output_artifacts", {}) or {}
     try:
         report = _attempt_validation_report(project_dir, required)
         return {"status": PASS, "validation_report": report}
