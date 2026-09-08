@@ -195,7 +195,6 @@ async function saveServer() {
   if (server.port) server.port = Number(server.port);
   return api("/api/config", "POST", { server }).then(d => {
     if (d.error) { alert(d.error); return d; }
-    document.getElementById("srvPass").value = "";
     flash(); return d;
   });
 }
@@ -226,7 +225,6 @@ async function saveAndTestLlm() {
   const result = await api("/api/test-llm", "POST", {});
   el.textContent = result.ok ? result.message + "：" + result.reply : result.message;
   el.className = result.ok ? "ok" : "err";
-  if (result.ok) document.getElementById("llmKey").value = "";
 }
 async function pullModels() {
   const saved = await saveLlm(); if (!saved || saved.error) return;
