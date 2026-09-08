@@ -190,6 +190,17 @@ class TestWebApp:
         assert stored["server"]["user"] == "alynn"
         assert stored["server"]["host"] == "login.hpc"
 
+    def test_config_save_can_initialize_idle_settings_session(self, client) -> None:
+        token = _token(client)
+        result = client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "port": 22}},
+            headers=_headers(token),
+        ).json()
+        assert "error" not in result
+        assert result["state"] == "drafting"
+        assert result["config"]["server"]["host"] == "10.30.24.1"
+
     def test_config_endpoint_llm_key_is_write_only(self, client, tmp_path: Path) -> None:
         token = _token(client)
         _new_project(client, token)

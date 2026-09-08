@@ -710,7 +710,19 @@ def create_app(
         if not patch:
             return {"error": "没有可保存的字段。"}
         try:
-            gate = session.edit(patch, note=" / ".join(note_parts))
+            if session.config is None:
+                base = _default_config(session.project_dir, {
+                    "project_id": "connection_settings",
+                    "title": "连接配置",
+                })
+                for section, values in patch.items():
+                    if isinstance(values, dict) and isinstance(base.get(section), dict):
+                        base[section].update(values)
+                    else:
+                        base[section] = values
+                gate = session.new_project(base)
+            else:
+                gate = session.edit(patch, note=" / ".join(note_parts))
             return {
                 "state": session.state,
                 "gate": gate.formatted(),
