@@ -709,6 +709,19 @@ def create_app(
 
         if not patch:
             return {"error": "没有可保存的字段。"}
+        if session.config is not None:
+            changed = any(
+                not isinstance(values, dict)
+                or not isinstance(session.config.get(section), dict)
+                or any(session.config[section].get(key) != value for key, value in values.items())
+                for section, values in patch.items()
+            )
+            if not changed:
+                return {
+                    "state": session.state,
+                    "unchanged": True,
+                    "config": _editable_config(session.config),
+                }
         try:
             if session.config is None:
                 base = _default_config(session.project_dir, {

@@ -201,6 +201,23 @@ class TestWebApp:
         assert result["state"] == "drafting"
         assert result["config"]["server"]["host"] == "10.30.24.1"
 
+    def test_saving_unchanged_config_is_idempotent(self, client) -> None:
+        token = _token(client)
+        _new_project(client, token)
+        first = client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "api_base": "https://llm.example/v1", "model": "demo", "api_key": "secret"}},
+            headers=_headers(token),
+        ).json()
+        second = client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "api_base": "https://llm.example/v1", "model": "demo", "api_key": "secret"}},
+            headers=_headers(token),
+        ).json()
+        assert "error" not in first
+        assert "error" not in second
+        assert second["unchanged"] is True
+
     def test_config_endpoint_llm_key_is_write_only(self, client, tmp_path: Path) -> None:
         token = _token(client)
         _new_project(client, token)
