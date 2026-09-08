@@ -74,6 +74,7 @@ class TestWorkspace:
         assert settings.status_code == 200
         for control in ("saveAndTestServer", "pullModels", "saveAndTestLlm", "loadDemoConfig", "runDemoTest"):
             assert f'id="{control}"' in settings.text
+        assert "if (result.ok) document.getElementById(\"llmKey\").value = \"\";" in settings.text
         assert "连接配置与测试" in client.get("/new-analysis").text
 
     def test_project_lifecycle(self, client) -> None:

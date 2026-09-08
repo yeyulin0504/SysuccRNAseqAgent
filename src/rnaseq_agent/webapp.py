@@ -807,6 +807,9 @@ def create_app(
             response.raise_for_status()
             models = sorted({str(item.get("id")) for item in response.json().get("data", []) if item.get("id")})
             return {"ok": True, "models": models}
+        except http_requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", "unknown")
+            return {"ok": False, "message": f"模型列表拉取失败：HTTP {status}", "models": []}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"模型列表拉取失败：{type(exc).__name__}", "models": []}
 
@@ -827,6 +830,9 @@ def create_app(
             response.raise_for_status()
             reply = str(response.json()["choices"][0]["message"]["content"]).strip()
             return {"ok": True, "message": "LLM API 连接成功", "reply": reply}
+        except http_requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", "unknown")
+            return {"ok": False, "message": f"LLM API 连接失败：HTTP {status}"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"LLM API 连接失败：{type(exc).__name__}"}
 
