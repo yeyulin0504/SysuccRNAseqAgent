@@ -61,6 +61,7 @@
 <div class="wrap">
   <div id="savedNotice" class="notice hidden">已保存。</div>
   <button id="loadDemoConfig" onclick="loadDemoConfig()">加载演示配置</button>
+  <button id="runDemoTest" class="secondary" onclick="runDemoTest()">一键保存并测试两项连接</button>
   <span class="muted">预填你的 SSH 与 Paratera API；密码和 API Key 请在下方输入。</span>
 
   <h2>HPC 连接</h2>
@@ -238,7 +239,23 @@ async function pullModels() {
 async function loadDemoConfig() {
   const result = await api("/api/config/demo", "POST", {});
   if (result.error) { alert(result.error); return; }
-  location.reload();
+  const c = result.config;
+  document.getElementById("srvHost").value = c.server.host;
+  document.getElementById("srvUser").value = c.server.user;
+  document.getElementById("srvPort").value = c.server.port;
+  document.getElementById("srvScheduler").value = c.server.scheduler;
+  document.getElementById("srvRemoteBase").value = c.server.remote_base_dir;
+  document.getElementById("srvRemoteDir").value = c.server.remote_workdir;
+  document.getElementById("llmBase").value = c.llm.api_base;
+  document.getElementById("llmModel").value = c.llm.model;
+  document.getElementById("llmProvider").value = c.llm.provider;
+  document.getElementById("llmEnabled").checked = true;
+  flash(); return result;
+}
+async function runDemoTest() {
+  const loaded = await loadDemoConfig(); if (!loaded) return;
+  await saveAndTestServer();
+  await saveAndTestLlm();
 }
 function clearKey() {
   api("/api/config", "POST", { llm: { api_key_clear: true } }).then(d => {

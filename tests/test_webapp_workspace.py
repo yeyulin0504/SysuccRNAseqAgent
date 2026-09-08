@@ -72,7 +72,7 @@ class TestWorkspace:
         assert client.get("/workbench").status_code == 200
         settings = client.get("/settings")
         assert settings.status_code == 200
-        for control in ("saveAndTestServer", "pullModels", "saveAndTestLlm", "loadDemoConfig"):
+        for control in ("saveAndTestServer", "pullModels", "saveAndTestLlm", "loadDemoConfig", "runDemoTest"):
             assert f'id="{control}"' in settings.text
         assert "连接配置与测试" in client.get("/new-analysis").text
 
