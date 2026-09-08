@@ -191,7 +191,7 @@ class RunIsolationTests(unittest.TestCase):
 
         script = render_remote_pipeline_script(config)
 
-        self.assertIn("apptainer exec --bind /ref /containers/rnaseq.sif fastp", script)
+        self.assertIn("apptainer exec --cleanenv --bind /ref /containers/rnaseq.sif fastp", script)
         self.assertNotIn("\nfastp \\", script)
 
 

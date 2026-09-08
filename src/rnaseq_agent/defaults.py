@@ -57,6 +57,7 @@ DEFAULT_PIPELINE = {
 DEFAULT_CONTAINER = {
     "enabled": True,
     "engine": "apptainer",
-    "image_path": "/data/containers/rnaseq-agent-star-rsem.sif",
+    "image_uri": "docker://ghcr.io/sysucc/rnaseq-downstream:2026.09",
+    "image_path": "/hwdata/home/yeyulin/containers/rnaseq-downstream-2026.09.sif",
     "bind_paths": [],
 }

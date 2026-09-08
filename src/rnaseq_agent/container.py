@@ -14,6 +14,7 @@ def container_config(config: dict[str, Any]) -> dict[str, Any]:
         return {"enabled": False}
     engine = str(container.get("engine", "apptainer") or "apptainer")
     image_path = str(container.get("image_path", "") or "")
+    image_uri = str(container.get("image_uri", "") or "")
     bind_paths = container.get("bind_paths", [])
     if not isinstance(bind_paths, list):
         bind_paths = []
@@ -21,6 +22,7 @@ def container_config(config: dict[str, Any]) -> dict[str, Any]:
         "enabled": bool(container.get("enabled", False)),
         "engine": engine,
         "image_path": image_path,
+        "image_uri": image_uri,
         "bind_paths": [str(path) for path in bind_paths if str(path or "").strip()],
     }
 
@@ -46,6 +48,6 @@ def wrap_command(config: dict[str, Any], command: str) -> str:
     )
     bind_prefix = f"{bind_args} " if bind_args else ""
     return (
-        f"{shell_quote(container['engine'])} exec {bind_prefix}"
+        f"{shell_quote(container['engine'])} exec --cleanenv {bind_prefix}"
         f"{shell_quote(container['image_path'])} {command}"
     )

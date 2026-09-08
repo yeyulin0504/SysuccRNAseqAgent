@@ -1,0 +1,5 @@
+stopifnot(requireNamespace("DESeq2", quietly = TRUE))
+stopifnot(requireNamespace("CMScaller", quietly = TRUE))
+cat(sprintf("DESeq2=%s\n", as.character(packageVersion("DESeq2"))))
+cat(sprintf("CMScaller=%s\n", as.character(packageVersion("CMScaller"))))
+sessionInfo()
