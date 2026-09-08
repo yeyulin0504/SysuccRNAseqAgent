@@ -90,6 +90,7 @@ def download_dataset(
     if spec.get("schema_version") != 1 or not isinstance(spec.get("files"), list):
         raise ValueError("Dataset spec must use schema_version=1 and contain a files array.")
 
+    requested_destination = destination
     destination = destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
     verified_files: list[dict[str, Any]] = []
@@ -171,7 +172,7 @@ def download_dataset(
         lock["archive_members"] = verified_archive_members
     lock_path = destination / "dataset.lock.json"
     lock_path.write_text(json.dumps(lock, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return lock_path
+    return requested_destination / "dataset.lock.json"
 
 
 def main(argv: list[str] | None = None) -> int:

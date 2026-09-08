@@ -21,6 +21,7 @@ stays usable while the three-page surface is introduced.
 from __future__ import annotations
 
 import secrets
+import shlex
 import socket
 import threading
 from contextlib import asynccontextmanager
@@ -55,7 +56,9 @@ from .threads import (
     rename_thread,
 )
 from .webchat import execute_intent, route_intent
-from .remote_transport import test_server_connection
+from .remote_transport import create_remote_transport, test_server_connection
+from .sample_detection import detect_fastq_pairs, read_counts_samples
+from .ssh_auth import get_ssh_credential, set_ssh_credential
 from .workspace import Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
@@ -95,6 +98,11 @@ def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
             "profile": config.get("server", {}).get("profile", ""),
             "host": config.get("server", {}).get("host", ""),
             "user": config.get("server", {}).get("user", ""),
+            "port": config.get("server", {}).get("port", 22),
+            "auth_mode": get_ssh_credential(
+                str(config.get("server", {}).get("host", "")),
+                str(config.get("server", {}).get("user", "")),
+            ).mode,
             "remote_base_dir": config.get("server", {}).get("remote_base_dir", ""),
             "remote_workdir": config.get("server", {}).get("remote_workdir", ""),
             "scheduler": config.get("server", {}).get("scheduler", "local"),
@@ -664,7 +672,7 @@ def create_app(
 
         server = payload.get("server")
         if isinstance(server, dict):
-            allowed = {"host", "user", "scheduler", "threads", "memory_gb"}
+            allowed = {"host", "user", "port", "scheduler", "threads", "memory_gb", "remote_base_dir", "remote_workdir"}
             server_patch = {k: v for k, v in server.items() if k in allowed and v is not None}
             if server_patch:
                 # threads / memory_gb arrive as numbers from the form.
@@ -672,8 +680,15 @@ def create_app(
                     server_patch["threads"] = int(server_patch["threads"])
                 if "memory_gb" in server_patch:
                     server_patch["memory_gb"] = int(server_patch["memory_gb"])
+                if "port" in server_patch:
+                    server_patch["port"] = int(server_patch["port"])
                 patch["server"] = server_patch
                 note_parts.append("服务器配置：" + ", ".join(f"{k}={v}" for k, v in server_patch.items()))
+            host = str(server.get("host") or (session.config or {}).get("server", {}).get("host", ""))
+            user = str(server.get("user") or (session.config or {}).get("server", {}).get("user", ""))
+            if host and user and (server.get("auth_mode") or server.get("password")):
+                mode = "password" if server.get("password") else str(server.get("auth_mode") or "key")
+                set_ssh_credential(host, user, mode=mode, password=str(server.get("password") or ""))
 
         llm = payload.get("llm")
         if isinstance(llm, dict):
@@ -703,6 +718,116 @@ def create_app(
             }
         except SessionError as exc:
             return {"error": str(exc)}
+
+    @app.post("/api/config/demo")
+    async def api_config_demo(request: Request):
+        _guard(request)
+        session = _session_for(_legacy_dir_for(request))
+        try:
+            session.edit(
+                {
+                    "server": {
+                        "host": "10.30.24.1", "user": "yeyulin", "port": 22,
+                        "scheduler": "slurm", "remote_base_dir": "/hwdata/home/yeyulin/",
+                        "remote_workdir": "/hwdata/home/yeyulin/",
+                    },
+                    "llm": {
+                        "enabled": True, "provider": "paratera",
+                        "api_base": "https://llmapi.paratera.com/v1",
+                        "model": "Deepseek-V4-Flash",
+                    },
+                },
+                note="加载真实连接演示配置",
+            )
+        except SessionError as exc:
+            return {"error": str(exc)}
+        return {"state": session.state, "config": _editable_config(session.config or {})}
+
+    @app.post("/api/test-server")
+    async def api_test_server(request: Request):
+        _guard(request)
+        session = _session_for(_legacy_dir_for(request))
+        if session.config is None:
+            return {"ok": False, "message": "请先创建项目并保存服务器配置"}
+        try:
+            result = test_server_connection(session.config)
+            ok = result.returncode == 0 and "RNASEQ_AGENT_SSH_OK" in result.stdout
+            return {"ok": ok, "message": "SSH 连接成功" if ok else "SSH 连接失败"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"SSH 连接失败：{type(exc).__name__}"}
+
+    def _configured_llm(request: Request) -> dict[str, Any] | None:
+        session = _session_for(_legacy_dir_for(request))
+        return (session.config or {}).get("llm") if session.config else None
+
+    @app.get("/api/llm/models")
+    async def api_llm_models(request: Request):
+        _guard(request)
+        llm = _configured_llm(request) or {}
+        if not llm.get("api_base") or not llm.get("api_key"):
+            return {"ok": False, "message": "请先保存 API Base 和 API Key", "models": []}
+        try:
+            import requests as http_requests
+            response = http_requests.get(
+                str(llm["api_base"]).rstrip("/") + "/models",
+                headers={"Authorization": f"Bearer {llm['api_key']}"}, timeout=20,
+            )
+            response.raise_for_status()
+            models = sorted({str(item.get("id")) for item in response.json().get("data", []) if item.get("id")})
+            return {"ok": True, "models": models}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"模型列表拉取失败：{type(exc).__name__}", "models": []}
+
+    @app.post("/api/test-llm")
+    async def api_test_llm(request: Request):
+        _guard(request)
+        llm = _configured_llm(request) or {}
+        if not llm.get("api_base") or not llm.get("api_key") or not llm.get("model"):
+            return {"ok": False, "message": "请先保存 API Base、API Key 和模型"}
+        try:
+            import requests as http_requests
+            response = http_requests.post(
+                str(llm["api_base"]).rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {llm['api_key']}", "Content-Type": "application/json"},
+                json={"model": llm["model"], "messages": [{"role": "user", "content": "请只回复：连接正常"}], "temperature": 0},
+                timeout=30,
+            )
+            response.raise_for_status()
+            reply = str(response.json()["choices"][0]["message"]["content"]).strip()
+            return {"ok": True, "message": "LLM API 连接成功", "reply": reply}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"LLM API 连接失败：{type(exc).__name__}"}
+
+    @app.post("/api/samples/counts-preview")
+    async def api_counts_preview(request: Request):
+        _guard(request)
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None:
+            return {"ok": False, "message": "请选择 counts 文件"}
+        try:
+            return {"ok": True, "samples": read_counts_samples(await upload.read())}
+        except (UnicodeError, ValueError, IndexError) as exc:
+            return {"ok": False, "message": str(exc)}
+
+    @app.post("/api/samples/scan-remote")
+    async def api_scan_remote_samples(request: Request):
+        _guard(request)
+        payload = await request.json()
+        remote_dir = str(payload.get("path") or "").strip()
+        session = _session_for(_legacy_dir_for(request, payload))
+        if not remote_dir or session.config is None:
+            return {"ok": False, "message": "请先保存服务器配置并填写远程 FASTQ 目录"}
+        try:
+            transport = create_remote_transport(session.config)
+            command = "find " + shlex.quote(remote_dir) + " -maxdepth 1 -type f \\( -name '*.fastq.gz' -o -name '*.fq.gz' -o -name '*.fastq' -o -name '*.fq' \\) -print"
+            result = transport.execute(command)
+            if result.returncode != 0:
+                return {"ok": False, "message": "远程目录扫描失败"}
+            detected = detect_fastq_pairs([line.strip() for line in result.stdout.splitlines() if line.strip()])
+            return {"ok": True, **detected}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "message": f"远程目录扫描失败：{type(exc).__name__}"}
 
     @app.post("/api/chat")
     async def api_chat(request: Request):

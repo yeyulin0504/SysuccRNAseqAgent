@@ -70,7 +70,11 @@ class TestWorkspace:
         assert "const TOKEN" in client.get("/").text
         assert client.get("/new-analysis").status_code == 200
         assert client.get("/workbench").status_code == 200
-        assert client.get("/settings").status_code == 200
+        settings = client.get("/settings")
+        assert settings.status_code == 200
+        for control in ("saveAndTestServer", "pullModels", "saveAndTestLlm", "loadDemoConfig"):
+            assert f'id="{control}"' in settings.text
+        assert "连接配置与测试" in client.get("/new-analysis").text
 
     def test_project_lifecycle(self, client) -> None:
         token = _token(client)

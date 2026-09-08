@@ -217,6 +217,94 @@ class TestWebApp:
         ).json()
         assert resp["config"]["llm"]["api_key_set"] is False
 
+    def test_demo_config_prefills_real_connections(self, client) -> None:
+        token = _token(client)
+        _new_project(client, token)
+        result = client.post("/api/config/demo", headers=_headers(token)).json()
+        assert result["config"]["server"]["host"] == "10.30.24.1"
+        assert result["config"]["server"]["user"] == "yeyulin"
+        assert result["config"]["server"]["port"] == 22
+        assert result["config"]["server"]["scheduler"] == "slurm"
+        assert result["config"]["server"]["remote_workdir"] == "/hwdata/home/yeyulin/"
+        assert result["config"]["llm"]["api_base"] == "https://llmapi.paratera.com/v1"
+        assert result["config"]["llm"]["model"] == "Deepseek-V4-Flash"
+
+    def test_server_connection_endpoint_calls_real_probe(self, client, monkeypatch) -> None:
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        _new_project(client, token)
+        monkeypatch.setattr(
+            webapp,
+            "test_server_connection",
+            lambda config: CommandResult([], 0, "RNASEQ_AGENT_SSH_OK", ""),
+        )
+        result = client.post("/api/test-server", headers=_headers(token)).json()
+        assert result["ok"] is True
+        assert result["message"] == "SSH 连接成功"
+
+    def test_llm_test_and_model_list_use_configured_api(self, client, monkeypatch) -> None:
+        import requests
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "api_base": "https://llm.example/v1", "model": "demo", "api_key": "secret"}},
+            headers=_headers(token),
+        )
+
+        class Response:
+            status_code = 200
+            text = ""
+            def __init__(self, payload): self.payload = payload
+            def json(self): return self.payload
+            def raise_for_status(self): return None
+
+        def fake_get(url, **kwargs):
+            assert url == "https://llm.example/v1/models"
+            return Response({"data": [{"id": "model-b"}, {"id": "model-a"}]})
+
+        def fake_post(url, **kwargs):
+            assert url == "https://llm.example/v1/chat/completions"
+            return Response({"choices": [{"message": {"content": "连接正常"}}]})
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(requests, "post", fake_post)
+        models = client.get("/api/llm/models", headers=_headers(token)).json()
+        tested = client.post("/api/test-llm", headers=_headers(token)).json()
+        assert models == {"ok": True, "models": ["model-a", "model-b"]}
+        assert tested["ok"] is True
+        assert tested["reply"] == "连接正常"
+
+    def test_counts_preview_detects_samples(self, client) -> None:
+        token = _token(client)
+        result = client.post(
+            "/api/samples/counts-preview",
+            files={"file": ("counts.tsv", b"gene\tA1\tA2\tB1\nG1\t1\t2\t3\n", "text/tab-separated-values")},
+            headers=_headers(token),
+        ).json()
+        assert result == {"ok": True, "samples": ["A1", "A2", "B1"]}
+
+    def test_remote_scan_returns_paired_preview(self, client, monkeypatch) -> None:
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        _new_project(client, token)
+
+        class Transport:
+            def execute(self, command):
+                return CommandResult([], 0, "/reads/A_R1.fastq.gz\n/reads/A_R2.fastq.gz\n", "")
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        result = client.post(
+            "/api/samples/scan-remote", json={"path": "/reads"}, headers=_headers(token)
+        ).json()
+        assert result["ok"] is True
+        assert result["samples"][0]["sample_id"] == "A"
+
     def test_chat_uses_llm_when_configured(self, client, tmp_path: Path, monkeypatch) -> None:
         import requests
 

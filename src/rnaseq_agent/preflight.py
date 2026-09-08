@@ -63,6 +63,7 @@ def run_preflight(
     the full remote command.
     """
 
+    requested_destination = output_path or config_path.parent / "preflight.json"
     config_path = config_path.resolve()
     config = normalize_config(load_json(config_path))
     _validate_config_for_preflight(config)
@@ -86,9 +87,9 @@ def run_preflight(
 
     parsed = _parse_probe_output(result.stdout)
     report = _build_report(config, parsed)
-    destination = (output_path or config_path.parent / "preflight.json").resolve()
+    destination = requested_destination.resolve()
     save_json(destination, report)
-    return destination, report
+    return requested_destination, report
 
 
 def build_read_only_probe(config: dict[str, Any]) -> str:

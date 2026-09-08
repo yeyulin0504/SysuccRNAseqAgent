@@ -60,6 +60,8 @@
 
 <div class="wrap">
   <div id="savedNotice" class="notice hidden">已保存。</div>
+  <button id="loadDemoConfig" onclick="loadDemoConfig()">加载演示配置</button>
+  <span class="muted">预填你的 SSH 与 Paratera API；密码和 API Key 请在下方输入。</span>
 
   <h2>HPC 连接</h2>
   <div class="card">
@@ -100,13 +102,15 @@
       <div><label>远程基础目录</label><input id="srvRemoteBase" placeholder="服务器上的工作根目录"></div>
     </div>
     <button onclick="saveServer()">保存 HPC 配置</button>
+    <button id="saveAndTestServer" class="secondary" onclick="saveAndTestServer()">保存并测试 SSH</button>
+    <div id="serverTestResult" class="muted" style="margin-top:8px"></div>
   </div>
 
   <h2>AI 模型接入</h2>
   <div class="card">
     <div class="row">
       <div><label>API Base</label><input id="llmBase" placeholder="https://api.openai.com/v1"></div>
-      <div><label>模型</label><input id="llmModel" placeholder="gpt-4o-mini"></div>
+      <div><label>模型</label><input id="llmModel" list="modelOptions" placeholder="Deepseek-V4-Flash"><datalist id="modelOptions"></datalist></div>
       <div><label>提供商（可选）</label><input id="llmProvider" placeholder="openai / deepseek / ..."></div>
     </div>
     <div class="row">
@@ -119,7 +123,10 @@
       </div>
     </div>
     <button onclick="saveLlm()">保存 AI 配置</button>
+    <button id="pullModels" class="secondary" onclick="pullModels()">拉取模型列表</button>
+    <button id="saveAndTestLlm" class="secondary" onclick="saveAndTestLlm()">保存并测试 API</button>
     <button class="secondary" onclick="clearKey()">清除 API Key</button>
+    <div id="llmTestResult" class="muted" style="margin-top:8px"></div>
     <div class="muted" style="margin-top:8px">未启用或请求失败时，对话自动回退本地规则路由。</div>
   </div>
 </div>
@@ -166,7 +173,7 @@ function load() {
     document.getElementById("llmKeyState").textContent = c.llm.api_key_set ? "（已设置）" : "（未设置）";
   });
 }
-function saveServer() {
+async function saveServer() {
   const server = {
     host: document.getElementById("srvHost").value.trim(),
     user: document.getElementById("srvUser").value.trim(),
@@ -185,13 +192,13 @@ function saveServer() {
   if (server.threads) server.threads = Number(server.threads);
   if (server.memory_gb) server.memory_gb = Number(server.memory_gb);
   if (server.port) server.port = Number(server.port);
-  api("/api/config", "POST", { server }).then(d => {
-    if (d.error) { alert(d.error); return; }
+  return api("/api/config", "POST", { server }).then(d => {
+    if (d.error) { alert(d.error); return d; }
     document.getElementById("srvPass").value = "";
-    flash();
+    flash(); return d;
   });
 }
-function saveLlm() {
+async function saveLlm() {
   const llm = {
     provider: document.getElementById("llmProvider").value.trim(),
     api_base: document.getElementById("llmBase").value.trim(),
@@ -201,11 +208,37 @@ function saveLlm() {
   Object.keys(llm).forEach(k => { if (llm[k] === "") delete llm[k]; });
   const key = document.getElementById("llmKey").value.trim();
   if (key) llm.api_key = key;
-  api("/api/config", "POST", { llm }).then(d => {
-    if (d.error) { alert(d.error); return; }
+  return api("/api/config", "POST", { llm }).then(d => {
+    if (d.error) { alert(d.error); return d; }
     document.getElementById("llmKey").value = "";
-    flash();
+    flash(); return d;
   });
+}
+async function saveAndTestServer() {
+  const saved = await saveServer(); if (!saved || saved.error) return;
+  const el = document.getElementById("serverTestResult"); el.textContent = "正在连接…";
+  const result = await api("/api/test-server", "POST", {});
+  el.textContent = result.message; el.className = result.ok ? "ok" : "err";
+}
+async function saveAndTestLlm() {
+  const saved = await saveLlm(); if (!saved || saved.error) return;
+  const el = document.getElementById("llmTestResult"); el.textContent = "正在请求模型…";
+  const result = await api("/api/test-llm", "POST", {});
+  el.textContent = result.ok ? result.message + "：" + result.reply : result.message;
+  el.className = result.ok ? "ok" : "err";
+}
+async function pullModels() {
+  const saved = await saveLlm(); if (!saved || saved.error) return;
+  const result = await api("/api/llm/models");
+  const el = document.getElementById("llmTestResult");
+  if (!result.ok) { el.textContent = result.message; el.className = "err"; return; }
+  document.getElementById("modelOptions").innerHTML = result.models.map(m => `<option value="${m.replace(/"/g, '&quot;')}">`).join("");
+  el.textContent = `已拉取 ${result.models.length} 个模型`; el.className = "ok";
+}
+async function loadDemoConfig() {
+  const result = await api("/api/config/demo", "POST", {});
+  if (result.error) { alert(result.error); return; }
+  location.reload();
 }
 function clearKey() {
   api("/api/config", "POST", { llm: { api_key_clear: true } }).then(d => {
