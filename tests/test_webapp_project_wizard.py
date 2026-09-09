@@ -496,3 +496,24 @@ def test_fastq_session_duplicate_submit_returns_exists_without_rewrite(tmp_path:
     intake_after = json.loads((project_dir / "intake.json").read_text(encoding="utf-8"))
     assert session_after == session_before
     assert intake_after == intake_before
+
+
+def test_workbench_renders_galaxy_style_regions(tmp_path: Path) -> None:
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    page = client.get("/workbench").text
+
+    assert 'id="toolPanel"' in page
+    assert 'id="mainWorkspace"' in page
+    assert 'id="historyPanel"' in page
+    assert 'id="agentConversation"' in page
+    assert "History" in page
+
+
+def test_index_labels_setup_state_for_new_projects(tmp_path: Path) -> None:
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_home")
+
+    projects = client.get("/api/projects", headers=h).json()["projects"]
+    assert next(p for p in projects if p["project_id"] == "wiz_home")["state"] == "setup"

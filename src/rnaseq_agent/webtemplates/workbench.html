@@ -32,11 +32,15 @@
   .state.failed, .state.error, .state.FAIL, .state.NOT_EVALUABLE { background: rgba(207,34,46,.12); color: var(--err); }
   .state.idle { background: rgba(101,109,118,.14); color: var(--muted); }
   .state.executing { background: rgba(9,105,218,.12); color: var(--accent); }
+  .state.input_ready, .state.setup { background: rgba(9,105,218,.12); color: var(--accent); }
 
-  .layout { display: grid; grid-template-columns: 260px 1fr 330px; height: calc(100vh - 58px); }
-  .left { border-right: 1px solid var(--border); padding: 14px; overflow: auto; }
-  .middle { padding: 16px 20px; overflow: auto; }
-  .right { border-left: 1px solid var(--border); padding: 14px; overflow: auto; }
+  .layout { display: grid; grid-template-columns: 250px minmax(640px, 1fr) 340px; height: calc(100vh - 58px); }
+  .left { border-right: 1px solid var(--border); padding: 12px; overflow: auto; }
+  .middle { padding: 0; display: grid; grid-template-rows: minmax(360px, 1fr) minmax(260px, 38vh); overflow: hidden; }
+  .right { border-left: 1px solid var(--border); padding: 12px; overflow: auto; background: var(--panel); }
+  .wizard-main,
+  .conversation-main { padding: 16px 20px; overflow: auto; }
+  .conversation-main { border-top: 1px solid var(--border); background: #fbfbfc; }
 
   h2 { font-size: 12px; color: var(--muted); text-transform: uppercase;
        letter-spacing: .5px; margin: 16px 0 8px; }
@@ -77,16 +81,16 @@
   .list li.active { background: var(--accent-weak); border: 1px solid var(--accent); }
   .list .sub { color: var(--muted); font-size: 11px; }
 
-  .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
-  .tabs button { flex: 1; background: var(--bg); border: 1px solid var(--border);
-                 color: var(--muted); padding: 7px 4px; margin-top: 0; font-size: 12px; font-weight: 500; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .tabs button { flex: 1; background: var(--panel); border: 1px solid var(--border);
+                 color: var(--muted); padding: 6px 4px; margin-top: 0; font-size: 12px; font-weight: 500; }
   .tabs button.active { color: var(--accent); border-color: var(--accent); background: var(--accent-weak); }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); color: var(--text); }
   th { color: var(--muted); font-weight: 600; }
 
-  /* ---- 新建草稿表单 ---- */
+  /* ---- 表单控件 ---- */
   .seg { display: flex; gap: 6px; }
   .seg button { flex: 1; background: var(--panel); border: 1px solid var(--border);
                 color: var(--muted); padding: 8px 6px; margin-top: 6px; font-weight: 500; }
@@ -103,6 +107,63 @@
   .add-row:hover { text-decoration: underline; }
   .ref-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; }
   .ref-grid .full { grid-column: 1 / -1; }
+
+  /* ---- 向导步骤条 ---- */
+  .wsteps { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; font-size: 12px; }
+  .wstep { display: flex; align-items: center; gap: 5px; color: var(--muted); white-space: nowrap; }
+  .wstep .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+  .wstep.done .dot { background: var(--ok); }
+  .wstep.done { color: var(--ok); }
+  .wstep.now { color: var(--accent); font-weight: 600; }
+  .wstep.now .dot { background: var(--accent); }
+  .wsep { flex: 1; height: 1px; background: var(--border); }
+
+  /* ---- 左栏工具卡 ---- */
+  .tool-card { border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px;
+               margin-bottom: 8px; background: var(--bg); cursor: pointer; }
+  .tool-card:hover { border-color: var(--accent); }
+  .tool-card.active { border-color: var(--accent); background: var(--accent-weak); }
+  .tool-card .t-name { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .tool-card .t-state { margin-left: auto; font-size: 10px; padding: 1px 7px; border-radius: 10px;
+                        background: var(--panel); color: var(--muted); border: 1px solid var(--border); white-space: nowrap; }
+  .tool-card.active .t-state { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tool-card .t-cap { font-size: 10px; color: var(--muted); margin-top: 3px; overflow: hidden;
+                      text-overflow: ellipsis; white-space: nowrap; }
+  .tool-card .t-reason { font-size: 11px; color: var(--warn); margin-top: 4px; }
+  .tool-card.placeholder { opacity: .6; cursor: default; }
+  .tool-card.placeholder:hover { border-color: var(--border); }
+
+  /* ---- 右栏 History 条目 ---- */
+  .hist-item { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+               margin-bottom: 6px; background: var(--bg); }
+  .hist-item .h-head { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+  .hist-item .h-type { font-size: 10px; padding: 1px 6px; border-radius: 10px;
+                       background: var(--accent-weak); color: var(--accent); white-space: nowrap; }
+  .hist-item .h-state { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .hist-item .h-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-item .h-time { font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .hist-item .h-details { font-size: 11px; color: var(--muted); margin-top: 4px; border-top: 1px dashed var(--border);
+                          padding-top: 4px; white-space: pre-wrap; word-break: break-all; }
+
+  /* ---- 对话区 ---- */
+  #chatMessages { max-height: 170px; overflow: auto; margin-bottom: 6px; }
+  .conv-row { display: flex; gap: 8px; align-items: stretch; }
+  .conv-row textarea { flex: 1; min-height: 64px; }
+  .conv-row button { margin-top: 0; align-self: stretch; }
+  .quick-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0 8px; }
+  .quick-row button { margin-top: 0; }
+
+  /* ---- counts/FASTQ 反馈区 ---- */
+  .matrix-meta { font-size: 12px; margin: 2px 0; }
+  .errbox { background: rgba(207,34,46,.08); border: 1px solid rgba(207,34,46,.3); color: var(--err);
+            padding: 8px 10px; border-radius: 8px; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  .gatebox { background: rgba(154,103,0,.08); border: 1px solid rgba(154,103,0,.3); color: var(--warn);
+             padding: 8px 10px; border-radius: 8px; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+  .okbox { background: rgba(26,127,55,.08); border: 1px solid rgba(26,127,55,.3); color: var(--ok);
+           padding: 8px 10px; border-radius: 8px; font-size: 12px; margin-top: 8px; }
+
+  details.adv { margin-top: 8px; font-size: 12px; }
+  details.adv summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -118,8 +179,8 @@
 </header>
 
 <div class="layout">
-  <!-- ============ 左栏：项目与对话 ============ -->
-  <div class="left">
+  <!-- ============ 左栏 #toolPanel：项目、对话与路线/工具 ============ -->
+  <div class="left" id="toolPanel">
     <h2>项目</h2>
     <div class="card">
       <ul class="list" id="projectList"><li class="muted">加载中…</li></ul>
@@ -135,169 +196,216 @@
         <button class="small secondary" onclick="archiveThread()">归档</button>
       </div>
     </div>
+
+    <h2>路线 / 工具</h2>
+    <div class="card" id="routeCards"><div class="muted">选择项目后加载可用路线。</div></div>
   </div>
 
-  <!-- ============ 中栏：配置与操作 ============ -->
+  <!-- ============ 中栏：向导 + 放大 Agent 对话 ============ -->
   <div class="middle">
-    <div id="qcNotice" class="notice hidden">
-      <b>QC 检查点</b>：fastp QC 已完成。请审阅后确认，进入后续阶段。
-      <button class="secondary small" onclick="resumeQc()">确认 QC，继续</button>
-    </div>
+    <!-- 中栏上半：向导 #mainWorkspace -->
+    <div class="wizard-main" id="mainWorkspace">
+      <div id="qcNotice" class="notice hidden">
+        <b>QC 检查点</b>：fastp QC 已完成。请审阅后确认，进入后续阶段。
+        <button class="secondary small" onclick="resumeQc()">确认 QC，继续</button>
+      </div>
 
-    <!-- 新建项目草稿 -->
-    <h2>新建分析草稿</h2>
-    <div class="card">
-      <div class="row">
-        <div><label>项目 ID</label><input id="projectId" placeholder="crc_01"></div>
-        <div><label>项目名称</label><input id="title" placeholder="CRC 差异表达"></div>
-        <div><label>癌种 <span class="hint">CMS 仅 CRC</span></label>
-          <input id="cancerType" list="cancerOpts" value="pan_cancer">
-          <datalist id="cancerOpts">
+      <!-- 四步向导进度条 -->
+      <div class="wsteps">
+        <div class="wstep" id="wstep1"><span class="dot"></span><span>1 路线</span></div>
+        <div class="wsep"></div>
+        <div class="wstep" id="wstep2"><span class="dot"></span><span>2 输入</span></div>
+        <div class="wsep"></div>
+        <div class="wstep" id="wstep3"><span class="dot"></span><span>3 样本设计</span></div>
+        <div class="wsep"></div>
+        <div class="wstep" id="wstep4"><span class="dot"></span><span>4 计划 / 执行</span></div>
+      </div>
+
+      <!-- Step 1 摘要卡片 -->
+      <div class="card">
+        <h3>① 路线摘要</h3>
+        <div id="routeSummary" class="muted"></div>
+      </div>
+
+      <!-- Step 2 输入类型选择 -->
+      <div class="card">
+        <h3>② 输入类型</h3>
+        <div class="seg" id="inputSeg">
+          <button type="button" id="inCounts" onclick="setInputType('counts')">Counts / 表达矩阵</button>
+          <button type="button" id="inLocal" onclick="setInputType('local_fastq')">本地 FASTQ</button>
+          <button type="button" id="inRemote" onclick="setInputType('remote_fastq')">服务器 FASTQ 扫描</button>
+        </div>
+        <div class="seg-hint" id="inputTypeHint"></div>
+
+        <!-- counts / 表达矩阵：preview → session -->
+        <div id="countsPane" class="hidden">
+          <p class="muted" style="margin:0 0 6px">上传表达计数矩阵，系统先做语义识别（raw counts / normalized expression / GEO）。
+            只有 <b>raw counts</b> 才能启用 DESeq2；非 raw counts 会给出明确提示。</p>
+          <div class="row" style="align-items:end">
+            <div style="flex:2"><input type="file" id="countsFile" accept=".tsv,.csv,.txt" style="padding:4px"></div>
+            <div style="flex:1; min-width:180px"><button class="secondary" onclick="previewCounts()">上传并预览矩阵</button></div>
+          </div>
+          <div id="countsPreviewBox" class="muted"></div>
+          <div id="countsGroupsBox" class="hidden">
+            <label>样本分组 <span class="hint">每行“样本ID + Tab + 分组”；预览后自动预填，可直接批量粘贴覆盖</span></label>
+            <textarea id="countsGroups" rows="4" style="width:100%" placeholder="CTRL_1&#9;control"></textarea>
+            <div class="row">
+              <div>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
+                  <input type="checkbox" id="countsDe" style="width:auto"> DESeq2 差异表达
+                </label>
+                <input id="countsRef" placeholder="参考组 condition，如 control">
+              </div>
+              <div>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
+                  <input type="checkbox" id="countsCms" style="width:auto"> CMS 结直肠癌分型
+                </label>
+                <input id="countsCancer" placeholder="癌种，CMS 需 crc">
+              </div>
+            </div>
+            <div class="row" style="align-items:center; margin-top:6px">
+              <button id="createCountsSessionBtn" style="flex:0 0 auto" onclick="createCountsSession()">生成 counts 分析会话</button>
+            </div>
+            <div id="countsMsg"></div>
+          </div>
+        </div>
+
+        <!-- 服务器 FASTQ 扫描 -->
+        <div id="remoteFastqPane" class="hidden">
+          <p class="muted" style="margin:0 0 6px">FASTQ 已存放在服务器：填目录自动扫描配对样本；也可以先在对话里说「浏览服务器目录」。</p>
+          <div class="row" style="align-items:end">
+            <div style="flex:2"><label>服务器 FASTQ 目录</label><input id="remoteFastqDir2" placeholder="/data/users/you/crc_raw"></div>
+            <div style="flex:1; min-width:150px"><label>&nbsp;</label><button class="secondary" onclick="scanRemoteFastq()">自动扫描并配对样本</button></div>
+          </div>
+          <div id="scanResult2" class="muted"></div>
+          <div id="fastqSampleEditor" class="hidden">
+            <label>批量分组 <span class="hint">每行“样本ID + Tab + 分组”，可直接从 Excel 粘贴；表格可快速编辑 condition</span></label>
+            <textarea id="fastqGroups" rows="3" style="width:100%"></textarea>
+            <div class="sample-head">
+              <span>样本 ID</span><span>条件</span><span>R1</span><span>R2</span><span>batch</span><span></span>
+            </div>
+            <div id="fastqSampleRows"></div>
+            <button class="add-row" onclick="addFastqSampleRow()">＋ 增加一行样本</button>
+            <div class="row" style="align-items:center">
+              <button onclick="createFastqSession()">生成服务器 FASTQ 会话</button>
+            </div>
+            <div id="fastqMsg"></div>
+          </div>
+        </div>
+
+        <!-- 本地 FASTQ -->
+        <div id="localFastqPane" class="hidden">
+          <p class="muted" style="margin:0 0 6px">登记本地 FASTQ 目录与样本文件（R1/R2 文件名）。首版为目录登记，不上传文件本体。</p>
+          <div class="row">
+            <div><label>本地 FASTQ 目录</label><input id="localFastqDir" placeholder="D:/data/rnaseq/raw_fastq"></div>
+            <div><label>癌种</label><input id="cancerType2" list="cancerOpts2" value="pan_cancer"></div>
+            <div><label>实验设计</label>
+              <select id="design2">
+                <option value="independent_two_group">独立两组（组间差异）</option>
+                <option value="single_group">单组队列</option>
+              </select>
+            </div>
+            <div><label>测序布局</label>
+              <select id="layout2">
+                <option value="paired">双端 paired-end</option>
+                <option value="single">单端 single-end</option>
+              </select>
+            </div>
+          </div>
+          <datalist id="cancerOpts2">
             <option value="pan_cancer">泛癌（不支持 CMS）</option>
             <option value="crc">结直肠癌 CRC</option>
             <option value="coad">结肠腺癌 COAD</option>
             <option value="read">直肠腺癌 READ</option>
           </datalist>
+          <label>批量分组 <span class="hint">每行“样本ID + Tab + 分组”</span></label>
+          <textarea id="fastqGroupsLocal" rows="3" style="width:100%"></textarea>
+          <div class="sample-head">
+            <span>样本 ID</span><span>条件</span><span>R1</span><span>R2</span><span>batch</span><span></span>
+          </div>
+          <div id="localFastqSampleRows"></div>
+          <button class="add-row" onclick="addLocalFastqSampleRow()">＋ 增加一行样本</button>
+          <button onclick="createLocalFastqSession()">生成本地 FASTQ 会话</button>
+          <div id="localFastqMsg"></div>
         </div>
       </div>
-      <div class="row">
-        <div><label>实验设计</label>
-          <select id="design">
-            <option value="independent_two_group">独立两组（组间差异）</option>
-            <option value="single_group">单组队列</option>
-          </select>
-        </div>
-        <div><label>测序布局</label>
-          <select id="layout">
-            <option value="paired">双端 paired-end</option>
-            <option value="single">单端 single-end</option>
-          </select>
-        </div>
-        <div><label>负责人</label><input id="owner" value="local_user"></div>
-      </div>
 
-      <label>数据来源</label>
-      <div class="seg">
-        <button type="button" id="srcLocal" class="active" onclick="setDataSource('local_upload')">本地上传 FASTQ</button>
-        <button type="button" id="srcRemote" onclick="setDataSource('remote_path')">服务器已有 FASTQ</button>
-      </div>
-      <div class="seg-hint" id="sourceHint"></div>
-      <div id="localDirRow" class="row">
-        <div><label>本地 FASTQ 目录 <span class="hint">绝对路径，示例：D:/data/rnaseq/raw</span></label>
-          <input id="fastqDir" placeholder="D:/data/rnaseq/raw_fastq"></div>
-      </div>
-      <div id="remoteDirRow" class="hidden row">
-        <div><label>服务器 FASTQ 目录 <span class="hint">HPC 上已存在的绝对路径，直接读取不再上传</span></label>
-          <input id="remoteFastqDir" placeholder="/data/users/you/crc_raw">
-          <button type="button" class="secondary small" onclick="scanRemoteFastq()">自动扫描并配对样本</button>
-          <div id="scanResult" class="muted"></div></div>
-      </div>
-
-      <div class="row">
-        <div><label>参考文件：GTF 注释</label><input id="gtf" placeholder="/ref/gencode.v47.gtf"></div>
-        <div><label>参考文件：基因组 FASTA</label><input id="genomeFasta" placeholder="/ref/GRCh38.fa"></div>
-        <div><label>STAR 索引目录</label><input id="starIndex" placeholder="/ref/star_2.7.11b"></div>
-        <div><label>RSEM 索引前缀</label><input id="rsemPrefix" placeholder="/ref/rsem/rsem_gencode_v47"></div>
-      </div>
-
-      <label>样本表 <span class="hint">至少一行。R1/R2 填写 FASTQ 文件名（相对上面目录）。</span></label>
-      <label>批量分组 <span class="hint">每行“样本ID + Tab + 分组”，可直接从 Excel 粘贴</span></label>
-      <textarea id="bulkGroups" rows="4" style="width:100%" placeholder="sample_1&#9;control&#10;sample_2&#9;treatment"></textarea>
-      <div class="sample-head">
-        <span>样本 ID</span><span>条件 condition</span><span>R1 文件名</span><span>R2 文件名（双端）</span><span>批次 batch（可选）</span><span></span>
-      </div>
-      <div id="sampleRows"></div>
-      <button class="add-row" onclick="addSampleRow()">＋ 增加一行样本</button>
-
-      <button onclick="createDraft()">创建项目草稿</button>
-      <span id="draftErr" class="err"></span>
-    </div>
-
-    <!-- counts 直入 -->
-    <h2>Counts 直接分析</h2>
-    <div class="card">
-      <p class="muted" style="margin:0 0 6px">不经过 FASTQ 处理：直接上传表达计数矩阵，运行差异表达（DESeq2）或 CMS 分子分型（CMScaller）。</p>
-      <input type="file" id="countsFile" accept=".tsv,.csv,.txt" style="padding:4px">
-      <div id="countsDetected" class="muted"></div>
-      <label>样本分组 <span class="hint">选择文件后自动读取表头；每行“样本ID + Tab + 分组”</span></label>
-      <textarea id="countsGroups" rows="5" style="width:100%" placeholder="CTRL_1&#9;control"></textarea>
-      <div class="row">
-        <div>
-          <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
-            <input type="checkbox" id="countsDe" style="width:auto"> DESeq2 差异表达
-          </label>
-          <input id="countsRef" placeholder="参考组 condition，如 control">
-        </div>
-        <div>
-          <label style="display:flex;align-items:center;gap:6px;margin-top:10px">
-            <input type="checkbox" id="countsCms" style="width:auto"> CMS 结直肠癌分型
-          </label>
-          <input id="countsCancer" placeholder="癌种，CMS 需 crc">
-        </div>
-      </div>
-      <button onclick="runCounts()">上传矩阵并创建分析</button>
-      <span id="countsErr" class="err"></span>
-    </div>
-
-    <!-- 流程控制 -->
-    <h2>流程控制</h2>
-    <div class="card">
-      <div id="planSteps" class="muted">尚未生成计划。创建草稿后点击「生成执行计划」。</div>
-      <div class="row">
-        <button onclick="doPlan()">生成执行计划</button>
-        <button id="confirmBtn" class="secondary" onclick="doConfirm()">确认并冻结契约</button>
-        <button class="secondary" onclick="doRollback()">回滚</button>
-      </div>
-      <div id="flowStatus" class="step"></div>
-    </div>
-
-    <!-- 条件开放能力 -->
-    <h2>条件开放：差异表达与分型</h2>
-    <div class="row">
-      <div class="card" style="flex:1">
-        <h3>差异表达 <span class="tag">DESeq2</span></h3>
-        <div id="degStatus" class="muted">未启用。两组独立设计（每组 ≥3 生物学重复、无混杂）时可启用。</div>
-        <div id="degRefRow" class="hidden">
-          <label>参考组 condition</label>
-          <input id="degRef" placeholder="control">
-        </div>
+      <!-- Step 3 样本与设计确认 + Step 4 计划/执行（一个卡片，按状态展示可用动作） -->
+      <div class="card">
+        <h3>③ / ④ 样本设计确认 · 计划 · 确认 · 执行</h3>
+        <div id="sampleDesignStatus" class="muted"></div>
+        <div id="planSteps" class="muted" style="margin-top:8px">尚未生成计划。建立输入会话后，点击「生成执行计划」。</div>
         <div class="row">
-          <button class="secondary small" onclick="degGate()">查看门禁</button>
-          <button class="secondary small" onclick="toggleDeg(true)">启用</button>
-          <button class="secondary small" onclick="toggleDeg(false)">关闭</button>
+          <button onclick="doPlan()">生成执行计划</button>
+          <button id="confirmBtn" class="secondary" onclick="doConfirm()">确认并冻结契约</button>
+          <button class="secondary" onclick="doRollback()">回滚</button>
+        </div>
+        <div id="flowStatus" class="step"></div>
+      </div>
+
+      <!-- 条件开放能力（保留 legacy deg/cms 面板） -->
+      <h2>条件开放：差异表达与分型</h2>
+      <div class="row">
+        <div class="card" style="flex:1">
+          <h3>差异表达 <span class="tag">DESeq2</span></h3>
+          <div id="degStatus" class="muted">未启用。两组独立设计（每组 ≥3 生物学重复、无混杂）时可启用。</div>
+          <div id="degRefRow" class="hidden">
+            <label>参考组 condition</label>
+            <input id="degRef" placeholder="control">
+          </div>
+          <div class="row">
+            <button class="secondary small" onclick="degGate()">查看门禁</button>
+            <button class="secondary small" onclick="toggleDeg(true)">启用</button>
+            <button class="secondary small" onclick="toggleDeg(false)">关闭</button>
+          </div>
+        </div>
+        <div class="card" style="flex:1">
+          <h3>CMS 分子分型 <span class="tag">CMScaller</span></h3>
+          <div id="cmsStatus" class="muted">未启用。仅结直肠癌（CRC），样本 ≥ 30，依赖 counts。</div>
+          <div class="row">
+            <button class="secondary small" onclick="cmsGate()">查看门禁</button>
+            <button class="secondary small" onclick="toggleCms(true)">启用</button>
+            <button class="secondary small" onclick="toggleCms(false)">关闭</button>
+          </div>
         </div>
       </div>
-      <div class="card" style="flex:1">
-        <h3>CMS 分子分型 <span class="tag">CMScaller</span></h3>
-        <div id="cmsStatus" class="muted">未启用。仅结直肠癌（CRC），样本 ≥ 30，依赖 counts。</div>
-        <div class="row">
-          <button class="secondary small" onclick="cmsGate()">查看门禁</button>
-          <button class="secondary small" onclick="toggleCms(true)">启用</button>
-          <button class="secondary small" onclick="toggleCms(false)">关闭</button>
-        </div>
-      </div>
+
+      <details class="adv">
+        <summary>设置与高级</summary>
+        <p class="muted">SSH / API / 容器详情在 <a href="/settings">设置页</a>；参考路径、线程等在连接设置中登记，回到本项目即可生效。</p>
+      </details>
     </div>
 
-    <!-- 对话与决策 -->
-    <h2>对话与决策</h2>
-    <div class="card">
-      <textarea id="chatInput" rows="3"
-        placeholder="向 Agent 提问，例如：请解释当前流程的 QC 阈值、把线程改成 16、以 control 为对照跑差异表达"></textarea>
-      <button onclick="sendChat()">发送</button>
-      <div id="chatReply" class="muted" style="margin-top:10px"></div>
+    <!-- 中栏下半：放大 Agent 对话 #agentConversation -->
+    <div class="conversation-main" id="agentConversation">
+      <h2 style="margin-top:0">Agent 对话</h2>
+      <div id="chatMessages" class="muted"></div>
+      <div class="quick-row">
+        <button class="small secondary" onclick="quickChat('生成执行计划')">生成计划</button>
+        <button class="small secondary" onclick="quickChat('解释当前门禁')">解释当前门禁</button>
+        <button class="small secondary" onclick="quickChat('浏览我的服务器目录')">浏览服务器目录</button>
+      </div>
+      <div class="conv-row">
+        <textarea id="chatInput" rows="3"
+          placeholder="向 Agent 提问，例如：请解释当前流程的 QC 阈值、把线程改成 16、以 control 为对照跑差异表达"></textarea>
+        <button onclick="sendChat()">发送</button>
+      </div>
+      <div id="chatReply" class="muted" style="margin-top:8px"></div>
     </div>
   </div>
 
-  <!-- ============ 右栏：项目上下文 ============ -->
-  <div class="right">
-    <h2>项目上下文</h2>
+  <!-- ============ 右栏 #historyPanel：History 项目记录 ============ -->
+  <div class="right" id="historyPanel">
+    <h2>History <span class="hint" style="text-transform:none">项目记录</span></h2>
     <div class="tabs">
-      <button id="tab-flow" class="active" onclick="switchTab('flow')">流程</button>
+      <button id="tab-history" class="active" onclick="switchTab('history')">记录</button>
+      <button id="tab-flow" onclick="switchTab('flow')">流程</button>
       <button id="tab-samples" onclick="switchTab('samples')">样本</button>
       <button id="tab-runs" onclick="switchTab('runs')">运行</button>
       <button id="tab-results" onclick="switchTab('results')">结果</button>
     </div>
-    <div id="panel-flow" class="card"></div>
+    <div id="panel-history" class="card"></div>
+    <div id="panel-flow" class="card hidden"></div>
     <div id="panel-samples" class="card hidden"></div>
     <div id="panel-runs" class="card hidden"></div>
     <div id="panel-results" class="card hidden"></div>
@@ -309,8 +417,12 @@ const TOKEN = "{{ token }}";
 const INITIAL_PROJECT = "{{ project_id }}";
 let currentProject = INITIAL_PROJECT || "";
 let currentThread = "";
-let activeTab = "flow";
+let activeTab = "history";
+let currentInputType = "";          // counts | remote_fastq | local_fastq
+let countsUploadId = "";
+let countsPreview = null;
 
+/* ---------------- 基础工具 ---------------- */
 async function api(method, path, body) {
   const opts = { method, headers: { "x-session-token": TOKEN } };
   if (body !== undefined) {
@@ -330,21 +442,40 @@ function legacy(path) {
   return path + (path.indexOf("?") >= 0 ? "&" : "?") + "project=" + encodeURIComponent(currentProject);
 }
 
+function wizardPath(rel) {
+  return "/api/projects/" + encodeURIComponent(currentProject) + rel;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
+function humanTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(0, 19).replace("T", " ");
+  return d.toLocaleString();
+}
+
+function msg(elId, html, kind) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  el.className = kind === "err" ? "errbox" : (kind === "ok" ? "okbox" : "gatebox");
+  el.innerHTML = html;
+}
+
+/* ---------------- 顶部状态徽标 ---------------- */
 function setState(state) {
   const badge = document.getElementById("stateBadge");
   const s = String(state || "");
   badge.textContent = s;
-  const cls = s.toLowerCase();
-  badge.className = "state " + cls;
-  document.getElementById("confirmBtn").disabled = s !== "planned";
+  badge.className = "state " + s.toLowerCase();
+  const confirmBtn = document.getElementById("confirmBtn");
+  if (confirmBtn) confirmBtn.disabled = s !== "planned";
 }
 
-/* ---------- 左栏：项目 ---------- */
+/* ---------- 左栏 #toolPanel：项目 ---------- */
 function renderProjects(rows) {
   const el = document.getElementById("projectList");
   if (!rows || !rows.length) {
@@ -371,14 +502,17 @@ function selectProject(id) {
   url.searchParams.set("project", id);
   history.pushState({}, "", url);
   document.getElementById("projectName").textContent = id;
-  document.getElementById("projectId").value = id;
-  document.getElementById("title").placeholder = id;
+  const chatBox = document.getElementById("chatMessages");
+  if (chatBox) chatBox.innerHTML = "";
+  const reply = document.getElementById("chatReply");
+  if (reply) reply.innerHTML = "";
   loadProjects();
   loadThreads();
+  loadWizardData();
   refreshAll();
 }
 
-/* ---------- 左栏：对话 ---------- */
+/* ---------- 左栏 #toolPanel：对话 ---------- */
 function renderThreads(rows) {
   const el = document.getElementById("threadList");
   if (!currentProject) {
@@ -400,25 +534,22 @@ function renderThreads(rows) {
 
 function loadThreads() {
   if (!currentProject) { renderThreads([]); return; }
-  api("GET", "/api/projects/" + encodeURIComponent(currentProject) + "/threads")
-    .then(d => renderThreads(d.threads || []));
+  api("GET", wizardPath("/threads")).then(d => renderThreads(d.threads || []));
 }
 
 function selectThread(tid) {
   currentThread = tid;
   loadThreads();
-  document.getElementById("threadTitle").textContent = tid;
   loadMessages();
 }
 
 function loadMessages() {
-  const el = document.getElementById("messages");
+  const el = document.getElementById("chatMessages");
   if (!el) return;
   if (!currentProject || !currentThread) { el.innerHTML = ""; return; }
-  api("GET", "/api/projects/" + encodeURIComponent(currentProject) + "/threads/"
-    + encodeURIComponent(currentThread) + "/messages").then(d => {
+  api("GET", wizardPath("/threads/" + encodeURIComponent(currentThread) + "/messages")).then(d => {
       const msgs = d.messages || [];
-      if (!msgs.length) { el.innerHTML = "<div class='step'>暂无消息。</div>"; return; }
+      if (!msgs.length) { el.innerHTML = "<div class='step'>暂无消息。点下方快速动作或直接提问。</div>"; return; }
       el.innerHTML = msgs.map(m =>
         `<div class="step"><b>${escapeHtml(m.role)}：</b>${escapeHtml(m.content)}</div>`).join("");
     });
@@ -427,12 +558,10 @@ function loadMessages() {
 function newThread() {
   if (!currentProject) { alert("请先选择一个项目。"); return; }
   const title = prompt("新对话标题（留空自动生成）", "");
-  api("POST", "/api/projects/" + encodeURIComponent(currentProject) + "/threads",
-    { title: title || "" }).then(d => {
+  api("POST", wizardPath("/threads"), { title: title || "" }).then(d => {
       if (d.error) { alert(d.error); return; }
       currentThread = d.thread_id;
       loadThreads();
-      document.getElementById("threadTitle").textContent = d.title;
     });
 }
 
@@ -440,10 +569,8 @@ function renameThread() {
   if (!currentProject || !currentThread) { alert("请先选择一个对话。"); return; }
   const title = prompt("重命名对话", currentThread);
   if (title === null) return;
-  api("PATCH", "/api/projects/" + encodeURIComponent(currentProject) + "/threads/"
-    + encodeURIComponent(currentThread), { title: title }).then(d => {
+  api("PATCH", wizardPath("/threads/" + encodeURIComponent(currentThread)), { title: title }).then(d => {
       if (d.error) { alert(d.error); return; }
-      document.getElementById("threadTitle").textContent = d.title;
       loadThreads();
     });
 }
@@ -451,155 +578,742 @@ function renameThread() {
 function archiveThread() {
   if (!currentProject || !currentThread) { alert("请先选择一个对话。"); return; }
   if (!confirm("归档对话 " + currentThread + "？分析数据不会删除。")) return;
-  api("DELETE", "/api/projects/" + encodeURIComponent(currentProject) + "/threads/"
-    + encodeURIComponent(currentThread)).then(d => {
+  api("DELETE", wizardPath("/threads/" + encodeURIComponent(currentThread))).then(d => {
       if (d.error) { alert(d.error); return; }
       currentThread = "";
-      document.getElementById("threadTitle").textContent = "（未选择对话）";
-      const el = document.getElementById("messages");
+      const el = document.getElementById("chatMessages");
       if (el) el.innerHTML = "";
       loadThreads();
     });
 }
 
-/* ---------- 数据源与样本行 ---------- */
-let dataSource = "local_upload";
-function setDataSource(src) {
-  dataSource = src;
-  document.getElementById("srcLocal").classList.toggle("active", src === "local_upload");
-  document.getElementById("srcRemote").classList.toggle("active", src === "remote_path");
-  document.getElementById("localDirRow").classList.toggle("hidden", src !== "local_upload");
-  document.getElementById("remoteDirRow").classList.toggle("hidden", src !== "remote_path");
-  const hint = document.getElementById("sourceHint");
-  if (src === "local_upload") {
-    hint.textContent = "从你的电脑上传 FASTQ 到分析服务器（填本地目录 + 样本表里的文件）。";
+/* ---------- 左栏 #toolPanel：路线/工具卡片 ---------- */
+function renderRouteCards(routes) {
+  const el = document.getElementById("routeCards");
+  if (!currentProject) { el.innerHTML = "<div class='muted'>选择项目后加载可用路线。</div>"; return; }
+  if (!routes || !routes.bulk_rna) { el.innerHTML = "<div class='muted'>暂无路线信息。</div>"; return; }
+  const order = ["bulk_rna", "wxs", "scrna"];
+  let html = "";
+  order.forEach(key => {
+    const r = routes[key] || { label: key, available: false, reason: "" };
+    const activeCls = (window._intakeRoute === key) ? "active" : "";
+    html += `<div class="tool-card ${activeCls}" onclick="pickRoute('${escapeHtml(key)}')">
+      <div class="t-name">${escapeHtml(r.label || key)}
+        <span class="t-state">${r.available ? "可配置" : "预留"}</span>
+      </div>
+      ${r.capability_id ? `<div class="t-cap mono">${escapeHtml(r.capability_id)}</div>` : ""}
+      ${r.available ? "" : `<div class="t-reason">${escapeHtml(r.reason || "未实现能力。")}</div>`}
+    </div>`;
+  });
+  html += `<div class="tool-card placeholder" title="尚未实现"><div class="t-name">模型中心 <span class="t-state">预留</span></div></div>
+    <div class="tool-card placeholder" title="尚未实现"><div class="t-name">报告 <span class="t-state">预留</span></div></div>`;
+  el.innerHTML = html;
+}
+
+function pickRoute(route) {
+  if (!currentProject) { alert("请先选择一个项目。"); return; }
+  const labels = {
+    wxs: "WXS 输入要求：paired tumor-normal WES FASTQ；首期目标 SNV/small InDel；后续 CNV；PCGR research interpretation。",
+    scrna: "scRNA-seq 输入要求：10x filtered matrix/H5、h5ad 或 Seurat RDS；首期目标对象审计、QC、Leiden/UMAP、marker、注释。",
+  };
+  if (route === "bulk_rna") {
+    api("POST", wizardPath("/route"), { route }).then(d => {
+      if (d.error) { alert(d.error); return; }
+      if (d.state) setState(d.state);
+      loadWizardData();
+    });
   } else {
-    hint.textContent = "FASTQ 已存放在服务器（填服务器目录 + 样本表里的文件名），不上传、不校验本地文件。";
+    alert((labels[route] || "该路线尚未接入执行链。") + "\n\n当前不可执行，仅展示输入要求，不创建任何会话。");
   }
 }
 
-function sampleRowHTML(sample) {
-  return `<div class="sample-row">
-    <input class="s-id" value="${escapeHtml(sample.sample_id || '')}" placeholder="ctrl_1">
-    <input class="s-cond" value="${escapeHtml(sample.condition || '')}" placeholder="control">
-    <input class="s-r1" value="${escapeHtml(sample.fastq_1 || '')}" placeholder="ctrl_1_R1.fastq.gz">
-    <input class="s-r2" value="${escapeHtml(sample.fastq_2 || '')}" placeholder="ctrl_1_R2.fastq.gz">
-    <input class="s-batch" value="${escapeHtml(sample.batch || '')}" placeholder="（可留空）">
-    <button class="icon-btn" onclick="removeSampleRow(this)" title="删除行">×</button>
-  </div>`;
+/* ---------- 中栏向导：数据装载与渲染 ---------- */
+function loadWizardData() {
+  if (!currentProject) {
+    document.getElementById("routeSummary").innerHTML = "<div class='muted'>选择左侧项目后开始配置。</div>";
+    renderRouteCards(null);
+    resetInputPanes();
+    loadHistory();
+    return;
+  }
+  api("GET", wizardPath("/intake")).then(d => {
+    if (d.error) {
+      document.getElementById("routeSummary").innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`;
+      return;
+    }
+    const intake = d.intake || {};
+    window._intakeRoute = intake.route;
+    window._intakeType = intake.input_type;
+    setState(d.state);
+    renderRouteCards(d.routes);
+    renderRouteSummary(d);
+    renderWizardSteps(d.state);
+    renderInputSelection(d);
+    renderSampleDesignStatus(d);
+    if (activeTab === "history") loadHistoryFrom(d.history);
+  });
 }
 
-function addSampleRow(sample) {
-  const wrap = document.getElementById("sampleRows");
-  wrap.insertAdjacentHTML("beforeend", sampleRowHTML(sample || {}));
+function renderRouteSummary(d) {
+  const el = document.getElementById("routeSummary");
+  const intake = d.intake || {};
+  const route = intake.route;
+  if (!route) {
+    el.innerHTML = `<span class="muted">尚未选择路线 —— 点击左栏「bulk RNA-seq」开始（WXS / scRNA 为预留位，仅展示输入要求）。</span>`;
+    return;
+  }
+  const info = (d.routes && d.routes[route]) || {};
+  if (route === "bulk_rna") {
+    el.innerHTML = `<div class="step"><b>${escapeHtml(info.label || "bulk RNA-seq")}</b>`
+      + (info.capability_id ? ` <span class="mono">${escapeHtml(info.capability_id)}</span>` : "")
+      + ` · <span class="ok">可运行</span>`
+      + (intake.input_type ? ` · 输入：${escapeHtml(String(intake.input_type).replace(/_/g, " "))}` : "")
+      + (intake.updated_at ? ` · 更新 ${humanTime(intake.updated_at)}` : "")
+      + `</div>`;
+  } else {
+    el.innerHTML = `<div class="step"><b>${escapeHtml(info.label || route)}</b> · <span class="warn">预留</span></div>`
+      + `<div class="step warn">${escapeHtml(info.reason || "尚未接入执行链。")}</div>`;
+  }
 }
-function removeSampleRow(btn) {
-  const rows = document.querySelectorAll("#sampleRows .sample-row");
+
+function renderWizardSteps(state) {
+  const order = ["setup", "input_ready", "planned", "confirmed", "running", "waiting_user", "completed", "failed"];
+  const idx = order.indexOf(state);
+  ["wstep1", "wstep2", "wstep3", "wstep4"].forEach((id, i) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove("done", "now");
+    if (idx < 0) return;
+    if (i < idx) el.classList.add("done");
+    else if (i === idx) el.classList.add("now");
+  });
+}
+
+function renderInputSelection(d) {
+  const state = d.state;
+  const intake = d.intake || {};
+  const route = intake.route;
+  const mode = intake.input_type;
+  const hintEl = document.getElementById("inputTypeHint");
+
+  // 不可配置时置灰按钮并提示。
+  const noConfig = !currentProject || !route || route !== "bulk_rna";
+  if (!currentProject) {
+    hintEl.textContent = "请先选择项目。";
+    setInputPaneEnabled(false);
+    return;
+  }
+  if (!route) {
+    hintEl.textContent = "先选择路线（bulk RNA-seq）后出现输入类型。";
+    setInputPaneEnabled(false);
+    return;
+  }
+  if (route !== "bulk_rna") {
+    hintEl.textContent = "当前路线为预留能力，不支持输入创建。请回左栏选择 bulk RNA-seq。";
+    setInputPaneEnabled(false);
+    return;
+  }
+  setInputPaneEnabled(true);
+  void state; void mode;
+
+  // 默认选中已登记输入，否则无选中。
+  const defaultType = mode === "counts_matrix" || mode === "expression_matrix" ? "counts"
+    : (mode === "remote_fastq" ? "remote_fastq"
+       : (mode === "local_fastq" ? "local_fastq" : ""));
+  setInputType(defaultType, true);
+}
+
+function setInputPaneEnabled(enabled) {
+  ["counts", "local_fastq", "remote_fastq"].forEach(t => {
+    const b = document.getElementById("in" + (t === "counts" ? "Counts" : t === "local_fastq" ? "Local" : "Remote"));
+    if (b) b.disabled = !enabled;
+  });
+  if (!enabled) {
+    document.getElementById("countsPane").classList.add("hidden");
+    document.getElementById("remoteFastqPane").classList.add("hidden");
+    document.getElementById("localFastqPane").classList.add("hidden");
+  }
+}
+
+function resetInputPanes() {
+  currentInputType = "";
+  ["inCounts", "inLocal", "inRemote"].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.classList.remove("active");
+  });
+  document.getElementById("countsPane").classList.add("hidden");
+  document.getElementById("remoteFastqPane").classList.add("hidden");
+  document.getElementById("localFastqPane").classList.add("hidden");
+  document.getElementById("inputTypeHint").textContent = "选择数据来源。";
+}
+
+function setInputType(type, silent) {
+  if (!type) { resetInputPanes(); return; }
+  currentInputType = type;
+  ["inCounts", "inLocal", "inRemote"].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.classList.remove("active");
+  });
+  const activeBtn = type === "counts" ? "inCounts" : (type === "remote_fastq" ? "inRemote" : "inLocal");
+  const btn = document.getElementById(activeBtn);
+  if (btn) btn.classList.add("active");
+  const hint = document.getElementById("inputTypeHint");
+  const countsPane = document.getElementById("countsPane");
+  const remotePane = document.getElementById("remoteFastqPane");
+  const localPane = document.getElementById("localFastqPane");
+  if (type === "counts") {
+    hint.textContent = "上传表达计数矩阵：先预览识别语义（raw counts / normalized / GEO），再确认分组并生成会话。";
+    countsPane.classList.remove("hidden");
+    remotePane.classList.add("hidden");
+    localPane.classList.add("hidden");
+    syncCountsPaneFromIntake();
+  } else if (type === "remote_fastq") {
+    hint.textContent = "服务器 FASTQ：扫描配对 → 补充分组 → 生成会话。";
+    countsPane.classList.add("hidden");
+    remotePane.classList.remove("hidden");
+    localPane.classList.add("hidden");
+  } else {
+    hint.textContent = "本地 FASTQ：登记目录与样本文件（首版目录登记，不上传）。";
+    countsPane.classList.add("hidden");
+    remotePane.classList.add("hidden");
+    localPane.classList.remove("hidden");
+  }
+  void silent;
+}
+
+function syncCountsPaneFromIntake() {
+  const pv = window._intakePreview;
+  const uploadId = window._intakeUploadId;
+  if (pv) {
+    countsPreview = pv;
+    countsUploadId = uploadId;
+    document.getElementById("countsPreviewBox").innerHTML = renderMatrixPreview(pv);
+    document.getElementById("countsGroupsBox").classList.remove("hidden");
+    const canDe = pv.can_run_deseq2 !== false;
+    if (canDe) {
+      const ta = document.getElementById("countsGroups");
+      const samples = pv.samples || [];
+      if (ta && !ta.value.trim()) ta.value = samples.map(s => s + "\t").join("\n");
+    }
+  }
+}
+
+/* counts：preview → session（新端点） */
+function renderMatrixPreview(pv) {
+  if (!pv) return "";
+  const typeLabel = { raw_counts: "raw counts", normalized_expression: "normalized expression",
+                      geo_series_matrix_like: "GEO series matrix", unknown: "unknown" }[pv.matrix_type] || pv.matrix_type;
+  const lines = [];
+  lines.push(`<div class="matrix-meta">矩阵语义：<b>${escapeHtml(typeLabel)}</b>`
+    + (pv.can_run_deseq2 ? ` <span class="ok">· 可运行 DESeq2</span>` : ` <span class="err">· 不可直接运行 DESeq2</span>`) + `</div>`);
+  if (pv.gene_id_column) lines.push(`<div class="matrix-meta">基因列：<b class="mono">${escapeHtml(pv.gene_id_column)}</b> · 基因数 ${pv.gene_count ?? "-"}</div>`);
+  if (pv.sample_count != null) lines.push(`<div class="matrix-meta">检测到 <b>${pv.sample_count}</b> 个样本列。</div>`);
+  if (pv.samples && pv.samples.length) {
+    lines.push(`<div class="matrix-meta">样本列：<span class="mono">${pv.samples.map(escapeHtml).join(", ")}</span></div>`);
+  }
+  (pv.warnings || []).forEach(w => lines.push(`<div class="step warn">- ${escapeHtml(w)}</div>`));
+  return lines.join("");
+}
+
+function previewCounts() {
+  const fileInput = document.getElementById("countsFile");
+  const file = fileInput && fileInput.files && fileInput.files[0];
+  const box = document.getElementById("countsPreviewBox");
+  const groupsBox = document.getElementById("countsGroupsBox");
+  if (!currentProject) { alert("请先在左侧选择一个项目。"); return; }
+  if (!file) { box.innerHTML = "<div class='err'>请先选择 counts 矩阵文件。</div>"; return; }
+  const form = new FormData();
+  form.append("file", file);
+  box.innerHTML = "<div class='muted'>上传并解析中…</div>";
+  if (groupsBox) groupsBox.classList.add("hidden");
+  fetch(wizardPath("/counts/preview"), { method: "POST", headers: { "x-session-token": TOKEN }, body: form })
+    .then(r => r.json()).then(d => {
+      if (d.error) { box.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
+      countsUploadId = d.upload_id;
+      countsPreview = d.preview;
+      window._intakePreview = d.preview;
+      window._intakeUploadId = d.upload_id;
+      window._intakeType = "counts_matrix";
+      window._intakeRoute = "bulk_rna";
+      if (d.state) setState(d.state);
+      box.innerHTML = renderMatrixPreview(d.preview);
+      if (groupsBox) groupsBox.classList.remove("hidden");
+      const ta = document.getElementById("countsGroups");
+      const samples = (d.preview && d.preview.samples) || [];
+      if (ta) ta.value = samples.map(s => s + "\t").join("\n");
+      const deBox = document.getElementById("countsDe");
+      const ref = document.getElementById("countsRef");
+      if (deBox) deBox.checked = d.preview.can_run_deseq2 !== false;
+      if (ref) ref.value = "";
+      msg("countsMsg", "", "");
+      renderWizardSteps(d.state);
+      if (d.history) loadHistoryFrom(d.history);
+    }).catch(err => {
+      box.innerHTML = `<div class='err'>上传失败：${escapeHtml(String(err))}</div>`;
+    });
+}
+
+function parseCountsGroups() {
+  const ta = document.getElementById("countsGroups");
+  const samples = [];
+  const seen = new Set();
+  String(ta ? ta.value : "").split(/\r?\n/).forEach(line => {
+    const parts = line.split(/\t|,/).map(v => v.trim());
+    if (parts.length >= 2 && parts[0] && parts[1] && !seen.has(parts[0])) {
+      seen.add(parts[0]);
+      samples.push({ sample_id: parts[0], condition: parts[1] });
+    }
+  });
+  return samples;
+}
+
+function createCountsSession() {
+  if (!currentProject) { alert("请先选择项目。"); return; }
+  if (!countsUploadId) { msg("countsMsg", "请先上传并预览矩阵。", "err"); return; }
+  const deBox = document.getElementById("countsDe");
+  const cmsBox = document.getElementById("countsCms");
+  const refInput = document.getElementById("countsRef");
+  const cancerInput = document.getElementById("countsCancer");
+  const diffexp = deBox ? deBox.checked : false;
+  const cmsEnabled = cmsBox ? cmsBox.checked : false;
+  if (!diffexp && !cmsEnabled) { msg("countsMsg", "请至少勾选差异表达（DE）或 CMS 分型。", "err"); return; }
+  const reference = refInput ? refInput.value.trim() : "";
+  if (diffexp && !reference) { msg("countsMsg", "差异表达需要参考组 condition。", "err"); return; }
+  const samples = parseCountsGroups();
+  if (!samples.length) { msg("countsMsg", "请至少填写一行样本分组（样本ID + 条件）。", "err"); return; }
+  if (diffexp && countsPreview && countsPreview.can_run_deseq2 === false) {
+    msg("countsMsg", "当前矩阵不是 raw counts，不能启用 DESeq2 差异表达。", "err");
+    return;
+  }
+  const payload = {
+    upload_id: countsUploadId,
+    enabled_diffexp: diffexp,
+    reference_condition: reference,
+    samples,
+  };
+  if (cmsEnabled) { payload.enabled_cms = true; payload.cancer_type = cancerInput ? cancerInput.value.trim() || "pan_cancer" : "pan_cancer"; }
+  api("POST", wizardPath("/counts/session"), payload).then(d => {
+    if (d.error_code) {
+      msg("countsMsg", escapeHtml(d.message || d.error_code), "err");
+      return;
+    }
+    if (d.error) { msg("countsMsg", escapeHtml(d.error), "err"); return; }
+    if (d.state) setState(d.state);
+    const lines = [];
+    const gateLines = (d.gate || []);
+    if (Array.isArray(gateLines) && gateLines.length) lines.push(...gateLines.map(escapeHtml));
+    lines.push("已创建 counts 分析会话"
+      + (diffexp ? "（DESeq2，参考组 " + reference + "）" : "")
+      + (cmsEnabled ? "（CMS 分型）" : "") + "。");
+    msg("countsMsg", lines.join("<br>"), "ok");
+    if (d.history) loadHistoryFrom(d.history);
+    loadWizardData();
+  });
+}
+
+/* FASTQ 输入：服务器扫描 + 本地登记，session 走新端点 */
+function addFastqSampleRow(sample) {
+  const wrap = document.getElementById("fastqSampleRows");
+  if (wrap) wrap.insertAdjacentHTML("beforeend", fastqSampleRowHTML(sample || {}, "f"));
+}
+function addLocalFastqSampleRow(sample) {
+  const wrap = document.getElementById("localFastqSampleRows");
+  if (wrap) wrap.insertAdjacentHTML("beforeend", fastqSampleRowHTML(sample || {}, "l"));
+}
+function fastqSampleRowHTML(sample, prefix) {
+  const c = prefix === "l" ? "lfs" : "fs";
+  return `<div class="sample-row">
+    <input class="${c}-id" value="${escapeHtml(sample.sample_id || '')}" placeholder="CTRL_1">
+    <input class="${c}-cond" value="${escapeHtml(sample.condition || '')}" placeholder="control">
+    <input class="${c}-r1" value="${escapeHtml(sample.fastq_1 || '')}" placeholder="CTRL_1_R1.fastq.gz">
+    <input class="${c}-r2" value="${escapeHtml(sample.fastq_2 || '')}" placeholder="CTRL_1_R2.fastq.gz">
+    <input class="${c}-batch" value="${escapeHtml(sample.batch || '')}" placeholder="（可留空）">
+    <button class="icon-btn" onclick="removeFastqSampleRow(this, '${c}')" title="删除行">×</button>
+  </div>`;
+}
+function removeFastqSampleRow(btn, cls) {
+  const wrap = document.getElementById(cls === "lfs" ? "localFastqSampleRows" : "fastqSampleRows");
+  const rows = wrap ? wrap.querySelectorAll(".sample-row") : [];
   if (rows.length <= 1) { alert("至少保留一行样本。"); return; }
   btn.closest(".sample-row").remove();
 }
-function collectSamples() {
-  const groupMap = Object.fromEntries(document.getElementById("bulkGroups").value.split(/\r?\n/).map(line => line.split(/\t|,/).map(v => v.trim())).filter(parts => parts.length >= 2 && parts[0] && parts[1]).map(parts => [parts[0], parts[1]]));
+function collectFastqSamples(scope) {
+  const wrap = document.getElementById(scope === "local" ? "localFastqSampleRows" : "fastqSampleRows");
+  const ta = document.getElementById(scope === "local" ? "fastqGroupsLocal" : "fastqGroups");
+  const cls = scope === "local" ? "lfs" : "fs";
+  const groupMap = Object.fromEntries(String(ta ? ta.value : "").split(/\r?\n/)
+    .map(line => line.split(/\t|,/).map(v => v.trim()))
+    .filter(parts => parts.length >= 2 && parts[0] && parts[1])
+    .map(parts => [parts[0], parts[1]]));
   const samples = [];
-  document.querySelectorAll("#sampleRows .sample-row").forEach(row => {
-    const id = row.querySelector(".s-id").value.trim();
-    const cond = groupMap[id] || row.querySelector(".s-cond").value.trim();
-    const r1 = row.querySelector(".s-r1").value.trim();
-    const r2 = row.querySelector(".s-r2").value.trim();
-    const batch = row.querySelector(".s-batch").value.trim();
+  if (!wrap) return samples;
+  wrap.querySelectorAll(".sample-row").forEach(row => {
+    const id = row.querySelector("." + cls + "-id").value.trim();
+    const cond = groupMap[id] || row.querySelector("." + cls + "-cond").value.trim();
+    const r1 = row.querySelector("." + cls + "-r1").value.trim();
+    const r2 = row.querySelector("." + cls + "-r2").value.trim();
+    const batch = row.querySelector("." + cls + "-batch").value.trim();
     if (id && cond && r1) samples.push({ sample_id: id, condition: cond, fastq_1: r1, fastq_2: r2, batch: batch || undefined });
   });
   return samples;
 }
 
 function scanRemoteFastq() {
-  const path = document.getElementById("remoteFastqDir").value.trim();
-  const el = document.getElementById("scanResult");
-  if (!path) { el.textContent = "请填写远程目录。"; return; }
-  el.textContent = "正在通过 SSH 扫描…";
+  const input = document.getElementById("remoteFastqDir2");
+  const path = input ? input.value.trim() : "";
+  const scanBox = document.getElementById("scanResult2");
+  const editor = document.getElementById("fastqSampleEditor");
+  if (!currentProject) { alert("请先选择项目。"); return; }
+  if (!path) { scanBox.innerHTML = "<span class='err'>请填写远程目录。</span>"; return; }
+  scanBox.innerHTML = "<div class='muted'>正在通过 SSH 扫描…</div>";
   api("POST", legacy("/api/samples/scan-remote"), { path }).then(d => {
-    if (!d.ok) { el.textContent = d.message; return; }
-    document.getElementById("sampleRows").innerHTML = "";
-    d.samples.forEach(addSampleRow);
-    document.getElementById("bulkGroups").value = d.samples.map(s => s.sample_id + "\t").join("\n");
-    el.textContent = `识别 ${d.samples.length} 个配对样本；${d.unmatched.length} 个文件未配对。`;
+    if (!d.ok) { scanBox.innerHTML = `<span class="err">${escapeHtml(d.message)}</span>`; return; }
+    const rows = d.samples || [];
+    const wrap = document.getElementById("fastqSampleRows");
+    if (wrap) wrap.innerHTML = "";
+    rows.forEach(s => addFastqSampleRow({ sample_id: s.sample_id, condition: "", fastq_1: s.fastq_1, fastq_2: s.fastq_2 }));
+    const ta = document.getElementById("fastqGroups");
+    if (ta) ta.value = rows.map(s => s.sample_id + "\t").join("\n");
+    if (editor) editor.classList.remove("hidden");
+    scanBox.innerHTML = `<span class="ok">识别 ${rows.length} 个配对样本</span> · ${d.unmatched.length} 个文件未配对。在下方补充分组后生成会话。`;
   });
 }
 
-/* ---------- 中栏：创建草稿（绑定 current project 或新项目） ---------- */
-function draftErr(msg) {
-  document.getElementById("draftErr").textContent = msg || "";
-}
-
-function createDraft() {
-  const samples = collectSamples();
-  if (!samples.length) { draftErr("请至少填写一行样本（样本 ID、条件、R1）。"); return; }
-  const body = {
-    project_id: document.getElementById("projectId").value.trim() || currentProject,
-    title: document.getElementById("title").value.trim(),
-    cancer_type: document.getElementById("cancerType").value.trim(),
-    design: document.getElementById("design").value,
-    layout: document.getElementById("layout").value,
-    owner: document.getElementById("owner").value.trim(),
-    data_source: dataSource,
-    fastq_dir: document.getElementById("fastqDir").value.trim(),
-    remote_fastq_dir: document.getElementById("remoteFastqDir").value.trim(),
-    gtf: document.getElementById("gtf").value.trim(),
-    genome_fasta: document.getElementById("genomeFasta").value.trim(),
-    star_index: document.getElementById("starIndex").value.trim(),
-    rsem_prefix: document.getElementById("rsemPrefix").value.trim(),
-    samples,
+function collectFastqMeta() {
+  return {
+    layout: (document.getElementById("layout2") || {}).value || "paired",
+    cancer_type: (document.getElementById("cancerType2") || {}).value || "pan_cancer",
+    design: (document.getElementById("design2") || {}).value || "independent_two_group",
   };
-  if (!body.project_id) { draftErr("请填写项目 ID。"); return; }
-  draftErr("");
-  api("POST", legacy("/api/new"), body).then(d => {
-    if (d.error) { draftErr(d.error); return; }
-    setState(d.state);
-    if (!currentProject && body.project_id) {
-      window.location.href = "/workbench?project=" + encodeURIComponent(body.project_id);
-      return;
-    }
-    refreshAll();
+}
+
+function createFastqSession() {
+  const samples = collectFastqSamples("remote");
+  if (!currentProject) { alert("请先选择项目。"); return; }
+  const dirEl = document.getElementById("remoteFastqDir2");
+  const dir = dirEl ? dirEl.value.trim() : "";
+  if (!dir) { msg("fastqMsg", "请填写服务器 FASTQ 目录。", "err"); return; }
+  if (!samples.length) { msg("fastqMsg", "请先扫描或手动填写至少一行样本（样本 ID、条件、R1）。", "err"); return; }
+  const body = { data_source: "remote_path", remote_fastq_dir: dir, samples, ...collectFastqMeta() };
+  api("POST", wizardPath("/fastq/session"), body).then(d => {
+    if (d.error_code) { msg("fastqMsg", escapeHtml(d.message || d.error || d.error_code), "err"); return; }
+    if (d.error) { msg("fastqMsg", escapeHtml(d.error), "err"); return; }
+    if (d.state) setState(d.state);
+    const gateLines = Array.isArray(d.gate) ? d.gate : [];
+    const lines = [];
+    if (gateLines.length) lines.push(...gateLines.map(escapeHtml));
+    lines.push("已创建服务器 FASTQ 会话（" + samples.length + " 个样本）。");
+    msg("fastqMsg", lines.join("<br>"), "ok");
+    if (d.history) loadHistoryFrom(d.history);
+    loadWizardData();
   });
 }
 
+function createLocalFastqSession() {
+  const samples = collectFastqSamples("local");
+  if (!currentProject) { alert("请先选择项目。"); return; }
+  const dirEl = document.getElementById("localFastqDir");
+  const dir = dirEl ? dirEl.value.trim() : "";
+  if (!dir) { msg("localFastqMsg", "请填写本地 FASTQ 目录。", "err"); return; }
+  if (!samples.length) { msg("localFastqMsg", "请至少填写一行样本（样本 ID、条件、R1）。", "err"); return; }
+  const body = { data_source: "local_upload", fastq_dir: dir, samples, ...collectFastqMeta() };
+  api("POST", wizardPath("/fastq/session"), body).then(d => {
+    if (d.error_code) { msg("localFastqMsg", escapeHtml(d.message || d.error || d.error_code), "err"); return; }
+    if (d.error) { msg("localFastqMsg", escapeHtml(d.error), "err"); return; }
+    if (d.state) setState(d.state);
+    const gateLines = Array.isArray(d.gate) ? d.gate : [];
+    const lines = [];
+    if (gateLines.length) lines.push(...gateLines.map(escapeHtml));
+    lines.push("已创建本地 FASTQ 会话（" + samples.length + " 个样本）。");
+    msg("localFastqMsg", lines.join("<br>"), "ok");
+    if (d.history) loadHistoryFrom(d.history);
+    loadWizardData();
+  });
+}
+
+/* 第 3 步摘要：样本与设计确认 */
+function renderSampleDesignStatus(d) {
+  const el = document.getElementById("sampleDesignStatus");
+  const intake = d.intake || {};
+  const samples = (intake.samples && Array.isArray(intake.samples)) ? intake.samples : null;
+  const fastq = intake.fastq || {};
+  const lines = [];
+  if (samples && samples.length) {
+    lines.push(`<div class="step">样本设计：<b>${samples.length}</b> 个样本（最近提交）。可在左侧对话或右侧样本页签核对；修改请在输入步骤重建会话。</div>`);
+    lines.push(samples.slice(0, 20).map(s =>
+      `<span class="mono" style="font-size:11px">${escapeHtml(s.sample_id || "")}=${escapeHtml(s.condition || "?")}</span>`).join(" "));
+  } else {
+    lines.push(`<div class="step">尚未确认样本分组。完成第 ② 步输入会话后自动生成设计摘要。</div>`);
+  }
+  if (fastq && (fastq.remote_fastq_dir || fastq.fastq_dir)) {
+    lines.push(`<div class="step">目录：<span class="mono">${escapeHtml(fastq.remote_fastq_dir || fastq.fastq_dir || "")}</span></div>`);
+  }
+  el.innerHTML = lines.join("");
+}
+
+/* ---------- plan / confirm / rollback（保留 legacy 路径） ---------- */
 function doPlan() {
   api("POST", legacy("/api/plan")).then(d => {
-    if (d.error) { document.getElementById("planSteps").innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
-    document.getElementById("planSteps").innerHTML =
-      (d.steps || []).map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
-    setState(d.state);
+    const el = document.getElementById("planSteps");
+    if (d.error) { if (el) el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
+    if (el) el.innerHTML = (d.steps || []).map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
+    if (d.state) setState(d.state);
     refreshAll();
+    loadWizardData();
   });
 }
 
 function doConfirm() {
   api("POST", legacy("/api/confirm")).then(d => {
     if (d.error) { alert(d.error); return; }
-    document.getElementById("planSteps").innerHTML +=
-      `<div class="step ok">契约已冻结：${escapeHtml(String(d.contract_id).slice(0, 24))}…</div>`;
-    setState(d.state);
+    const el = document.getElementById("planSteps");
+    if (el) el.innerHTML += `<div class="step ok">契约已冻结：${escapeHtml(String(d.contract_id).slice(0, 24))}…</div>`;
+    if (d.state) setState(d.state);
+    loadWizardData();
   });
 }
 
 function doRollback() {
   api("POST", legacy("/api/rollback"), {}).then(d => {
-    if (d.error) alert(d.error); else { setState(d.state); refreshState(); }
+    if (d.error) alert(d.error);
+    else { if (d.state) setState(d.state); refreshState(); loadWizardData(); }
   });
 }
 
 function resumeQc() {
   if (!currentProject) return;
-  api("POST", "/api/projects/" + encodeURIComponent(currentProject) + "/graph/resume",
-    { approved: true }).then(d => {
+  api("POST", wizardPath("/graph/resume"), { approved: true }).then(d => {
       if (d.error) { alert(d.error); return; }
       refreshAll();
     });
 }
 
-/* ---------- 差异表达面板 ---------- */
+/* ---------- Agent 对话（#agentConversation，走既有 /api/chat） ---------- */
+function appendChatLine(role, text) {
+  const el = document.getElementById("chatMessages");
+  if (!el) return;
+  const div = document.createElement("div");
+  div.className = "step";
+  div.innerHTML = `<b>${escapeHtml(role)}：</b>${escapeHtml(text)}`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+}
+
+function sendChat() {
+  const input = document.getElementById("chatInput");
+  const q = input ? input.value.trim() : "";
+  if (!q) return;
+  if (input) input.value = "";
+  appendChatLine("你", q);
+  chatRequest(q);
+}
+
+function quickChat(text) {
+  if (!currentProject) { alert("请先选择项目。"); return; }
+  appendChatLine("你", text);
+  chatRequest(text);
+}
+
+function chatRequest(q) {
+  const reply = document.getElementById("chatReply");
+  if (reply) reply.innerHTML = "<span class='muted'>Agent：处理中…</span>";
+  api("POST", legacy("/api/chat"), { message: q }).then(d => {
+    const via = d.via === "llm" ? "（大模型）" : "（规则）";
+    let body = escapeHtml(d.reply || d.error || "完成。");
+    if (d.steps) body += "<br>" + d.steps.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
+    if (d.summary) body += "<br>" + d.summary.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
+    if (d.gate && Array.isArray(d.gate)) body += "<br>" + d.gate.map(s => `<div class="step err">${escapeHtml(s)}</div>`).join("");
+    if (d.action === "browse_samples" && Array.isArray(d.samples)) {
+      window.discoveredSamples = d.samples;
+      body += "<br>" + d.samples.map(s => `<div class="step">${escapeHtml(s.sample_id)}：${escapeHtml(s.fastq_1)} / ${escapeHtml(s.fastq_2)}</div>`).join("");
+      if (d.unmatched && d.unmatched.length) body += `<div class="step err">${d.unmatched.length} 个文件未配对</div>`;
+      body += `<button class="secondary small" onclick="applyDiscoveredSamples()">应用到服务器样本表</button>`;
+    }
+    if (reply) reply.innerHTML = "<b>Agent" + via + "：</b>" + body;
+    if (d.state) setState(d.state);
+    refreshState();
+  }).catch(err => {
+    if (reply) reply.innerHTML = "<span class='err'>请求失败：" + escapeHtml(String(err)) + "</span>";
+  });
+}
+
+function applyDiscoveredSamples() {
+  const samples = window.discoveredSamples || [];
+  if (!samples.length) return;
+  // 优先切到服务器 FASTQ 面板并把样本填入样本表。
+  setInputType("remote_fastq");
+  document.getElementById("fastqSampleEditor").classList.remove("hidden");
+  const wrap = document.getElementById("fastqSampleRows");
+  if (wrap) wrap.innerHTML = "";
+  samples.forEach(s => addFastqSampleRow({ sample_id: s.sample_id, condition: "", fastq_1: s.fastq_1, fastq_2: s.fastq_2 }));
+  const ta = document.getElementById("fastqGroups");
+  if (ta) ta.value = samples.map(s => s.sample_id + "\t").join("\n");
+}
+
+/* ---------- 右栏 History（#historyPanel 主内容） ---------- */
+function loadHistoryFrom(items) {
+  const el = document.getElementById("panel-history");
+  if (!el) return;
+  const rows = items || [];
+  if (!currentProject) {
+    el.innerHTML = "<div class='muted'>请先选择一个项目。</div>";
+    return;
+  }
+  if (!rows.length) {
+    el.innerHTML = "<div class='muted'>尚无项目记录。上传输入、生成计划或冻结契约后，记录会出现在这里。</div>";
+    return;
+  }
+  el.innerHTML = rows.slice().reverse().map(h => `
+    <div class="hist-item">
+      <div class="h-head" onclick="this.parentElement.querySelector('.h-details').classList.toggle('hidden')">
+        <span class="h-type">${escapeHtml(h.type || "event")}</span>
+        <span class="h-name" title="${escapeHtml(h.name || "")}">${escapeHtml(h.name || h.type || "event")}</span>
+        <span class="h-state">${escapeHtml(h.state || "")}</span>
+      </div>
+      <div class="h-time">${humanTime(h.created_at)}</div>
+      <div class="h-details hidden">${escapeHtml(JSON.stringify(h.details || {}, null, 2))}</div>
+    </div>`).join("");
+}
+
+function loadHistory() {
+  if (!currentProject) { loadHistoryFrom([]); return; }
+  api("GET", wizardPath("/intake")).then(d => {
+    if (d.error) {
+      const el = document.getElementById("panel-history");
+      if (el) el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`;
+      return;
+    }
+    loadHistoryFrom(d.history);
+  });
+}
+
+/* ---------- 状态与右栏 ---------- */
+function setQc(waiting) {
+  const el = document.getElementById("qcNotice");
+  if (el) el.classList.toggle("hidden", !waiting);
+}
+
+function refreshState() {
+  api("GET", legacy("/api/state")).then(d => {
+    if (d.error) return;
+    if (d.state) setState(d.state);
+  });
+}
+
+function refreshGraph() {
+  if (!currentProject) { setQc(false); return; }
+  api("GET", wizardPath("/graph/state")).then(d => {
+    if (d.error) { setQc(false); return; }
+    setQc(d.state === "WAITING_USER");
+    loadFlowPanel();
+  });
+}
+
+function refreshAll() {
+  refreshState();
+  refreshGraph();
+  loadTab(activeTab);
+}
+
+function switchTab(name) {
+  activeTab = name;
+  ["history", "flow", "samples", "runs", "results"].forEach(t => {
+    const tb = document.getElementById("tab-" + t);
+    const pn = document.getElementById("panel-" + t);
+    if (tb) tb.classList.toggle("active", t === name);
+    if (pn) pn.classList.toggle("hidden", t !== name);
+  });
+  loadTab(name);
+}
+
+function loadTab(name) {
+  if (name === "history") loadHistory();
+  else if (name === "flow") loadFlow();
+  else if (name === "samples") loadSamples();
+  else if (name === "runs") loadRuns();
+  else if (name === "results") loadResults();
+}
+
+function graphStatePath() {
+  return wizardPath("/graph/state");
+}
+
+function loadFlow() {
+  const el = document.getElementById("panel-flow");
+  if (!el) return;
+  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
+  api("GET", graphStatePath()).then(d => {
+    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
+    const gs = d.graph_state || {};
+    const lines = [];
+    lines.push(`<div class="step">状态：<b>${escapeHtml(d.state)}</b></div>`);
+    if (d.in_flight) lines.push(`<div class="step warn">运行中…</div>`);
+    if (d.interrupt) lines.push(`<div class="step warn">检查点：${escapeHtml(JSON.stringify(d.interrupt))}</div>`);
+    if (gs.status) lines.push(`<div class="step">graph status：${escapeHtml(gs.status)}</div>`);
+    if (gs.message) lines.push(`<div class="step">${escapeHtml(gs.message)}</div>`);
+    if (Array.isArray(gs.steps)) lines.push(gs.steps.map(s => `<div class="step">- ${escapeHtml(s)}</div>`).join(""));
+    el.innerHTML = lines.join("");
+  });
+}
+
+function loadFlowPanel() {
+  if (activeTab === "flow") loadFlow();
+}
+
+function loadSamples() {
+  const el = document.getElementById("panel-samples");
+  if (!el) return;
+  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
+  api("GET", legacy("/api/state")).then(d => {
+    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
+    const samples = d.samples || [];
+    if (!samples.length) {
+      el.innerHTML = "<div class='muted'>尚未登记样本。创建输入会话后这里会显示样本表。</div>";
+      return;
+    }
+    let html = `<table><tr><th>样本</th><th>条件</th><th>R1</th><th>R2</th><th>batch</th></tr>`;
+    samples.forEach(s => {
+      html += `<tr><td>${escapeHtml(s.sample_id || "")}</td><td>${escapeHtml(s.condition || "")}</td>`
+        + `<td class="mono">${escapeHtml(s.fastq_1 || "")}</td><td class="mono">${escapeHtml(s.fastq_2 || "")}</td>`
+        + `<td>${escapeHtml(s.batch || "")}</td></tr>`;
+    });
+    html += "</table>";
+    el.innerHTML = html;
+  });
+}
+
+function loadRuns() {
+  const el = document.getElementById("panel-runs");
+  if (!el) return;
+  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
+  api("GET", graphStatePath()).then(d => {
+    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
+    el.innerHTML =
+      `<div class="step">状态：<b>${escapeHtml(d.state)}</b></div>`
+      + `<div class="step">运行中：${d.in_flight ? "是" : "否"}</div>`
+      + (d.error ? `<div class="step err">${escapeHtml(d.error)}</div>` : "");
+  });
+}
+
+function loadResults() {
+  const el = document.getElementById("panel-results");
+  if (!el) return;
+  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
+  api("GET", graphStatePath()).then(d => {
+    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
+    const gs = d.graph_state || {};
+    const status = gs.status || d.state;
+    el.innerHTML =
+      `<div class="step">运行结果：<b>${escapeHtml(status)}</b></div>`
+      + (gs.message ? `<div class="step">${escapeHtml(gs.message)}</div>` : "")
+      + `<div class="muted" style="margin-top:8px">结果产物由运行面板提供（result_manifest）。</div>`;
+  });
+}
+
+/* ---------- 差异表达面板（保留 legacy） ---------- */
 function renderDeg(d) {
   const el = document.getElementById("degStatus");
+  if (!el) return;
   if (d.error) { el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
   const lines = [];
   lines.push(d.requested ? `状态：已启用（${escapeHtml(d.formula)}）` : "状态：未启用");
@@ -611,12 +1325,15 @@ function renderDeg(d) {
     (d.gate_reasons || []).forEach(r => lines.push(`<div class="step">- ${escapeHtml(r)}</div>`));
   }
   el.innerHTML = lines.join("<br>");
-  document.getElementById("degRefRow").classList.toggle("hidden", !d.requested);
-  document.getElementById("degRef").value = (d.design && d.design.reference_condition) || "";
+  const refRow = document.getElementById("degRefRow");
+  const ref = document.getElementById("degRef");
+  if (refRow) refRow.classList.toggle("hidden", !d.requested);
+  if (ref) ref.value = (d.design && d.design.reference_condition) || "";
 }
 
 function toggleDeg(enabled) {
-  const reference = document.getElementById("degRef").value.trim();
+  const ref = document.getElementById("degRef");
+  const reference = ref ? ref.value.trim() : "";
   const payload = { enabled };
   if (reference) payload.reference_condition = reference;
   api("POST", legacy("/api/deg"), payload).then(d => {
@@ -631,9 +1348,10 @@ function degGate() {
   api("POST", legacy("/api/deg"), {}).then(d => renderDeg(d));
 }
 
-/* ---------- CMS 面板 ---------- */
+/* ---------- CMS 面板（保留 legacy） ---------- */
 function renderCms(d) {
   const el = document.getElementById("cmsStatus");
+  if (!el) return;
   if (d.error) { el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
   const lines = [];
   lines.push(d.requested ? `状态：已启用（run_mode=${escapeHtml(d.run_mode || "pipeline")}）` : "状态：未启用");
@@ -660,218 +1378,17 @@ function cmsGate() {
   api("POST", legacy("/api/cms"), {}).then(d => renderCms(d));
 }
 
-/* ---------- counts 直入 ---------- */
-document.getElementById("countsFile").addEventListener("change", async function() {
-  const file = this.files && this.files[0]; if (!file) return;
-  const form = new FormData(); form.append("file", file);
-  const response = await fetch("/api/samples/counts-preview", { method: "POST", headers: { "x-session-token": TOKEN }, body: form });
-  const result = await response.json();
-  const el = document.getElementById("countsDetected");
-  if (!result.ok) { el.textContent = result.message; return; }
-  el.textContent = `已从表头识别 ${result.samples.length} 个样本。`;
-  document.getElementById("countsGroups").value = result.samples.map(s => s + "\t").join("\n");
-});
-function runCounts() {
-  const fileInput = document.getElementById("countsFile");
-  const file = fileInput.files && fileInput.files[0];
-  if (!file) { document.getElementById("countsErr").textContent = "请先选择 counts 矩阵文件。"; return; }
-  const de = document.getElementById("countsDe").checked;
-  const cms = document.getElementById("countsCms").checked;
-  const reference = document.getElementById("countsRef").value.trim();
-  const cancer = document.getElementById("countsCancer").value.trim();
-  if (!de && !cms) { document.getElementById("countsErr").textContent = "请至少勾选差异表达或 CMS 分型。"; return; }
-  if (de && !reference) { document.getElementById("countsErr").textContent = "差异表达需要参考组 condition。"; return; }
-  const form = new FormData();
-  form.append("file", file);
-  form.append("enabled_diffexp", de ? "1" : "0");
-  form.append("enabled_cms", cms ? "1" : "0");
-  if (reference) form.append("reference_condition", reference);
-  if (cancer) form.append("cancer_type", cancer);
-  document.getElementById("countsGroups").value.split(/\r?\n/).forEach(line => {
-    const parts = line.split(/\t|,/).map(v => v.trim());
-    if (parts[0]) form.append("sample_id", parts[0]);
-    if (parts[1]) form.append("condition", parts[1]);
-  });
-  document.getElementById("countsErr").textContent = "";
-  const path = currentProject
-    ? "/api/projects/" + encodeURIComponent(currentProject) + "/counts"
-    : "/api/projects/" + encodeURIComponent(document.getElementById("projectId").value.trim()) + "/counts";
-  if (!currentProject && !document.getElementById("projectId").value.trim()) {
-    document.getElementById("countsErr").textContent = "还没有项目：请在页面顶部「新建项目」登记，或先在左侧选择项目。";
-    return;
-  }
-  fetch(path, { method: "POST", headers: { "x-session-token": TOKEN }, body: form })
-    .then(r => r.json()).then(d => {
-      if (d.error) { document.getElementById("countsErr").textContent = d.error; return; }
-      const msg = "已创建 counts 分析：差异表达" + (de ? "（参考组 " + reference + "）" : "") + (cms ? "、CMS 分型" : "");
-      document.getElementById("countsErr").innerHTML = `<span class="ok">${escapeHtml(msg)}</span>`;
-      if (d.state) setState(d.state);
-      refreshAll();
-    }).catch(err => {
-      document.getElementById("countsErr").textContent = "上传失败：" + err;
-    });
-}
-
-/* ---------- 对话 ---------- */
-function sendChat() {
-  const q = document.getElementById("chatInput").value.trim();
-  if (!q) return;
-  const reply = document.getElementById("chatReply");
-  reply.innerHTML = "<span class='muted'>你：</span>" + escapeHtml(q) + "<br><span class='muted'>Agent：处理中…</span>";
-  api("POST", legacy("/api/chat"), { message: q }).then(d => {
-    const head = "<span class='muted'>你：</span>" + escapeHtml(q) + "<br>";
-    const via = d.via === "llm" ? "（大模型）" : "（规则）";
-    let body = escapeHtml(d.reply || d.error || "完成。");
-    if (d.steps) body += "<br>" + d.steps.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
-    if (d.summary) body += "<br>" + d.summary.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
-    if (d.gate && Array.isArray(d.gate)) body += "<br>" + d.gate.map(s => `<div class="step err">${escapeHtml(s)}</div>`).join("");
-    if (d.action === "browse_samples" && Array.isArray(d.samples)) {
-      window.discoveredSamples = d.samples;
-      body += "<br>" + d.samples.map(s => `<div class="step">${escapeHtml(s.sample_id)}：${escapeHtml(s.fastq_1)} / ${escapeHtml(s.fastq_2)}</div>`).join("");
-      if (d.unmatched && d.unmatched.length) body += `<div class="step err">${d.unmatched.length} 个文件未配对</div>`;
-      body += `<button class="secondary" onclick="applyDiscoveredSamples()">应用到样本表</button>`;
-    }
-    reply.innerHTML = head + "<b>Agent" + via + "：</b>" + body;
-    if (d.state) setState(d.state);
-    refreshState();
-  }).catch(err => {
-    reply.innerHTML = "<span class='err'>请求失败：" + escapeHtml(String(err)) + "</span>";
-  });
-}
-
-function applyDiscoveredSamples() {
-  const samples = window.discoveredSamples || [];
-  if (!samples.length) return;
-  document.getElementById("sampleRows").innerHTML = "";
-  samples.forEach(s => addSampleRow({...s, condition: "待分组"}));
-  document.getElementById("bulkGroups").value = samples.map(s => s.sample_id + "\t").join("\n");
-  window.scrollTo({top: 0, behavior: "smooth"});
-}
-
-/* ---------- 状态与右栏 ---------- */
-function setQc(waiting) {
-  document.getElementById("qcNotice").classList.toggle("hidden", !waiting);
-}
-
-function refreshState() {
-  api("GET", legacy("/api/state")).then(d => {
-    if (d.error) return;
-    setState(d.state);
-  });
-}
-
-function refreshGraph() {
-  if (!currentProject) { setQc(false); return; }
-  api("GET", "/api/projects/" + encodeURIComponent(currentProject) + "/graph/state").then(d => {
-    if (d.error) { setQc(false); return; }
-    setQc(d.state === "WAITING_USER");
-    loadFlowPanel();
-  });
-}
-
-function refreshAll() {
-  refreshState();
-  refreshGraph();
-  loadTab(activeTab);
-}
-
-function switchTab(name) {
-  activeTab = name;
-  ["flow", "samples", "runs", "results"].forEach(t => {
-    document.getElementById("tab-" + t).classList.toggle("active", t === name);
-    document.getElementById("panel-" + t).classList.toggle("hidden", t !== name);
-  });
-  loadTab(name);
-}
-
-function loadTab(name) {
-  if (name === "flow") loadFlow();
-  else if (name === "samples") loadSamples();
-  else if (name === "runs") loadRuns();
-  else if (name === "results") loadResults();
-}
-
-function graphStatePath() {
-  return "/api/projects/" + encodeURIComponent(currentProject) + "/graph/state";
-}
-
-function loadFlow() {
-  const el = document.getElementById("panel-flow");
-  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
-  api("GET", graphStatePath()).then(d => {
-    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
-    const gs = d.graph_state || {};
-    const lines = [];
-    lines.push(`<div class="step">状态：<b>${escapeHtml(d.state)}</b></div>`);
-    if (d.in_flight) lines.push(`<div class="step warn">运行中…</div>`);
-    if (d.interrupt) lines.push(`<div class="step warn">检查点：${escapeHtml(JSON.stringify(d.interrupt))}</div>`);
-    if (gs.status) lines.push(`<div class="step">graph status：${escapeHtml(gs.status)}</div>`);
-    if (gs.message) lines.push(`<div class="step">${escapeHtml(gs.message)}</div>`);
-    if (Array.isArray(gs.steps)) lines.push(gs.steps.map(s => `<div class="step">- ${escapeHtml(s)}</div>`).join(""));
-    el.innerHTML = lines.join("");
-  });
-}
-
-function loadFlowPanel() {
-  if (activeTab === "flow") loadFlow();
-}
-
-function loadSamples() {
-  const el = document.getElementById("panel-samples");
-  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
-  api("GET", legacy("/api/state")).then(d => {
-    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
-    const samples = d.samples || [];
-    if (!samples.length) {
-      el.innerHTML = "<div class='muted'>尚未登记样本。创建项目草稿后这里会显示样本表。</div>";
-      return;
-    }
-    let html = `<table><tr><th>样本</th><th>条件</th><th>R1</th><th>R2</th><th>batch</th></tr>`;
-    samples.forEach(s => {
-      html += `<tr><td>${escapeHtml(s.sample_id || "")}</td><td>${escapeHtml(s.condition || "")}</td>`
-        + `<td class="mono">${escapeHtml(s.fastq_1 || "")}</td><td class="mono">${escapeHtml(s.fastq_2 || "")}</td>`
-        + `<td>${escapeHtml(s.batch || "")}</td></tr>`;
-    });
-    html += "</table>";
-    el.innerHTML = html;
-  });
-}
-
-function loadRuns() {
-  const el = document.getElementById("panel-runs");
-  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
-  api("GET", graphStatePath()).then(d => {
-    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
-    el.innerHTML =
-      `<div class="step">状态：<b>${escapeHtml(d.state)}</b></div>`
-      + `<div class="step">运行中：${d.in_flight ? "是" : "否"}</div>`
-      + (d.error ? `<div class="step err">${escapeHtml(d.error)}</div>` : "");
-  });
-}
-
-function loadResults() {
-  const el = document.getElementById("panel-results");
-  if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
-  api("GET", graphStatePath()).then(d => {
-    if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
-    const gs = d.graph_state || {};
-    const status = gs.status || d.state;
-    el.innerHTML =
-      `<div class="step">运行结果：<b>${escapeHtml(status)}</b></div>`
-      + (gs.message ? `<div class="step">${escapeHtml(gs.message)}</div>` : "")
-      + `<div class="muted" style="margin-top:8px">结果产物由运行面板提供（result_manifest）。</div>`;
-  });
-}
-
 /* ---------- 初始化 ---------- */
-document.getElementById("projectId").value = currentProject;
 document.getElementById("projectName").textContent = currentProject || "未选择项目";
-document.getElementById("title").placeholder = currentProject || "";
-addSampleRow({ sample_id: "ctrl_1", condition: "control", fastq_1: "ctrl_1_R1.fastq.gz", fastq_2: "ctrl_1_R2.fastq.gz", batch: "" });
-addSampleRow({ sample_id: "trt_1", condition: "treatment", fastq_1: "trt_1_R1.fastq.gz", fastq_2: "trt_1_R2.fastq.gz", batch: "" });
-setDataSource("local_upload");
+addFastqSampleRow({});
+addFastqSampleRow({});
+addLocalFastqSampleRow({});
+addLocalFastqSampleRow({});
+resetInputPanes();
+setInputPaneEnabled(false);
 loadProjects();
 loadThreads();
+loadWizardData();
 refreshAll();
 </script>
 </body>

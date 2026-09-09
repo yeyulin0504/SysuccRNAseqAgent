@@ -54,6 +54,7 @@
   .state.waiting_user, .state.waiting { background: rgba(154,103,0,.14); color: var(--warn); }
   .state.completed { background: rgba(26,127,55,.12); color: var(--ok); }
   .state.failed, .state.error { background: rgba(207,34,46,.12); color: var(--err); }
+  .state.input_ready, .state.setup { background: rgba(9,105,218,.12); color: var(--accent); }
   .muted { color: var(--muted); font-size: 12px; }
   .err { color: var(--err); font-size: 13px; }
   .ok { color: var(--ok); }
@@ -145,10 +146,11 @@ function renderProjects(rows) {
   const el = document.getElementById("projects");
   if (!rows || !rows.length) { el.innerHTML = "<div class='muted'>还没有项目。在上方新建一个。</div>"; return; }
   el.innerHTML = rows.map(p => `
-    <div class="proj">
+    <div class="proj" id="proj-${escapeHtml(p.project_id)}">
       <div style="flex:2">
         <div class="title">${escapeHtml(p.title)}</div>
-        <div class="meta">${escapeHtml(p.project_id)} · ${escapeHtml(p.owner || "—")} · 更新 ${escapeHtml(p.updated_at || "—")}</div>
+        <div class="meta">${escapeHtml(p.project_id)} · ${escapeHtml(p.owner || "—")} · 更新 ${escapeHtml(p.updated_at || "—")}
+          <span class="route-summary"></span></div>
       </div>
       <div><span class="${stateClass(p.state)}">${escapeHtml(p.state)}</span></div>
       <div class="meta">${p.thread_count || 0} 对话</div>
@@ -157,6 +159,16 @@ function renderProjects(rows) {
         <button class="secondary small" onclick="archiveProject('${escapeHtml(p.project_id)}')">归档</button>
       </div>
     </div>`).join("");
+  // 每项目拉一次向导 route 摘要（轻量只读，失败静默）。
+  rows.forEach(p => {
+    api(`/api/projects/${encodeURIComponent(p.project_id)}/intake`)
+      .then(d => {
+        if (!d || !d.intake || !d.intake.route) return;
+        const span = el.querySelector(`#proj-${CSS.escape(p.project_id)} .route-summary`);
+        if (span) span.textContent = "· route: " + d.intake.route;
+      })
+      .catch(() => {});
+  });
 }
 function loadProjects() {
   api("/api/projects").then(d => renderProjects(d.projects || []))
