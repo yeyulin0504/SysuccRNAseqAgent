@@ -1379,6 +1379,87 @@ def create_app(
             "history": history_items(project_dir),
         }
 
+    # -- remote FASTQ 向导 session（bulk RNA 一级入口）------------------
+
+    @app.post("/api/projects/{project_id}/fastq/session")
+    async def api_project_fastq_session(project_id: str, request: Request):
+        """Create a bulk-RNA FASTQ wizard session from wizard intake samples.
+
+        Persists project intake (route=bulk_rna, input_type=remote_fastq or
+        local_fastq, state=input_ready), then creates the real FASTQ analysis
+        session via the same config builder used by ``/api/new`` so existing
+        plan/confirm logic remains usable.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+
+        data_source = str(payload.get("data_source") or "").strip()
+        if data_source not in {"remote_path", "local_upload"}:
+            return {"error_code": "INVALID_DATA_SOURCE", "message": "data_source 必须为 remote_path 或 local_upload。"}
+
+        samples = payload.get("samples") or []
+        # Finding：畸形 samples（非 list，或 list 含非 dict 元素）必须在解析前
+        # 被拦截，与 counts/session 段（isinstance(dict) 防御）语义一致，否则
+        # 会以 .get AttributeError 抛 500。
+        if not isinstance(samples, list):
+            return {"error_code": "INVALID_SAMPLES", "message": "samples 必须是样本对象列表。"}
+        # 先剔除非 dict 元素，再做 sample_id/condition 双非空筛选；剔除后的
+        # 纯 dict 列表回写 payload，供 _default_config 构建 project.json items。
+        dict_samples = [s for s in samples if isinstance(s, dict)]
+        valid_samples = [
+            s for s in dict_samples
+            if str(s.get("sample_id") or "").strip() and str(s.get("condition") or "").strip()
+        ]
+        if not valid_samples:
+            return {"error_code": "EMPTY_SAMPLES", "message": "缺少有效样本设计（sample_id + condition）。"}
+        payload = {**payload, "samples": dict_samples}
+
+        # 重复提交短路：已有 session.json 时不再重跑 new_project（后者会抛
+        # 状态机错误），对齐 legacy /api/new 的“项目已存在”语义。
+        if (project_dir / "session.json").is_file():
+            return {"error_code": "SESSION_EXISTS", "error": "项目已存在，请先打开或删除。"}
+
+        # 1) persist intake first so the UI / history reads an input_ready state.
+        intake = save_intake(
+            project_dir,
+            {
+                "route": "bulk_rna",
+                "input_type": "remote_fastq" if data_source == "remote_path" else "local_fastq",
+                "state": "input_ready",
+                "fastq": {
+                    "data_source": data_source,
+                    "remote_fastq_dir": str(payload.get("remote_fastq_dir") or "").strip(),
+                    "fastq_dir": str(payload.get("fastq_dir") or "").strip(),
+                },
+                "samples": samples,  # keep the raw list for downstream sample design editing
+            },
+        )
+
+        # 2) build the normal FASTQ project session (same path as /api/new?project=...).
+        config = _default_config(project_dir, {**payload, "project_id": project_id})
+        session = ProjectSession(project_dir)
+        gate = session.new_project(config)
+        workspace.touch(project_id, session.state)
+
+        # 3) record a sample-design history item.
+        append_history(
+            project_dir,
+            {
+                "type": "sample_design",
+                "name": "样本分组",
+                "state": session.state,
+                "details": {"count": len(valid_samples), "layout": str(payload.get("layout") or "paired")},
+            },
+        )
+
+        return {
+            "state": session.state,
+            "gate": gate.formatted(),
+            "intake": intake,
+            "history": history_items(project_dir),
+        }
+
     # -- threads API (per-project conversations) -------------------------
 
     @app.get("/api/projects/{project_id}/threads")

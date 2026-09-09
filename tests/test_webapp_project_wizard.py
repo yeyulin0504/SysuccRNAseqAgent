@@ -317,3 +317,182 @@ def test_counts_session_rejects_duplicate_sample_id(tmp_path: Path) -> None:
     assert body.get("error_code"), body
     assert "A1" in body.get("message", "")
     assert not (tmp_path / "wiz_j" / "session.json").is_file()
+
+
+def test_fastq_session_from_detected_samples_enters_input_ready(tmp_path: Path) -> None:
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_e")
+
+    body = client.post(
+        "/api/projects/wiz_e/fastq/session",
+        json={
+            "data_source": "remote_path",
+            "remote_fastq_dir": "/hwdata/home/yeyulin/demo_fastq",
+            "cancer_type": "crc",
+            "design": "independent_two_group",
+            "layout": "paired",
+            "samples": [
+                {
+                    "sample_id": "CTRL_1",
+                    "condition": "control",
+                    "fastq_1": "CTRL_1_R1.fastq.gz",
+                    "fastq_2": "CTRL_1_R2.fastq.gz",
+                },
+                {
+                    "sample_id": "CASE_1",
+                    "condition": "case",
+                    "fastq_1": "CASE_1_R1.fastq.gz",
+                    "fastq_2": "CASE_1_R2.fastq.gz",
+                },
+            ],
+        },
+        headers=h,
+    ).json()
+
+    assert body["state"] in {"input_ready", "drafting"}
+    assert body["intake"]["route"] == "bulk_rna"
+    assert body["intake"]["input_type"] == "remote_fastq"
+    assert body["history"][-1]["type"] == "sample_design"
+
+    # Task 6 plan 依赖：成功分支必须真正落盘 session.json，且与响应 state 一致。
+    import json
+
+    project_dir = tmp_path / "wiz_e"
+    assert (project_dir / "session.json").is_file()
+    session = json.loads((project_dir / "session.json").read_text(encoding="utf-8"))
+    assert session["state"] == body["state"]
+    # project.json 进入 remote_path 直入：数据源与样本表落盘。
+    assert (project_dir / "project.json").is_file()
+    project_json = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    assert project_json["samples"]["source"] == "remote_path"
+    assert project_json["samples"]["remote_prestaged"] is True
+    assert len(project_json["samples"]["items"]) == 2
+    # intake 意图态 input_ready 与 session 真实态分层保留，fastq 目录不丢。
+    intake = json.loads((project_dir / "intake.json").read_text(encoding="utf-8"))
+    assert intake["state"] == "input_ready"
+    assert intake["route"] == "bulk_rna"
+    assert intake["fastq"]["remote_fastq_dir"] == "/hwdata/home/yeyulin/demo_fastq"
+
+
+def test_fastq_session_rejects_samples_not_a_list(tmp_path: Path) -> None:
+    """Finding 1：samples 传 dict 而非 list → INVALID_SAMPLES，不得 500."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_k")
+
+    body = client.post(
+        "/api/projects/wiz_k/fastq/session",
+        json={
+            "data_source": "remote_path",
+            "remote_fastq_dir": "/data/demo_fastq",
+            "samples": {"sample_id": "A", "condition": "ctrl"},
+        },
+        headers=h,
+    ).json()
+
+    assert body.get("error_code") == "INVALID_SAMPLES", body
+    assert "样本对象列表" in body.get("message", "")
+    assert not (tmp_path / "wiz_k" / "session.json").is_file()
+
+
+def test_fastq_session_skips_non_dict_samples(tmp_path: Path) -> None:
+    """Finding 1：samples 列表含非 dict 元素必须被跳过而不是 .get 崩溃 → 500."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_l")
+
+    body = client.post(
+        "/api/projects/wiz_l/fastq/session",
+        json={
+            "data_source": "remote_path",
+            "remote_fastq_dir": "/data/demo_fastq",
+            "samples": ["CTRL_1", 123],
+        },
+        headers=h,
+    ).json()
+
+    assert body.get("error_code") == "EMPTY_SAMPLES", body
+    assert not (tmp_path / "wiz_l" / "session.json").is_file()
+
+
+def test_fastq_session_mixed_samples_keeps_only_dict_rows(tmp_path: Path) -> None:
+    """Finding 1：混合列表中非 dict 元素被剔除，剩余合法样本仍能建 session."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_m")
+
+    body = client.post(
+        "/api/projects/wiz_m/fastq/session",
+        json={
+            "data_source": "remote_path",
+            "remote_fastq_dir": "/hwdata/home/yeyulin/demo_fastq",
+            "cancer_type": "crc",
+            "design": "independent_two_group",
+            "layout": "paired",
+            "samples": [
+                "IGNORED_NOT_A_DICT",
+                123,
+                {
+                    "sample_id": "CTRL_1",
+                    "condition": "control",
+                    "fastq_1": "CTRL_1_R1.fastq.gz",
+                    "fastq_2": "CTRL_1_R2.fastq.gz",
+                },
+                {
+                    "sample_id": "CASE_1",
+                    "condition": "case",
+                    "fastq_1": "CASE_1_R1.fastq.gz",
+                    "fastq_2": "CASE_1_R2.fastq.gz",
+                },
+            ],
+        },
+        headers=h,
+    ).json()
+
+    assert "error_code" not in body, body
+    assert (tmp_path / "wiz_m" / "session.json").is_file()
+    import json
+
+    project_json = json.loads((tmp_path / "wiz_m" / "project.json").read_text(encoding="utf-8"))
+    assert [item["sample_id"] for item in project_json["samples"]["items"]] == ["CTRL_1", "CASE_1"]
+
+
+def test_fastq_session_duplicate_submit_returns_exists_without_rewrite(tmp_path: Path) -> None:
+    """Minor：重复提交返回 SESSION_EXISTS 且不改写 intake/session 落盘."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_n")
+    payload = {
+        "data_source": "remote_path",
+        "remote_fastq_dir": "/hwdata/home/yeyulin/demo_fastq",
+        "cancer_type": "crc",
+        "design": "independent_two_group",
+        "layout": "paired",
+        "samples": [
+            {"sample_id": "CTRL_1", "condition": "control", "fastq_1": "CTRL_1_R1.fastq.gz", "fastq_2": "CTRL_1_R2.fastq.gz"},
+            {"sample_id": "CASE_1", "condition": "case", "fastq_1": "CASE_1_R1.fastq.gz", "fastq_2": "CASE_1_R2.fastq.gz"},
+        ],
+    }
+    first = client.post("/api/projects/wiz_n/fastq/session", json=payload, headers=h).json()
+    assert "error_code" not in first, first
+
+    import json
+
+    project_dir = tmp_path / "wiz_n"
+    session_before = json.loads((project_dir / "session.json").read_text(encoding="utf-8"))
+    intake_before = json.loads((project_dir / "intake.json").read_text(encoding="utf-8"))
+
+    body = client.post("/api/projects/wiz_n/fastq/session", json=payload, headers=h).json()
+    assert body.get("error_code") == "SESSION_EXISTS", body
+    assert "已存在" in body.get("error", "")
+
+    session_after = json.loads((project_dir / "session.json").read_text(encoding="utf-8"))
+    intake_after = json.loads((project_dir / "intake.json").read_text(encoding="utf-8"))
+    assert session_after == session_before
+    assert intake_after == intake_before
