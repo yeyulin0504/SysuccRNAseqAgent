@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .project_intake import derive_visible_state
 from .storage import load_json, save_json
 
 WORKSPACE_FILE = "workspace.json"
@@ -80,7 +81,7 @@ class Workspace:
             if not include_archived and meta.get("archived"):
                 continue
             project_dir = self.project_dir(project_id)
-            state = meta.get("state") or _infer_state(project_dir)
+            state = derive_visible_state(project_dir, registry_state=meta.get("state"))
             rows.append(
                 {
                     "project_id": project_id,
@@ -109,7 +110,7 @@ class Workspace:
             "created_at": meta.get("created_at", ""),
             "updated_at": meta.get("updated_at", ""),
             "archived": bool(meta.get("archived")),
-            "state": meta.get("state") or _infer_state(project_dir),
+            "state": derive_visible_state(project_dir, registry_state=meta.get("state")),
             "description": meta.get("description", ""),
             "project_dir": str(project_dir),
         }
