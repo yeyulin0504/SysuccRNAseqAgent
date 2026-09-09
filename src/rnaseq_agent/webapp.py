@@ -57,7 +57,18 @@ from .threads import (
 )
 from .webchat import execute_intent, route_intent
 from .remote_transport import create_remote_transport, test_server_connection
-from .sample_detection import detect_fastq_pairs, read_counts_samples
+from .project_intake import (
+    append_history,
+    derive_visible_state,
+    history_items,
+    load_intake,
+    save_intake,
+)
+from .sample_detection import (
+    detect_fastq_pairs,
+    preview_expression_matrix,
+    read_counts_samples,
+)
 from .container_service import (
     ContainerSettingsError,
     build_pull_command,
@@ -286,6 +297,95 @@ def create_app(
         if workspace.get_project(project_id) is None:
             raise HTTPException(status_code=404, detail=f"项目 {project_id!r} 不存在。")
         return workspace.project_dir(project_id)
+
+    def _route_statuses() -> dict[str, dict[str, object]]:
+        """Wizard route cards: which analysis routes are runnable today."""
+        return {
+            "bulk_rna": {
+                "label": "bulk RNA-seq",
+                "available": True,
+                "capability_id": "workflow.bulk_rna.grch38_pe_expression_fusion",
+                "reason": "",
+            },
+            "wxs": {
+                "label": "WXS",
+                "available": False,
+                "capability_id": "workflow.wes.grch38_paired_somatic_small_variant",
+                "reason": "WXS 执行链尚未接入；当前仅展示输入要求。",
+            },
+            "scrna": {
+                "label": "scRNA-seq",
+                "available": False,
+                "capability_id": "analysis.scrna.scanpy_standard",
+                "reason": "scRNA 执行链尚未接入；当前仅展示 10x/h5ad/Seurat RDS 输入要求。",
+            },
+        }
+
+    def _create_counts_direct_session(
+        project_dir: Path,
+        project_id: str,
+        counts_path: Path,
+        samples: list[dict[str, Any]],
+        *,
+        enabled_diffexp: bool,
+        reference_condition: str = "",
+        enabled_cms: bool = False,
+        cancer_type: str = "",
+        design: str = "",
+    ) -> tuple[ProjectSession, dict[str, Any]]:
+        """Build a counts 直入 analysis session for an uploaded matrix.
+
+        Shared by the legacy ``POST /api/projects/{id}/counts`` multipart entry
+        and the wizard ``POST /api/projects/{id}/counts/session`` JSON entry:
+        both disable the FASTQ pipeline and leave only the conditional
+        downstream stages (diffexp now, CMS later) enabled.
+        """
+        uploads_dir = counts_path.parent
+        base = _default_config(project_dir, {"project_id": project_id})
+        base["samples"] = {
+            "source": "counts_upload",
+            "local_data_dir": str(uploads_dir),
+            "remote_data_dir": "AUTO",
+            "counts_path": str(counts_path),
+            "items": samples,
+        }
+        base["pipeline"].update(
+            {
+                # counts 直入：关闭 FASTQ 主流程，只保留下游条件开放阶段。
+                "fastp": {"enabled": False, "version": "0.24.1"},
+                "star": {"enabled": False, "version": "2.7.11b"},
+                "arriba": {"enabled": False, "version": "2.5.0"},
+                "featurecounts": {"enabled": False, "version": "Subread 2.1.1"},
+                "rsem": {"enabled": False, "version": "1.2.28"},
+                "diffexp": {"enabled": enabled_diffexp, "version": "DESeq2 1.40+ (R 4.2+)"},
+                "cms": {"enabled": enabled_cms, "version": "CMScaller 2.0"},
+            }
+        )
+        base["cms"] = {
+            "run_mode": "counts",
+            "n_perm": 1000,
+            "fdr": 0.05,
+            "seed": 20260907,
+            "do_plot": False,
+            "min_samples": 30,
+        }
+        base["study"].update(
+            {
+                "cancer_type": cancer_type or "pan_cancer",
+                "design": design or "independent_two_group",
+            }
+        )
+        if enabled_diffexp:
+            base["diffexp"] = {
+                "reference_condition": reference_condition,
+                "formula": "~ condition",
+                "min_replicates_per_group": 3,
+            }
+
+        session = ProjectSession(project_dir)
+        gate = session.new_project(base)
+        workspace.touch(project_id, session.state)
+        return session, {"state": session.state, "gate": gate.formatted()}
 
     def _bound_project_id(request: Request, body: dict[str, Any] | None = None) -> str | None:
         """Resolve an optional workspace project binding for a legacy ``/api/*`` call.
@@ -1059,6 +1159,226 @@ def create_app(
         except WorkspaceError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    # -- project wizard API（项目级多组学向导）--------------------------
+
+    @app.get("/api/projects/{project_id}/intake")
+    async def api_project_intake(project_id: str, request: Request):
+        """Project-scoped wizard state: setup progress + route cards + history."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        return {
+            "project_id": project_id,
+            "state": derive_visible_state(project_dir),
+            "intake": load_intake(project_dir),
+            "routes": _route_statuses(),
+            "history": history_items(project_dir),
+        }
+
+    @app.post("/api/projects/{project_id}/route")
+    async def api_project_route(project_id: str, request: Request):
+        """Record the chosen analysis route in the project intake.
+
+        Routes that are still reserved (available False) only record the
+        intent — they never create an analysis session, so the project stays
+        in the ``setup`` state until a runnable route's inputs arrive.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        route = str(payload.get("route") or "").strip()
+        route_info = _route_statuses().get(route)
+        if route_info is None:
+            return {"error": "未知 route。"}
+        save_intake(project_dir, {"route": route})
+        return {
+            "route": route,
+            "available": route_info["available"],
+            "state": "setup",
+            "reason": route_info["reason"],
+        }
+
+    @app.post("/api/projects/{project_id}/counts/preview")
+    async def api_project_counts_preview(project_id: str, request: Request):
+        """Upload + preview a counts / expression matrix for the project wizard.
+
+        Persists the file under ``uploads/<upload_id>_<safe_name>`` so a later
+        ``POST .../counts/session`` can read the same bytes back, records the
+        upload in the project intake / history, and returns the detection
+        preview (matrix type, samples, DESeq2 eligibility).
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None:
+            return {"error": "请选择 counts 文件。"}
+        content = await upload.read()
+        if not content:
+            return {"error": "上传的文件为空。"}
+
+        # -- persist the uploaded matrix --------------------------------
+        import re
+
+        uploads_dir = project_dir / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        upload_id = secrets.token_urlsafe(8)
+        raw_name = Path(upload.filename or "matrix.tsv").name
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).strip("._") or "matrix.tsv"
+        stored_name = f"{upload_id}_{safe_name}"
+        file_path = uploads_dir / stored_name
+        file_path.write_bytes(content)
+
+        # -- parse + record ---------------------------------------------
+        preview = preview_expression_matrix(content, filename=safe_name)
+        input_type = "counts_matrix" if preview["matrix_type"] == "raw_counts" else "expression_matrix"
+        save_intake(
+            project_dir,
+            {
+                "route": "bulk_rna",
+                "input_type": input_type,
+                "state": "input_ready",
+                "matrix_preview": preview,
+                "upload_id": upload_id,
+                # counts/session 需要回读上传文件：存落盘文件名以定位
+                # ``uploads/<stored_name>``。
+                "upload_file": stored_name,
+            },
+        )
+        append_history(
+            project_dir,
+            {
+                "type": "input_matrix",
+                "name": safe_name,
+                "state": "ready",
+                "details": {
+                    "matrix_type": preview["matrix_type"],
+                    "sample_count": preview.get("sample_count", 0),
+                },
+            },
+        )
+        return {
+            "upload_id": upload_id,
+            "preview": preview,
+            "state": "input_ready",
+            "history": history_items(project_dir),
+        }
+
+    @app.post("/api/projects/{project_id}/counts/session")
+    async def api_project_counts_session(project_id: str, request: Request):
+        """Turn a previously previewed matrix into a counts 直入 analysis session.
+
+        Reads the stored preview intake (upload file + matrix type), validates
+        that DESeq2 is only requested for raw counts, then reuses the counts
+        直入 config builder shared with the legacy ``/api/projects/{id}/counts``
+        endpoint so both entries produce identical sessions.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        upload_id = str(payload.get("upload_id") or "").strip()
+        intake = load_intake(project_dir)
+        matrix_preview = intake.get("matrix_preview")
+        if not upload_id or upload_id != intake.get("upload_id") or not isinstance(matrix_preview, dict):
+            return {"error_code": "NOT_FOUND", "message": "未找到该上传文件，请先预览矩阵。"}
+        upload_file = intake.get("upload_file")
+        uploads_dir = project_dir / "uploads"
+        counts_path = (
+            uploads_dir / str(upload_file)
+            if upload_file
+            else next(uploads_dir.glob(f"{upload_id}_*"), None)
+        )
+        if counts_path is None or not Path(counts_path).is_file():
+            return {"error_code": "NOT_FOUND", "message": "未找到该上传文件，请先预览矩阵。"}
+        counts_path = Path(counts_path)
+
+        matrix_type = str(matrix_preview.get("matrix_type") or "")
+        enabled_diffexp = bool(payload.get("enabled_diffexp"))
+        if enabled_diffexp and matrix_type != "raw_counts":
+            return {
+                "error_code": "NOT_EVALUABLE",
+                "message": "当前矩阵不是 raw counts，不能用于 DESeq2 raw counts 流程。",
+            }
+        if not enabled_diffexp:
+            return {"error_code": "NOT_EVALUABLE", "message": "请至少启用差异表达（DE）。"}
+
+        # -- build the counts 直入 session ------------------------------
+        raw_samples = payload.get("samples") or []
+        samples: list[dict[str, Any]] = []
+        for raw in raw_samples:
+            if not isinstance(raw, dict):
+                continue
+            sample_id = str(raw.get("sample_id") or "").strip()
+            condition = str(raw.get("condition") or "").strip()
+            if sample_id and condition:
+                samples.append({"sample_id": sample_id, "condition": condition})
+
+        # 建 session 前先做输入级校验：畸形 payload 在此被字段级错误拦截，
+        # 而不是放进 helper 内部门禁、以 drafting 假成功返回。
+        # 语义与 legacy POST /api/projects/{id}/counts 对齐（reference 显式必填）。
+        if not samples:
+            return {
+                "error_code": "NOT_EVALUABLE",
+                "message": "samples 至少需要 1 个非空的 sample_id/condition 样本。",
+            }
+        preview_sample_ids = [
+            str(sample) for sample in (matrix_preview.get("samples") or []) if str(sample).strip()
+        ]
+        seen_sample_ids: set[str] = set()
+        for sample in samples:
+            sample_id = sample["sample_id"]
+            if sample_id in seen_sample_ids:
+                return {
+                    "error_code": "NOT_EVALUABLE",
+                    "message": f"重复的样本 sample_id：{sample_id}。",
+                }
+            seen_sample_ids.add(sample_id)
+            if preview_sample_ids and sample_id not in preview_sample_ids:
+                return {
+                    "error_code": "NOT_EVALUABLE",
+                    "message": f"样本 {sample_id} 不在上传矩阵检测到的样本列中，"
+                    f"请基于预览结果填写样本：{preview_sample_ids}。",
+                }
+
+        reference_condition = str(payload.get("reference_condition") or "").strip()
+        # Finding 1：enabled_diffexp 时 reference_condition 显式必填，且必须落在
+        # 本批样本的 condition 集合中（与 helper 内部门禁 diffexp_design_checks
+        # 同语义，但放在 helper 之前、避免把畸形输入写进 project.json）。
+        if enabled_diffexp and not reference_condition:
+            return {
+                "error_code": "NOT_EVALUABLE",
+                "message": "启用差异表达必须显式提供 reference_condition。",
+            }
+        condition_set = sorted({str(sample["condition"]) for sample in samples})
+        if enabled_diffexp and reference_condition not in condition_set:
+            return {
+                "error_code": "NOT_EVALUABLE",
+                "message": f"reference_condition={reference_condition!r} 不在样本 condition 中："
+                f"{condition_set}。",
+            }
+
+        session, base_view = _create_counts_direct_session(
+            project_dir,
+            project_id,
+            counts_path,
+            samples,
+            enabled_diffexp=True,
+            reference_condition=reference_condition,
+        )
+        append_history(
+            project_dir,
+            {
+                "type": "sample_design",
+                "name": "样本分组",
+                "state": session.state,
+                "details": {"count": len(samples)},
+            },
+        )
+        return {
+            **base_view,
+            "counts_path": str(counts_path),
+            "history": history_items(project_dir),
+        }
+
     # -- threads API (per-project conversations) -------------------------
 
     @app.get("/api/projects/{project_id}/threads")
@@ -1236,8 +1556,8 @@ def create_app(
             if sample_id and condition:
                 samples.append({"sample_id": sample_id, "condition": condition})
 
-        base = _default_config(project_dir, {"project_id": project_id})
         # counts 直入固定参考路径由表单覆盖（用户可手填服务器路径）。
+        reference_overrides: dict[str, str] = {}
         for key, form_key in (
             ("remote_gtf_path", "gtf"),
             ("remote_genome_fasta_path", "genome_fasta"),
@@ -1246,55 +1566,30 @@ def create_app(
         ):
             value = str(form.get(form_key) or "").strip()
             if value:
-                base["reference"][key] = value
+                reference_overrides[key] = value
 
-        base["samples"] = {
-            "source": "counts_upload",
-            "local_data_dir": str(uploads_dir),
-            "remote_data_dir": "AUTO",
-            "counts_path": str(counts_path),
-            "items": samples,
-        }
-        base["pipeline"].update(
-            {
-                # counts 直入：关闭 FASTQ 主流程，只保留下游条件开放阶段。
-                "fastp": {"enabled": False, "version": "0.24.1"},
-                "star": {"enabled": False, "version": "2.7.11b"},
-                "arriba": {"enabled": False, "version": "2.5.0"},
-                "featurecounts": {"enabled": False, "version": "Subread 2.1.1"},
-                "rsem": {"enabled": False, "version": "1.2.28"},
-                "diffexp": {"enabled": enabled_diffexp, "version": "DESeq2 1.40+ (R 4.2+)"},
-                "cms": {"enabled": enabled_cms, "version": "CMScaller 2.0"},
-            }
+        session, base_view = _create_counts_direct_session(
+            project_dir,
+            project_id,
+            counts_path,
+            samples,
+            enabled_diffexp=enabled_diffexp,
+            reference_condition=reference,
+            enabled_cms=enabled_cms,
+            cancer_type=str(form.get("cancer_type") or "").strip(),
+            design=str(form.get("design") or "").strip(),
         )
-        base["cms"] = {
-            "run_mode": "counts",
-            "n_perm": 1000,
-            "fdr": 0.05,
-            "seed": 20260907,
-            "do_plot": False,
-            "min_samples": 30,
-        }
-        base["study"].update(
-            {
-                "cancer_type": str(form.get("cancer_type") or "").strip() or "pan_cancer",
-                "design": str(form.get("design") or "").strip() or "independent_two_group",
-            }
-        )
-        if enabled_diffexp:
-            base["diffexp"] = {
-                "reference_condition": reference,
-                "formula": "~ condition",
-                "min_replicates_per_group": 3,
-            }
+        if reference_overrides:
+            from .actions import load_project_config
+            from .storage import load_json, save_json
 
-        session = ProjectSession(project_dir)
-        gate = session.new_project(base)
-        workspace.touch(project_id, session.state)
+            config = load_json(session.config_path)
+            config.setdefault("reference", {}).update(reference_overrides)
+            save_json(session.config_path, config)
+            session.config = load_project_config(session.config_path)
         return {
-            "state": session.state,
+            **base_view,
             "counts_path": str(counts_path),
-            "gate": gate.formatted(),
             "cms_counts": True,
         }
 
