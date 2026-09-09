@@ -517,3 +517,235 @@ def test_index_labels_setup_state_for_new_projects(tmp_path: Path) -> None:
 
     projects = client.get("/api/projects", headers=h).json()["projects"]
     assert next(p for p in projects if p["project_id"] == "wiz_home")["state"] == "setup"
+
+
+def test_command_plan_uses_project_state(tmp_path: Path) -> None:
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_cmd")
+    matrix = b"gene\tA1\tA2\tA3\tB1\tB2\tB3\nG1\t1\t2\t3\t4\t5\t6\n"
+    preview = client.post(
+        "/api/projects/wiz_cmd/counts/preview",
+        files={"file": ("counts.tsv", matrix, "text/tab-separated-values")},
+        headers=h,
+    ).json()
+    client.post(
+        "/api/projects/wiz_cmd/counts/session",
+        json={
+            "upload_id": preview["upload_id"],
+            "enabled_diffexp": True,
+            "reference_condition": "B",
+            "samples": [
+                {"sample_id": "A1", "condition": "A"},
+                {"sample_id": "A2", "condition": "A"},
+                {"sample_id": "A3", "condition": "A"},
+                {"sample_id": "B1", "condition": "B"},
+                {"sample_id": "B2", "condition": "B"},
+                {"sample_id": "B3", "condition": "B"},
+            ],
+        },
+        headers=h,
+    )
+
+    body = client.post(
+        "/api/projects/wiz_cmd/command",
+        json={"command": "plan"},
+        headers=h,
+    ).json()
+
+    assert body["state"] == "planned"
+    assert body["action"] == "plan"
+
+
+# -- SDD Task 6 评审修复回归：统一 command 端点边界 --------------------
+
+import json as _json
+
+
+def _read_history_types(project_dir: Path) -> list[str]:
+    return [item["type"] for item in _read_history(project_dir)]
+
+
+def _read_history(project_dir: Path) -> list[dict]:
+    if not (project_dir / "history.json").is_file():
+        return []
+    return _json.loads((project_dir / "history.json").read_text(encoding="utf-8"))["items"]
+
+
+def _register_counts_session(client, token: str, project_id: str) -> None:
+    """Upload a raw matrix and bind a counts 直入 session (drafting)."""
+    upload_id = _preview_raw(client, token, project_id)
+    body = client.post(
+        f"/api/projects/{project_id}/counts/session",
+        json={
+            "upload_id": upload_id,
+            "enabled_diffexp": True,
+            "reference_condition": "B",
+            "samples": _raw_samples(),
+        },
+        headers=_headers(token),
+    ).json()
+    assert "error_code" not in body, body
+
+
+def test_command_confirm_records_contract_history(tmp_path: Path) -> None:
+    """Task 6 修复：confirm 成功 → state confirmed + history 尾 contract."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    project_id = "wiz_cmd_confirm"
+    _create_project(client, token, project_id)
+    _register_counts_session(client, token, project_id)
+
+    planned = client.post(
+        f"/api/projects/{project_id}/command",
+        json={"command": "plan"},
+        headers=h,
+    ).json()
+    assert planned["state"] == "planned", planned
+
+    body = client.post(
+        f"/api/projects/{project_id}/command",
+        json={"command": "confirm"},
+        headers=h,
+    ).json()
+
+    assert body["state"] == "confirmed", body
+    assert body["action"] == "confirm"
+    assert str(body["contract_id"]).startswith("sha256:")
+    assert body["history"][-1]["type"] == "contract"
+    assert body["history"][-1]["state"] == "confirmed"
+
+    # 落盘 session.json 也必须是 confirmed，而不是只在响应里改状态。
+    session = _json.loads(
+        (tmp_path / project_id / "session.json").read_text(encoding="utf-8")
+    )
+    assert session["state"] == "confirmed"
+
+
+def test_command_unknown_command_returns_error(tmp_path: Path) -> None:
+    """Task 6 修复：未知 command → UNKNOWN_COMMAND."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    project_id = "wiz_cmd_unknown"
+    _create_project(client, token, project_id)
+    _register_counts_session(client, token, project_id)
+
+    body = client.post(
+        f"/api/projects/{project_id}/command",
+        json={"command": "explode_the_planet"},
+        headers=h,
+    ).json()
+
+    assert body["error_code"] == "UNKNOWN_COMMAND", body
+
+
+def test_command_plan_without_session_returns_no_session(tmp_path: Path) -> None:
+    """Task 6 修复：从未建 session 的新项目发 command → NO_SESSION."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    project_id = "wiz_cmd_nosession"
+    _create_project(client, token, project_id)
+    assert not (tmp_path / project_id / "session.json").is_file()
+
+    body = client.post(
+        f"/api/projects/{project_id}/command",
+        json={"command": "plan"},
+        headers=h,
+    ).json()
+
+    assert body["error_code"] == "NO_SESSION", body
+
+
+def test_command_scan_failure_skips_history_and_reports_error(tmp_path: Path) -> None:
+    """Task 6 修复：scan_remote_fastq 失败 → NOT_EVALUABLE 且不写 fastq_scan history.
+
+    相对路径（非绝对 POSIX 路径）会被 _scan_remote_samples 直接返回
+    ok=False，不触碰真实 SSH，可稳定复现失败分支。
+    """
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    project_id = "wiz_cmd_scanfail"
+    _create_project(client, token, project_id)
+    _register_counts_session(client, token, project_id)
+
+    resp = client.post(
+        f"/api/projects/{project_id}/command",
+        json={"command": "scan_remote_fastq", "remote_fastq_dir": "relative/dir"},
+        headers=h,
+    )
+    body = resp.json()
+    assert resp.status_code == 200, body
+
+    assert body.get("ok") is False
+    assert body.get("error_code") == "NOT_EVALUABLE", body
+    assert "绝对 POSIX 路径" in body.get("message", "")
+    # 失败不得写入假成功的 fastq_scan/ready 审计事实。
+    types = _read_history_types(tmp_path / project_id)
+    assert "fastq_scan" not in types, types
+
+
+def test_command_rejects_non_dict_json_body(tmp_path: Path) -> None:
+    """Task 6 修复：json=[1,2] 不得 500，返回 INVALID_REQUEST."""
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    project_id = "wiz_cmd_badbody"
+    _create_project(client, token, project_id)
+
+    resp = client.post(
+        f"/api/projects/{project_id}/command",
+        json=[1, 2],
+        headers=h,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["error_code"] == "INVALID_REQUEST", body
+    assert "JSON 对象" in body.get("message", "")
+
+
+def test_command_scan_success_records_fastq_scan_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 6 修复回归：scan 成功分支仍必须写 fastq_scan/ready 审计 history.
+
+    打桩 _scan_remote_samples 返回 ok=True（避免真实 SSH），验证 ok 分支
+    的既有行为没有被这次修复破坏。
+    """
+    import rnaseq_agent.webapp as webapp
+
+    monkeypatch.setattr(
+        webapp,
+        "_scan_remote_samples",
+        lambda config, remote_dir: {
+            "ok": True,
+            "scanned_path": remote_dir,
+            "samples": [
+                {"sample_id": "CTRL_1", "fastq_1": "CTRL_1_R1.fastq.gz", "fastq_2": "CTRL_1_R2.fastq.gz"},
+                {"sample_id": "CASE_1", "fastq_1": "CASE_1_R1.fastq.gz", "fastq_2": "CASE_1_R2.fastq.gz"},
+            ],
+        },
+    )
+
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    project_id = "wiz_cmd_scansucc"
+    _create_project(client, token, project_id)
+    _register_counts_session(client, token, project_id)
+
+    body = client.post(
+        f"/api/projects/{project_id}/command",
+        json={"command": "scan_remote_fastq", "remote_fastq_dir": "/hwdata/reads"},
+        headers=h,
+    ).json()
+
+    assert body.get("ok") is True, body
+    assert body["action"] == "scan_remote_fastq"
+    assert body["history"][-1]["type"] == "fastq_scan"
+    assert body["history"][-1]["state"] == "ready"
+    assert body["history"][-1]["details"]["sample_count"] == 2

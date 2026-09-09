@@ -1460,6 +1460,82 @@ def create_app(
             "history": history_items(project_dir),
         }
 
+    # -- 统一 command 路由（按钮 + 对话快速动作共用）-------------------
+
+    @app.post("/api/projects/{project_id}/command")
+    async def api_project_command(project_id: str, request: Request):
+        """Route a wizard action (plan/confirm/set_route/scan_remote_fastq)
+        against a registered project, returning its new state + history.
+
+        Buttons and chat quick-actions call the same command endpoint so state
+        transitions stay auditable and intake/history stay in sync.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        # Finding：非 dict JSON body（如 json=[1,2]）不得以 AttributeError 抛 500；
+        # counts/session(:1277) 与 fastq/session(:1395) 同样存在此守卫缺口，
+        # 本轮只修 command 端点，避免扩大改动面。
+        if not isinstance(payload, dict):
+            return {"error_code": "INVALID_REQUEST", "message": "请求体必须是 JSON 对象。"}
+        command = str(payload.get("command") or "").strip()
+
+        if command == "set_route":
+            route = str(payload.get("route") or "").strip()
+            info = _route_statuses().get(route)
+            if info is None:
+                return {"error_code": "UNKNOWN_ROUTE", "message": f"未知 route：{route}"}
+            save_intake(project_dir, {"route": route})
+            append_history(project_dir, {"type": "route", "name": str(info["label"]), "state": "ready",
+                                         "details": {"available": bool(info["available"])}})
+            return {"state": derive_visible_state(project_dir), "action": "set_route", "route": route,
+                    "available": bool(info["available"]), "history": history_items(project_dir)}
+
+        if command == "scan_remote_fastq":
+            remote_dir = str(payload.get("remote_fastq_dir") or "").strip()
+            if not remote_dir:
+                return {"error_code": "NOT_EVALUABLE", "message": "远程样本目录不能为空。"}
+            session = _session_for(project_dir)
+            if session.config is None:
+                return {"error_code": "NO_SESSION", "message": "项目还没有分析会话，请先创建输入会话。"}
+            try:
+                result = _scan_remote_samples(session.config, remote_dir)
+            except SessionError as exc:
+                return {"error_code": "NOT_EVALUABLE", "message": str(exc)}
+            # Finding：_scan_remote_samples 对失败返回 {ok:False,...} 而不抛异常；
+            # 只有 ok=True 才把 fastq_scan/ready 写进审计 history，失败必须透传
+            # 给调用者，绝不把失败记为成功事实。
+            if not result.get("ok"):
+                return {**result, "error_code": "NOT_EVALUABLE",
+                        "action": "scan_remote_fastq", "history": history_items(project_dir)}
+            append_history(project_dir, {"type": "fastq_scan", "name": remote_dir or "remote_scan",
+                                         "state": "ready", "details": {"sample_count": len(result.get("samples", []))}})
+            return {**result, "action": "scan_remote_fastq", "history": history_items(project_dir)}
+
+        # plan / confirm: drive the audited session state machine.
+        session = _session_for(project_dir)
+        if session.config is None:
+            return {"error_code": "NO_SESSION", "message": "项目还没有分析会话，请先创建输入会话。"}
+        try:
+            if command == "plan":
+                plan = session.plan()
+                workspace.touch(project_id, session.state)
+                append_history(project_dir, {"type": "analysis_plan", "name": "执行计划", "state": session.state,
+                                             "details": {"step_count": len(plan.steps)}})
+                return {"state": session.state, "action": "plan", "steps": plan.steps,
+                        "summary": getattr(plan, "summary", None), "history": history_items(project_dir)}
+            if command == "confirm":
+                contract = session.confirm()
+                workspace.touch(project_id, session.state)
+                append_history(project_dir, {"type": "contract", "name": "契约", "state": session.state,
+                                             "details": {"contract_id": contract["contract_id"]}})
+                return {"state": session.state, "action": "confirm", "contract_id": contract["contract_id"],
+                        "history": history_items(project_dir)}
+        except SessionError as exc:
+            return {"error_code": "NOT_EVALUABLE", "message": str(exc)}
+
+        return {"error_code": "UNKNOWN_COMMAND", "message": "该动作不在允许列表中。"}
+
     # -- threads API (per-project conversations) -------------------------
 
     @app.get("/api/projects/{project_id}/threads")

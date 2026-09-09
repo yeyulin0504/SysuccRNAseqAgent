@@ -1051,10 +1051,12 @@ function renderSampleDesignStatus(d) {
   el.innerHTML = lines.join("");
 }
 
-/* ---------- plan / confirm / rollback（保留 legacy 路径） ---------- */
+/* ---------- plan / confirm 走统一 command 端点；rollback 保留 legacy ---------- */
 function doPlan() {
-  api("POST", legacy("/api/plan")).then(d => {
+  if (!currentProject) { alert("请先选择一个项目。"); return; }
+  api("POST", wizardPath("/command"), { command: "plan" }).then(d => {
     const el = document.getElementById("planSteps");
+    if (d.error_code) { if (el) el.innerHTML = `<span class="err">${escapeHtml(d.message || d.error_code)}</span>`; return; }
     if (d.error) { if (el) el.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`; return; }
     if (el) el.innerHTML = (d.steps || []).map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
     if (d.state) setState(d.state);
@@ -1064,10 +1066,12 @@ function doPlan() {
 }
 
 function doConfirm() {
-  api("POST", legacy("/api/confirm")).then(d => {
+  if (!currentProject) { alert("请先选择一个项目。"); return; }
+  api("POST", wizardPath("/command"), { command: "confirm" }).then(d => {
+    if (d.error_code) { alert(d.message || d.error_code); return; }
     if (d.error) { alert(d.error); return; }
     const el = document.getElementById("planSteps");
-    if (el) el.innerHTML += `<div class="step ok">契约已冻结：${escapeHtml(String(d.contract_id).slice(0, 24))}…</div>`;
+    if (el) el.innerHTML += `<div class="step ok">契约已冻结：${escapeHtml(String(d.contract_id || "").slice(0, 24))}…</div>`;
     if (d.state) setState(d.state);
     loadWizardData();
   });
@@ -1088,7 +1092,7 @@ function resumeQc() {
     });
 }
 
-/* ---------- Agent 对话（#agentConversation，走既有 /api/chat） ---------- */
+/* ---------- Agent 对话（#agentConversation） ---------- */
 function appendChatLine(role, text) {
   const el = document.getElementById("chatMessages");
   if (!el) return;
@@ -1108,10 +1112,54 @@ function sendChat() {
   chatRequest(q);
 }
 
+/* 快速动作路由：可映射为统一 command 的文案先试 command 端点，其余回落 /api/chat。
+   - 生成执行计划 → 状态机动作（同一 command 端点，可审计）
+   - 浏览服务器目录 / 解释门禁 → 依赖 SSH/上下文，无状态写，保留对话语义
+   输入既有命令文本又需要被 quickChat 记录时，经 commandAction 换回复。
+   注：quickChat 全模板只被「生成计划 / 解释当前门禁 / 浏览我的服务器目录」
+   三枚按钮调用，sendChat 自由输入不查本表，故仅保留可达键「生成执行计划」，
+   「生成计划 / 确认 / 确认并冻结契约」等死键已移除（自由文本计划走 /api/chat）。 */
+const CHAT_COMMAND_MAP = {
+  "生成执行计划": "plan",
+};
+
 function quickChat(text) {
   if (!currentProject) { alert("请先选择项目。"); return; }
   appendChatLine("你", text);
+  const mapped = CHAT_COMMAND_MAP[text.trim()];
+  if (mapped) { commandAction(mapped); return; }
   chatRequest(text);
+}
+
+/* 由统一 command 端点执行状态机动作（按钮 doPlan/doConfirm 与对话快速动作共用）。 */
+function commandAction(command) {
+  if (!currentProject) { alert("请先选择项目。"); return; }
+  const reply = document.getElementById("chatReply");
+  if (reply) reply.innerHTML = "<span class='muted'>Agent：处理中…</span>";
+  api("POST", wizardPath("/command"), { command }).then(d => {
+    if (d.error_code) {
+      if (reply) reply.innerHTML = `<span class="err">${escapeHtml(d.message || d.error_code)}</span>`;
+      return;
+    }
+    if (d.error) {
+      if (reply) reply.innerHTML = `<span class="err">${escapeHtml(d.error)}</span>`;
+      return;
+    }
+    let text = command === "plan"
+      ? `已生成执行计划（${(d.steps || []).length} 步）。请在「生成执行计划」下方审阅，然后点「确认并冻结契约」。`
+      : `契约已冻结：${escapeHtml(String(d.contract_id || "").slice(0, 24))}…`;
+    if (reply) reply.innerHTML = "<b>Agent（规则）：</b>" + escapeHtml(text);
+    const el = document.getElementById("planSteps");
+    if (d.steps && el && command === "plan") {
+      el.innerHTML = d.steps.map(s => `<div class="step">${escapeHtml(s)}</div>`).join("");
+    }
+    if (d.state) setState(d.state);
+    if (d.history) loadHistoryFrom(d.history);
+    refreshAll();
+    loadWizardData();
+  }).catch(err => {
+    if (reply) reply.innerHTML = "<span class='err'>请求失败：" + escapeHtml(String(err)) + "</span>";
+  });
 }
 
 function chatRequest(q) {
