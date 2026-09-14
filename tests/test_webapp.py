@@ -714,3 +714,209 @@ class TestWebApp:
         # Rule router takes over.
         assert resp.get("state") == "planned"
         assert "steps" in resp
+
+
+class TestSharedLlmConfig:
+    """大模型接入也是「配一次、所有项目共用、永久保存」。
+
+    用户实际遇到的问题：在设置页配好了大模型，但对话仍返回规则式兜底
+    答复（「我还没理解成可执行操作…」）。根因是 LLM 配置存在各项目自己的
+    ``project.json`` 里，而用户当前打开的项目没有该文件，于是 ``/api/chat``
+    的 ``if config is not None`` 直接跳过了 LLM 分支。
+    """
+
+    def test_saving_llm_in_settings_persists_to_shared_store(self, client) -> None:
+        from rnaseq_agent.connection_store import load_llm
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={
+                "llm": {
+                    "enabled": True,
+                    "provider": "paratera",
+                    "api_base": "https://llmapi.paratera.com/v1",
+                    "model": "DeepSeek-V4-Flash",
+                    "api_key": "sk-shared-key",
+                }
+            },
+            headers=_headers(token),
+        )
+
+        stored = load_llm()
+
+        assert stored["enabled"] is True
+        assert stored["provider"] == "paratera"
+        assert stored["api_base"] == "https://llmapi.paratera.com/v1"
+        assert stored["model"] == "DeepSeek-V4-Flash"
+        assert stored["api_key"] == "sk-shared-key"
+        # 明文绝不能落盘。
+        from rnaseq_agent.connection_store import connection_file_path
+
+        assert "sk-shared-key" not in connection_file_path().read_text(encoding="utf-8")
+
+    def test_chat_uses_shared_llm_when_project_has_no_config(self, client, monkeypatch) -> None:
+        """核心回归：项目尚未创建（无 project.json）时也必须走 LLM。"""
+        import requests
+
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        # 用户已在设置页配过全局大模型，但当前没有任何项目。
+        save_llm(
+            {
+                "enabled": True,
+                "provider": "paratera",
+                "api_base": "https://llmapi.paratera.com/v1",
+                "model": "DeepSeek-V4-Flash",
+                "api_key": "sk-shared-key",
+            }
+        )
+
+        calls = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls["url"] = url
+            calls["auth"] = headers.get("Authorization")
+            calls["model"] = json["model"]
+
+            class FakeResp:
+                status_code = 200
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "我看到了你的问题。"}}]}
+
+            return FakeResp()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+        resp = client.post(
+            "/api/chat",
+            json={"message": "RNA-seq 分析一般需要多少生物学重复？"},
+            headers=_headers(token),
+        ).json()
+
+        assert resp["reply"] == "我看到了你的问题。", resp
+        assert resp["via"] == "llm"
+        assert calls["url"] == "https://llmapi.paratera.com/v1/chat/completions"
+        assert calls["auth"] == "Bearer sk-shared-key"
+
+    def test_new_project_inherits_shared_llm(self, client) -> None:
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        save_llm(
+            {
+                "enabled": True,
+                "api_base": "https://llm.example/v1",
+                "model": "shared-model",
+                "api_key": "sk-shared",
+            }
+        )
+
+        resp = client.post(
+            "/api/new",
+            json={
+                "project_id": "llm_inherit",
+                "title": "llm inherit",
+                "samples": [{"sample_id": "a", "condition": "ctrl", "fastq_1": "a_R1.fastq.gz"}],
+            },
+            headers=_headers(token),
+        )
+        assert "error" not in resp.json()
+
+        cfg = client.get("/api/config", headers=_headers(token)).json()["config"]
+        assert cfg["llm"]["enabled"] is True
+        assert cfg["llm"]["model"] == "shared-model"
+        assert cfg["llm"]["api_key_set"] is True
+        # 下发到前端时 api_key 必须被抹掉。
+        assert "api_key" not in cfg["llm"]
+
+    def test_config_get_reports_shared_llm_before_any_project_exists(self, client) -> None:
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        save_llm(
+            {"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"}
+        )
+
+        cfg = client.get("/api/config", headers=_headers(token)).json()["config"]
+
+        assert cfg["llm"]["enabled"] is True
+        assert cfg["llm"]["api_base"] == "https://llm.example/v1"
+        assert cfg["llm"]["api_key_set"] is True
+
+    def test_llm_models_endpoint_works_with_shared_llm_only(self, client, monkeypatch) -> None:
+        import requests
+
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        save_llm({"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"})
+
+        class Response:
+            status_code = 200
+
+            def json(self):
+                return {"data": [{"id": "model-b"}, {"id": "model-a"}]}
+
+            def raise_for_status(self):
+                return None
+
+        def fake_get(url, **kwargs):
+            assert url == "https://llm.example/v1/models"
+            assert kwargs["headers"]["Authorization"] == "Bearer sk-1"
+            return Response()
+
+        monkeypatch.setattr(requests, "get", fake_get)
+        result = client.get("/api/llm/models", headers=_headers(token)).json()
+
+        assert result == {"ok": True, "models": ["model-a", "model-b"]}
+
+    def test_project_specific_llm_is_not_overwritten_by_shared(self, client) -> None:
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"llm": {"enabled": True, "api_base": "https://project.example/v1", "model": "project-model",
+                          "api_key": "sk-project"}},
+            headers=_headers(token),
+        )
+        # 之后再改全局：不应覆盖项目里已经明确填过的模型与地址。
+        save_llm({"enabled": True, "api_base": "https://shared.example/v1", "model": "shared-model"})
+
+        cfg = client.get("/api/config", headers=_headers(token)).json()["config"]
+
+        assert cfg["llm"]["api_base"] == "https://project.example/v1"
+        assert cfg["llm"]["model"] == "project-model"
+
+    def test_shared_llm_enables_chat_reply_without_action(self, client, monkeypatch) -> None:
+        """用户截图里的现象：纯提问得到「我还没理解成可执行操作」。
+
+        配好全局大模型后，同一句话应得到模型答复而不是规则兜底。
+        """
+        import requests
+
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        save_llm({"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"})
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            class FakeResp:
+                status_code = 200
+
+                def json(self):
+                    return {"choices": [{"message": {"content": "这是模型给出的解释。"}}]}
+
+            return FakeResp()
+
+        monkeypatch.setattr(requests, "post", fake_post)
+        reply = client.post(
+            "/api/chat", json={"message": "这个流程大概要跑多久"}, headers=_headers(token)
+        ).json()
+
+        assert reply["reply"] == "这是模型给出的解释。"
+        assert "我还没理解成可执行操作" not in reply["reply"]

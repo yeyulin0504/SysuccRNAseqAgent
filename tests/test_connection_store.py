@@ -17,10 +17,13 @@ import pytest
 from rnaseq_agent.connection_store import (
     CONNECTION_FILE_NAME,
     apply_connection_to_config,
+    apply_llm_to_config,
     clear_password,
     connection_file_path,
     load_connection,
+    load_llm,
     save_connection,
+    save_llm,
 )
 
 
@@ -180,3 +183,110 @@ class TestApplyToConfig:
         apply_connection_to_config(config, {"host": "10.0.0.1"})
 
         assert config["server"]["host"] == "localhost"
+
+
+class TestLlmStore:
+    """大模型接入同样是「配一次、所有项目共用、永久保存」。
+
+    用户的诉求是：在设置页填过大模型（provider / api_base / model / key）
+    之后，任何项目里的对话都应走 LLM，而不是回退成规则式答复。因此 LLM
+    配置与服务器连接一样存进用户级配置文件，api_key 同样 DPAPI 加密。
+    """
+
+    def test_round_trips_llm_fields(self, store_dir: Path) -> None:
+        save_llm(
+            {
+                "enabled": True,
+                "provider": "paratera",
+                "api_base": "https://llmapi.paratera.com/v1",
+                "model": "DeepSeek-V4-Flash",
+            },
+            store_dir=store_dir,
+        )
+
+        loaded = load_llm(store_dir=store_dir)
+
+        assert loaded["enabled"] is True
+        assert loaded["provider"] == "paratera"
+        assert loaded["api_base"] == "https://llmapi.paratera.com/v1"
+        assert loaded["model"] == "DeepSeek-V4-Flash"
+
+    def test_api_key_is_never_stored_in_plaintext(self, store_dir: Path) -> None:
+        save_llm({"api_key": "sk-TopSecret123"}, store_dir=store_dir)
+
+        raw = (store_dir / CONNECTION_FILE_NAME).read_text(encoding="utf-8")
+        assert "sk-TopSecret123" not in raw
+
+    def test_api_key_round_trips_through_encryption(self, store_dir: Path) -> None:
+        save_llm({"enabled": True, "api_key": "sk-TopSecret123"}, store_dir=store_dir)
+
+        assert load_llm(store_dir=store_dir)["api_key"] == "sk-TopSecret123"
+
+    def test_blank_api_key_keeps_the_stored_one(self, store_dir: Path) -> None:
+        save_llm({"api_key": "sk-original"}, store_dir=store_dir)
+        save_llm({"model": "m2"}, store_dir=store_dir)
+
+        loaded = load_llm(store_dir=store_dir)
+
+        assert loaded["api_key"] == "sk-original"
+        assert loaded["model"] == "m2"
+
+    def test_explicit_clear_drops_api_key(self, store_dir: Path) -> None:
+        save_llm({"api_key": "sk-original"}, store_dir=store_dir)
+        save_llm({"api_key": ""}, store_dir=store_dir)
+
+        assert not load_llm(store_dir=store_dir).get("api_key")
+
+    def test_llm_and_connection_coexist_in_one_file(self, store_dir: Path) -> None:
+        save_connection({"host": "h", "user": "u"}, store_dir=store_dir)
+        save_llm({"enabled": True, "model": "m"}, store_dir=store_dir)
+
+        assert load_connection(store_dir=store_dir)["host"] == "h"
+        assert load_llm(store_dir=store_dir)["model"] == "m"
+
+    def test_load_llm_missing_file_returns_empty(self, store_dir: Path) -> None:
+        assert load_llm(store_dir=store_dir) == {}
+
+
+class TestApplyLlmToConfig:
+    def test_fills_empty_llm_block(self) -> None:
+        config = {"project": {"id": "demo01"}, "llm": {"enabled": False, "api_key": ""}}
+
+        merged = apply_llm_to_config(
+            config,
+            {"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "k"},
+        )
+
+        assert merged["llm"]["enabled"] is True
+        assert merged["llm"]["api_base"] == "https://llm.example/v1"
+        assert merged["llm"]["api_key"] == "k"
+        assert merged["project"]["id"] == "demo01"
+
+    def test_project_specific_llm_wins_over_shared(self) -> None:
+        config = {"llm": {"enabled": False, "model": "project-model"}}
+
+        merged = apply_llm_to_config(config, {"enabled": True, "model": "shared-model"})
+
+        assert merged["llm"]["model"] == "project-model"
+        assert merged["llm"]["enabled"] is True  # 共享的 enabled 补齐
+
+    def test_empty_shared_llm_leaves_config_untouched(self) -> None:
+        config = {"llm": {"model": "project-model"}}
+
+        merged = apply_llm_to_config(config, {})
+
+        assert merged["llm"]["model"] == "project-model"
+
+    def test_does_not_mutate_input_config(self) -> None:
+        config = {"llm": {"model": ""}}
+        apply_llm_to_config(config, {"model": "shared"})
+
+        assert config["llm"]["model"] == ""
+
+    def test_secret_is_not_leaked_into_config_by_connection_merge(self) -> None:
+        config = {"llm": {"model": "m"}}
+        merged = apply_llm_to_config(config, {"api_key": "sk-secret"})
+
+        # 需要 api_key 才能调用 LLM，因此它必须进入运行时 config；
+        # 但 _editable_config 负责在下发前端前抹掉它（见 webapp 测试）。
+        assert merged["llm"]["api_key"] == "sk-secret"

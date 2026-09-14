@@ -1,16 +1,17 @@
-"""跨项目共享的服务器连接配置（配一次，所有项目复用）。
+"""跨项目共享的服务器连接与大模型配置（配一次，所有项目复用）。
 
 设计目标（用户需求 2026-09-14）：
 
-- **配一次**：连接信息只填一次，之后新建的任何项目自动继承；
-- **永久保存**：进程重启后仍然生效，不需要重新输入密码。
+- **配一次**：服务器连接与大模型接入只填一次，之后任何项目自动继承；
+- **永久保存**：进程重启后仍然生效，不需要重新输入密码 / API Key。
 
 落点是一个用户级配置文件，默认 ``~/.rnaseq_agent/connection.json``；
 可用环境变量 ``RNASEQ_AGENT_HOME`` 覆盖其所在目录（测试与便携部署用）。
+服务器连接字段平铺在顶层，大模型配置放在 ``llm`` 子对象里。
 
-密码处理：在 Windows 上用 DPAPI（``CryptProtectData``）加密，密文只能被
-当前 Windows 用户解密，把文件拷到别的机器也无法还原明文；其他平台在
-没有系统密钥环时退化为「仅存连接信息、不存密码」，并在返回值里标记。
+密码与 API Key 的处理：在 Windows 上用 DPAPI（``CryptProtectData``）加密，
+密文只能被当前 Windows 用户解密，把文件拷到别的机器也无法还原明文；其他
+平台在没有系统密钥环时退化为「仅存非敏感字段、不存秘密」。
 """
 
 from __future__ import annotations
@@ -42,6 +43,12 @@ SHARED_FIELDS = (
 )
 
 _PASSWORD_KEY = "password_protected"
+
+# 大模型接入（OpenAI 兼容端点）同样是用户级共享配置：存在同一个文件的
+# ``llm`` 子对象里，API Key 与密码用同一套 DPAPI 加密。
+LLM_BLOCK_KEY = "llm"
+LLM_FIELDS = ("enabled", "provider", "api_base", "model")
+_LLM_API_KEY_KEY = "api_key_protected"
 
 
 def connection_home() -> Path:
@@ -123,17 +130,29 @@ def _resolve_store_dir(store_dir: Path | None) -> Path:
     return Path(store_dir) if store_dir is not None else connection_home()
 
 
-def load_connection(*, store_dir: Path | None = None) -> dict[str, Any]:
-    """Return the stored connection, with the password decrypted when possible."""
-    path = _resolve_store_dir(store_dir) / CONNECTION_FILE_NAME
+def _read_payload(directory: Path) -> dict[str, Any]:
+    """Read the raw JSON payload, tolerating a missing or corrupt file."""
+    path = directory / CONNECTION_FILE_NAME
     if not path.is_file():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    if not isinstance(payload, dict):
-        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_payload(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def load_connection(*, store_dir: Path | None = None) -> dict[str, Any]:
+    """Return the stored connection, with the password decrypted when possible."""
+    payload = _read_payload(_resolve_store_dir(store_dir))
     result = {k: v for k, v in payload.items() if k in SHARED_FIELDS and v is not None}
     token = payload.get(_PASSWORD_KEY)
     if isinstance(token, str) and token:
@@ -153,16 +172,7 @@ def save_connection(values: dict[str, Any], *, store_dir: Path | None = None) ->
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONNECTION_FILE_NAME
 
-    existing: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                existing = raw
-        except (OSError, ValueError):
-            existing = {}
-
-    merged = dict(existing)
+    merged = dict(_read_payload(directory))
     auth_mode = str(values.get("auth_mode") or merged.get("auth_mode") or "key")
     for key in SHARED_FIELDS:
         if key in values and values[key] is not None:
@@ -177,11 +187,7 @@ def save_connection(values: dict[str, Any], *, store_dir: Path | None = None) ->
     if auth_mode != "password":
         merged.pop(_PASSWORD_KEY, None)
 
-    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    _write_payload(path, merged)
     return load_connection(store_dir=store_dir)
 
 
@@ -191,14 +197,89 @@ def clear_password(*, store_dir: Path | None = None) -> None:
     path = directory / CONNECTION_FILE_NAME
     if not path.is_file():
         return
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if not isinstance(payload, dict):
+    payload = _read_payload(directory)
+    if not payload:
         return
     payload.pop(_PASSWORD_KEY, None)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_llm(*, store_dir: Path | None = None) -> dict[str, Any]:
+    """Return the shared LLM settings, with the API key decrypted when possible."""
+    payload = _read_payload(_resolve_store_dir(store_dir))
+    block = payload.get(LLM_BLOCK_KEY)
+    if not isinstance(block, dict):
+        return {}
+    result = {key: block[key] for key in LLM_FIELDS if block.get(key) is not None}
+    token = block.get(_LLM_API_KEY_KEY)
+    if isinstance(token, str) and token:
+        secret = _unprotect(token)
+        if secret:
+            result["api_key"] = secret
+    return result
+
+
+def save_llm(values: dict[str, Any], *, store_dir: Path | None = None) -> dict[str, Any]:
+    """Merge LLM ``values`` into the user-level store and persist them.
+
+    Secret handling mirrors ``save_connection``: a non-empty ``api_key`` is
+    encrypted, omitting the key keeps whatever was stored, and an explicit
+    empty string clears it.
+    """
+    directory = _resolve_store_dir(store_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / CONNECTION_FILE_NAME
+    payload = _read_payload(directory)
+
+    block = payload.get(LLM_BLOCK_KEY)
+    if not isinstance(block, dict):
+        block = {}
+    for key in LLM_FIELDS:
+        if key in values and values[key] is not None:
+            block[key] = values[key]
+
+    if "api_key" in values:
+        new_key = str(values.get("api_key") or "")
+        if new_key:
+            block[_LLM_API_KEY_KEY] = _protect(new_key)
+        else:
+            block.pop(_LLM_API_KEY_KEY, None)
+
+    payload[LLM_BLOCK_KEY] = block
+    _write_payload(path, payload)
+    return load_llm(store_dir=store_dir)
+
+
+def apply_llm_to_config(config: dict[str, Any], shared: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``config`` whose ``llm`` block inherits ``shared``.
+
+    Project-level values win when they are already set; the shared block only
+    fills the gaps. ``enabled`` is the exception: it is an OR, because enabling
+    the model is a user-level decision (「配一次，所有项目共用」) and a project
+    that merely defaulted to ``False`` must not cancel it.
+    """
+    from copy import deepcopy
+
+    merged = deepcopy(config)
+    if not shared:
+        return merged
+    block = merged.get("llm")
+    if not isinstance(block, dict):
+        block = {}
+    for key in LLM_FIELDS:
+        value = shared.get(key)
+        if value is None or value == "":
+            continue
+        if key == "enabled":
+            block[key] = bool(block.get(key)) or bool(value)
+            continue
+        if block.get(key) not in (None, ""):
+            continue
+        block[key] = value
+    if not block.get("api_key") and shared.get("api_key"):
+        block["api_key"] = shared["api_key"]
+    merged["llm"] = block
+    return merged
 
 
 def apply_connection_to_config(

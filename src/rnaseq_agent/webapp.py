@@ -75,7 +75,14 @@ from .container_service import (
     build_test_command,
     validate_image_settings,
 )
-from .connection_store import apply_connection_to_config, load_connection, save_connection
+from .connection_store import (
+    apply_connection_to_config,
+    apply_llm_to_config,
+    load_connection,
+    load_llm,
+    save_connection,
+    save_llm,
+)
 from .ssh_auth import get_ssh_credential, normalize_auth_mode, set_ssh_credential
 from .workspace import Workspace, WorkspaceError
 
@@ -90,11 +97,24 @@ def _default_workspace_dir() -> Path:
 def _session_for(project_dir: Path) -> ProjectSession:
     session = ProjectSession(project_dir)
     session.load_session()
-    # 用户级共享连接：所有项目共用同一套服务器配置（配一次即可）。仅在项目
-    # 已有配置时在内存中覆盖 server 块，不回写磁盘，避免污染项目自身记录。
+    # 用户级共享连接与大模型：所有项目共用同一套配置（配一次即可）。仅在
+    # 项目已有配置时在内存中覆盖，不回写磁盘，避免污染项目自身记录。
     if session.config is not None:
         session.config = apply_connection_to_config(session.config, load_connection())
+        session.config = apply_llm_to_config(session.config, load_llm())
     return session
+
+
+def _shared_llm_config() -> dict[str, Any] | None:
+    """全局大模型配置包装成 ``{"llm": ...}``，供 LLM helper 直接消费。
+
+    项目尚未创建（无 project.json）时，``session.config is None``；此时对话
+    仍应走用户已配好的全局大模型，而不是回退成规则式答复。
+    """
+    shared = load_llm()
+    if not shared.get("enabled") or not shared.get("api_key") or not shared.get("api_base"):
+        return None
+    return {"llm": shared}
 
 
 def _connection_as_config() -> dict[str, Any] | None:
@@ -152,6 +172,9 @@ def _session_view(session: ProjectSession) -> dict[str, Any]:
 
 def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
     """Surface only the fields the web form may edit, never the api_key."""
+    # 大模型配置也是用户级共享的：项目里缺失的字段用全局配置补齐，设置页
+    # 与后端看到同一套 provider / api_base / model 与「key 已保存」状态。
+    config = apply_llm_to_config(config, load_llm())
     llm = config.get("llm", {})
     # 连接信息是用户级共享的：项目里缺失的字段用全局连接补齐，UI 与后端
     # 逻辑才能看到同一套 host / 目录，不必在每个项目里重复填写。
@@ -879,9 +902,12 @@ def create_app(
         _restore_runtime_credential()
         session = _session_for(_legacy_dir_for(request))
         if session.config is None:
-            # 项目尚未创建：仍回显全局连接，设置页不会显示成空白。
+            # 项目尚未创建：仍回显全局连接与大模型，设置页不会显示成空白。
             shared = load_connection()
-            return {"config": _editable_config({"server": shared}) if shared else None}
+            shared_llm = load_llm()
+            if not shared and not shared_llm:
+                return {"config": None}
+            return {"config": _editable_config({"server": shared, "llm": shared_llm})}
         return {"config": _editable_config(session.config)}
 
     @app.post("/api/config")
@@ -949,6 +975,11 @@ def create_app(
                 patch["llm"] = llm_patch
                 note_parts.append(
                     "大模型接入：" + (f"启用 {llm_patch.get('model', '')}" if llm_patch.get("enabled") else "更新")
+                )
+                # 大模型接入同样是用户级、跨项目共用的：同步写入全局配置并
+                # 持久化（API Key 经 DPAPI 加密），这样任何项目、重启后都生效。
+                save_llm(
+                    {k: v for k, v in llm_patch.items() if k in ("enabled", "provider", "api_base", "model", "api_key")}
                 )
 
         container = payload.get("container")
@@ -1073,7 +1104,11 @@ def create_app(
 
     def _configured_llm(request: Request) -> dict[str, Any] | None:
         session = _session_for(_legacy_dir_for(request))
-        return (session.config or {}).get("llm") if session.config else None
+        # _session_for 已把全局大模型合并进项目配置；项目尚未创建时直接
+        # 用全局配置，设置页与「拉取模型 / 测试连接」在无项目时也可用。
+        if session.config is None:
+            return load_llm() or None
+        return (session.config or {}).get("llm")
 
     @app.get("/api/llm/models")
     async def api_llm_models(request: Request):
@@ -1192,8 +1227,11 @@ def create_app(
             }
 
         # 1) LLM path (when enabled and reachable).
-        if config is not None:
-            llm_reply = _llm_reply_or_none(config, text)
+        # 大模型配置是用户级共享的：项目里没有 project.json 时回退到全局
+        # 配置，用户配一次之后任何对话都能拿到模型答复。
+        llm_config = config if config is not None else _shared_llm_config()
+        if llm_config is not None:
+            llm_reply = _llm_reply_or_none(llm_config, text)
             if llm_reply:
                 return {"state": session.state, "reply": llm_reply, "via": "llm"}
 
