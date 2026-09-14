@@ -25,7 +25,9 @@ pytestmark = pytest.mark.skipif(fastapi_missing, reason="fastapi/httpx not insta
 
 
 @pytest.fixture
-def client(tmp_path: Path):
+def client(tmp_path: Path, monkeypatch):
+    # 隔离全局连接配置目录，避免测试污染真实用户的 ~/.rnaseq_agent。
+    monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
     app = create_app(project_dir=tmp_path / "proj")
     return TestClient(app)
 
@@ -384,6 +386,96 @@ class TestWebApp:
         clear_ssh_credential("10.30.24.1", "yeyulin")
         config = client.get("/api/config", headers=_headers(token)).json()["config"]
         assert config["server"]["auth_mode"] == "password"
+
+    def test_connection_is_shared_across_projects(self, client, tmp_path) -> None:
+        """核心需求：配一次，所有项目共用。
+
+        在设置页保存连接后，新建项目应自动继承该连接（host/user/scheduler），
+        而不是要求用户在每个项目里重新填写。
+        """
+        from rnaseq_agent.connection_store import load_connection
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={
+                "server": {
+                    "host": "10.30.24.1",
+                    "user": "yeyulin",
+                    "port": 22,
+                    "scheduler": "slurm",
+                    "remote_base_dir": "/hwdata/home/yeyulin/",
+                    "auth_mode": "password",
+                    "password": "shared-secret",
+                }
+            },
+            headers=_headers(token),
+        )
+
+        stored = load_connection()
+        assert stored["host"] == "10.30.24.1"
+        assert stored["scheduler"] == "slurm"
+        assert stored["password"] == "shared-secret"
+
+    def test_new_project_inherits_shared_connection(self, client, tmp_path) -> None:
+        """新建项目应自动继承全局连接，无需再次填写服务器信息。"""
+        from rnaseq_agent.connection_store import save_connection
+
+        token = _token(client)
+        # 先保存一次全局连接（模拟用户在设置页配过），再新建项目。
+        save_connection(
+            {
+                "host": "10.30.24.1",
+                "user": "yeyulin",
+                "port": 22,
+                "scheduler": "slurm",
+                "remote_base_dir": "/hwdata/home/yeyulin/",
+                "auth_mode": "password",
+            }
+        )
+
+        resp = client.post(
+            "/api/new",
+            json={
+                "project_id": "inherit_test",
+                "title": "inherit",
+                "samples": [
+                    {"sample_id": "a", "condition": "ctrl", "fastq_1": "a_R1.fastq.gz"},
+                ],
+            },
+            headers=_headers(token),
+        )
+        assert resp.status_code == 200
+        assert "error" not in resp.json()
+
+        config = client.get("/api/config", headers=_headers(token)).json()["config"]
+        assert config["server"]["host"] == "10.30.24.1"
+        assert config["server"]["user"] == "yeyulin"
+        assert config["server"]["scheduler"] == "slurm"
+
+    def test_stored_password_restores_ssh_credential_after_restart(self, client) -> None:
+        """模拟进程重启：内存凭据清空后，应从全局配置恢复密码模式凭据。"""
+        from rnaseq_agent.ssh_auth import clear_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password", "password": "restore-me"}},
+            headers=_headers(token),
+        )
+
+        # 模拟重启：清空进程内凭据。
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+        # 触发一次读取（例如打开设置页），应把全局密码重新注入运行时凭据。
+        client.get("/api/config", headers=_headers(token))
+
+        from rnaseq_agent.ssh_auth import get_ssh_credential
+
+        credential = get_ssh_credential("10.30.24.1", "yeyulin")
+        assert credential.mode == "password"
+        assert credential.password == "restore-me"
 
     def test_llm_test_and_model_list_use_configured_api(self, client, monkeypatch) -> None:
         import requests

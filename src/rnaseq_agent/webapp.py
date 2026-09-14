@@ -75,6 +75,7 @@ from .container_service import (
     build_test_command,
     validate_image_settings,
 )
+from .connection_store import apply_connection_to_config, load_connection, save_connection
 from .ssh_auth import get_ssh_credential, normalize_auth_mode, set_ssh_credential
 from .workspace import Workspace, WorkspaceError
 
@@ -89,7 +90,49 @@ def _default_workspace_dir() -> Path:
 def _session_for(project_dir: Path) -> ProjectSession:
     session = ProjectSession(project_dir)
     session.load_session()
+    # 用户级共享连接：所有项目共用同一套服务器配置（配一次即可）。仅在项目
+    # 已有配置时在内存中覆盖 server 块，不回写磁盘，避免污染项目自身记录。
+    if session.config is not None:
+        session.config = apply_connection_to_config(session.config, load_connection())
     return session
+
+
+def _connection_as_config() -> dict[str, Any] | None:
+    """Wrap the shared connection as a minimal ``{"server": ...}`` config.
+
+    ``create_remote_transport`` expects a config dict with a ``server`` block.
+    The user-level connection is a flat field map, so adapt it here; return
+    None when no usable host is configured.
+    """
+    shared = load_connection()
+    if not shared.get("host"):
+        return None
+    from copy import deepcopy
+
+    return {"server": deepcopy(shared)}
+
+
+def _restore_runtime_credential(connection: dict[str, Any] | None = None) -> dict[str, Any]:
+    """把全局连接配置里的凭据重新注入运行时存储。
+
+    密码只存在全局配置（DPAPI 加密）里，进程重启后内存凭据会丢失。任何
+    需要连接的服务端入口先调这里，用户便不必每次重新输入密码。
+    """
+    stored = connection if connection is not None else load_connection()
+    host = str(stored.get("host") or "").strip()
+    user = str(stored.get("user") or "").strip()
+    if not host or not user:
+        return stored
+    mode = normalize_auth_mode(str(stored.get("auth_mode") or "key"))
+    password = str(stored.get("password") or "")
+    existing = get_ssh_credential(host, user)
+    # 已有更新的内存凭据时不覆盖（用户刚在当前进程里填过）。
+    if existing.mode != "key" and existing.password:
+        return stored
+    if mode == "password" and not password:
+        return stored
+    set_ssh_credential(host, user, mode=mode, password=password)
+    return stored
 
 
 def _session_view(session: ProjectSession) -> dict[str, Any]:
@@ -110,25 +153,33 @@ def _session_view(session: ProjectSession) -> dict[str, Any]:
 def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
     """Surface only the fields the web form may edit, never the api_key."""
     llm = config.get("llm", {})
-    host = str(config.get("server", {}).get("host", ""))
-    user = str(config.get("server", {}).get("user", ""))
+    # 连接信息是用户级共享的：项目里缺失的字段用全局连接补齐，UI 与后端
+    # 逻辑才能看到同一套 host / 目录，不必在每个项目里重复填写。
+    shared = load_connection()
+    merged_server = apply_connection_to_config(config, shared).get("server", {})
+    host = str(merged_server.get("host", ""))
+    user = str(merged_server.get("user", ""))
     auth_mode = get_ssh_credential(host, user).mode
-    # 进程重启后内存凭据丢失，回退到 project.json 中持久化的认证方式，
-    # 避免 UI 把已选中的「密码」静默显示成「SSH 密钥」。
-    if auth_mode == "key" and config.get("server", {}).get("auth_mode"):
-        auth_mode = normalize_auth_mode(str(config["server"]["auth_mode"]))
+    # 进程重启后内存凭据丢失，依次回退到全局连接配置、再回退到项目内
+    # 持久化的认证方式，避免 UI 把已选中的「密码」静默显示成「SSH 密钥」。
+    if auth_mode == "key":
+        shared_auth_mode = str(shared.get("auth_mode") or "")
+        if shared_auth_mode:
+            auth_mode = normalize_auth_mode(shared_auth_mode)
+        elif config.get("server", {}).get("auth_mode"):
+            auth_mode = normalize_auth_mode(str(config["server"]["auth_mode"]))
     return {
         "server": {
-            "profile": config.get("server", {}).get("profile", ""),
+            "profile": merged_server.get("profile", ""),
             "host": host,
             "user": user,
-            "port": config.get("server", {}).get("port", 22),
+            "port": merged_server.get("port", 22),
             "auth_mode": auth_mode,
-            "remote_base_dir": config.get("server", {}).get("remote_base_dir", ""),
-            "remote_workdir": config.get("server", {}).get("remote_workdir", ""),
-            "scheduler": config.get("server", {}).get("scheduler", "local"),
-            "threads": config.get("server", {}).get("threads", 8),
-            "memory_gb": config.get("server", {}).get("memory_gb", 32),
+            "remote_base_dir": merged_server.get("remote_base_dir", ""),
+            "remote_workdir": merged_server.get("remote_workdir", ""),
+            "scheduler": merged_server.get("scheduler", "local"),
+            "threads": merged_server.get("threads", 8),
+            "memory_gb": merged_server.get("memory_gb", 32),
         },
         "llm": {
             "enabled": bool(llm.get("enabled")),
@@ -162,7 +213,7 @@ def _connection_error_hint(exc: Exception) -> str:
         if "permission denied" in lowered:
             return "认证被拒绝（Permission denied）。请确认用户名/密码正确，或该账号已分配登录节点权限。"
         if "authentication failed" in lowered:
-            return "密码认证失败（Authentication failed）。请确认密码正确；若该账号仅允许密钥登录，请改用 SSH 密钥。"
+            return "密码认证失败（Authentication failed）：服务器已接受该方法但拒绝了这组凭据。请核对用户名与密码；若密码含首尾空格，请确认原样输入。"
         if "临时密码" in line:
             return line
         if "connection refused" in lowered:
@@ -700,6 +751,8 @@ def create_app(
         if (project_dir / "session.json").is_file():
             return {"error": "项目已存在，请先打开或删除。"}
         config = _default_config(project_dir, payload)
+        # 新项目继承用户级共享连接（配一次、所有项目共用）。
+        config = apply_connection_to_config(config, load_connection())
         session = ProjectSession(project_dir)
         gate = session.new_project(config)
         # 若该目录对应一个已注册的 workspace 项目，同步注册表里的状态。
@@ -822,9 +875,13 @@ def create_app(
     async def api_config_get(request: Request):
         """Read back the web-editable connection / LLM settings (api_key masked)."""
         _guard(request)
+        # 先恢复全局连接凭据：进程重启后密码仍在，用户无需重填。
+        _restore_runtime_credential()
         session = _session_for(_legacy_dir_for(request))
         if session.config is None:
-            return {"config": None}
+            # 项目尚未创建：仍回显全局连接，设置页不会显示成空白。
+            shared = load_connection()
+            return {"config": _editable_config({"server": shared}) if shared else None}
         return {"config": _editable_config(session.config)}
 
     @app.post("/api/config")
@@ -861,9 +918,21 @@ def create_app(
                 # 提供了密码即视为密码模式；否则沿用表单所选模式。
                 mode = "password" if (new_password or requested_mode == "password") else requested_mode
                 if mode == "password" and not new_password:
-                    # 重保存时密码框留空：沿用内存中已有的临时密码，避免被覆盖为空。
-                    new_password = get_ssh_credential(host, user).password
+                    # 重保存时密码框留空：沿用内存中/全局配置里已有的密码。
+                    new_password = (
+                        get_ssh_credential(host, user).password
+                        or str(load_connection().get("password") or "")
+                    )
                 set_ssh_credential(host, user, mode=mode, password=new_password)
+
+                # 连接信息是用户级、跨项目共用的：同步写入全局配置并持久化
+                # （密码经 DPAPI 加密），这样新建项目自动继承、重启后仍生效。
+                shared_values = {k: v for k, v in server_patch.items() if k != "password"}
+                if mode == "password" and new_password:
+                    shared_values["password"] = new_password
+                elif mode != "password":
+                    shared_values["password"] = ""
+                save_connection(shared_values)
 
         llm = payload.get("llm")
         if isinstance(llm, dict):
@@ -1068,9 +1137,10 @@ def create_app(
         payload = await request.json()
         remote_dir = str(payload.get("path") or "").strip()
         session = _session_for(_legacy_dir_for(request, payload))
-        if not remote_dir or session.config is None:
+        scan_config = session.config or _connection_as_config()
+        if not remote_dir or scan_config is None:
             return {"ok": False, "message": "请先保存服务器配置并填写远程 FASTQ 目录"}
-        return _scan_remote_samples(session.config, remote_dir)
+        return _scan_remote_samples(scan_config, remote_dir)
 
     @app.post("/api/chat")
     async def api_chat(request: Request):
@@ -1092,18 +1162,24 @@ def create_app(
 
         session = _session_for(_legacy_dir_for(request, payload))
         config = session.config
+        # 连接信息是用户级共享的：项目尚未创建（无 project.json）时，仍可用
+        # 全局连接做只读的服务器操作，不再要求用户先建项目再保存配置。
+        # load_connection() 是扁平的连接字段，包成 {"server": {...}} 以复用
+        # 既有的 create_remote_transport(config) 契约。
+        connection_config = _connection_as_config()
 
         # Deterministic tool intents take priority over free-form LLM replies.
         # This prevents the model from inventing shell commands or claiming it
         # browsed data that was never read through the SSH transport.
         intent = route_intent(text)
         if intent is not None and intent.action == "browse_samples":
-            if config is None:
+            browse_config = config or connection_config
+            if browse_config is None:
                 return {"reply": "请先保存服务器连接配置。", "state": session.state}
-            remote_dir = str(intent.params.get("path") or config.get("server", {}).get("remote_workdir") or "").strip()
+            remote_dir = str(intent.params.get("path") or browse_config.get("server", {}).get("remote_workdir") or "").strip()
             if not remote_dir:
                 return {"reply": "请告诉我要浏览的绝对目录，或先保存远程工作目录。", "state": session.state}
-            result = _scan_remote_samples(config, remote_dir)
+            result = _scan_remote_samples(browse_config, remote_dir)
             if not result.get("ok"):
                 return {"reply": result.get("message", "远程目录扫描失败"), "state": session.state}
             count = len(result["samples"])

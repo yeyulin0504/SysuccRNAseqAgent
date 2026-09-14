@@ -210,8 +210,11 @@ async function saveServer() {
     remote_workdir: document.getElementById("srvRemoteDir").value.trim(),
     auth_mode: authMode,
   };
-  if (authMode === "pass" && document.getElementById("srvPass").value.trim()) {
-    server.password = document.getElementById("srvPass").value.trim();
+  const passInput = document.getElementById("srvPass");
+  // 密码原样提交：仅用 trim 判断是否为空，但绝不能 trim 后赋值——
+  // 首尾空格可能是密码的一部分。
+  if (authMode === "pass" && passInput.value) {
+    server.password = passInput.value;
   }
   Object.keys(server).forEach(k => { if (server[k] === "") delete server[k]; });
   if (server.threads) server.threads = Number(server.threads);
