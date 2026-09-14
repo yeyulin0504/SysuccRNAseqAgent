@@ -75,7 +75,7 @@ from .container_service import (
     build_test_command,
     validate_image_settings,
 )
-from .ssh_auth import get_ssh_credential, set_ssh_credential
+from .ssh_auth import get_ssh_credential, normalize_auth_mode, set_ssh_credential
 from .workspace import Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
@@ -110,16 +110,20 @@ def _session_view(session: ProjectSession) -> dict[str, Any]:
 def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
     """Surface only the fields the web form may edit, never the api_key."""
     llm = config.get("llm", {})
+    host = str(config.get("server", {}).get("host", ""))
+    user = str(config.get("server", {}).get("user", ""))
+    auth_mode = get_ssh_credential(host, user).mode
+    # 进程重启后内存凭据丢失，回退到 project.json 中持久化的认证方式，
+    # 避免 UI 把已选中的「密码」静默显示成「SSH 密钥」。
+    if auth_mode == "key" and config.get("server", {}).get("auth_mode"):
+        auth_mode = normalize_auth_mode(str(config["server"]["auth_mode"]))
     return {
         "server": {
             "profile": config.get("server", {}).get("profile", ""),
-            "host": config.get("server", {}).get("host", ""),
-            "user": config.get("server", {}).get("user", ""),
+            "host": host,
+            "user": user,
             "port": config.get("server", {}).get("port", 22),
-            "auth_mode": get_ssh_credential(
-                str(config.get("server", {}).get("host", "")),
-                str(config.get("server", {}).get("user", "")),
-            ).mode,
+            "auth_mode": auth_mode,
             "remote_base_dir": config.get("server", {}).get("remote_base_dir", ""),
             "remote_workdir": config.get("server", {}).get("remote_workdir", ""),
             "scheduler": config.get("server", {}).get("scheduler", "local"),
@@ -141,6 +145,35 @@ def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
             "bind_paths": list(config.get("container", {}).get("bind_paths", [])),
         },
     }
+
+
+def _connection_error_hint(exc: Exception) -> str:
+    """Turn a connection exception into a one-line, user-actionable message.
+
+    ``RuntimeError`` carries the SSH stderr (e.g. ``Permission denied``) but
+    also multi-line scaffolding from ``run_command``; surface the essential
+    reason instead of only the exception class name so the settings page
+    shows *why* the connection failed.
+    """
+    text = str(exc).strip() or type(exc).__name__
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        lowered = line.lower()
+        if "permission denied" in lowered:
+            return "认证被拒绝（Permission denied）。请确认用户名/密码正确，或该账号已分配登录节点权限。"
+        if "authentication failed" in lowered:
+            return "密码认证失败（Authentication failed）。请确认密码正确；若该账号仅允许密钥登录，请改用 SSH 密钥。"
+        if "临时密码" in line:
+            return line
+        if "connection refused" in lowered:
+            return f"无法建立连接（Connection refused）。请确认主机与端口可达：{line}"
+        if "timed out" in lowered or "timeout" in lowered:
+            return f"连接超时。请确认主机可达、端口正确：{line}"
+        if "no route to host" in lowered or "could not resolve" in lowered:
+            return f"主机不可达或域名无法解析：{line}"
+        if "host key verification failed" in lowered:
+            return "服务器主机指纹未被信任，请先在终端手动 ssh 一次并接受指纹。"
+    return lines[0][:300]
 
 
 def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0) -> str | None:
@@ -805,7 +838,7 @@ def create_app(
 
         server = payload.get("server")
         if isinstance(server, dict):
-            allowed = {"host", "user", "port", "scheduler", "threads", "memory_gb", "remote_base_dir", "remote_workdir"}
+            allowed = {"host", "user", "port", "scheduler", "threads", "memory_gb", "remote_base_dir", "remote_workdir", "auth_mode"}
             server_patch = {k: v for k, v in server.items() if k in allowed and v is not None}
             if server_patch:
                 # threads / memory_gb arrive as numbers from the form.
@@ -815,13 +848,22 @@ def create_app(
                     server_patch["memory_gb"] = int(server_patch["memory_gb"])
                 if "port" in server_patch:
                     server_patch["port"] = int(server_patch["port"])
+                if "auth_mode" in server_patch:
+                    # 前端按钮值为 'pass'：落盘前归一化为规范的 'password'。
+                    server_patch["auth_mode"] = normalize_auth_mode(server_patch["auth_mode"])
                 patch["server"] = server_patch
                 note_parts.append("服务器配置：" + ", ".join(f"{k}={v}" for k, v in server_patch.items()))
             host = str(server.get("host") or (session.config or {}).get("server", {}).get("host", ""))
             user = str(server.get("user") or (session.config or {}).get("server", {}).get("user", ""))
             if host and user and (server.get("auth_mode") or server.get("password")):
-                mode = "password" if server.get("password") else str(server.get("auth_mode") or "key")
-                set_ssh_credential(host, user, mode=mode, password=str(server.get("password") or ""))
+                new_password = str(server.get("password") or "")
+                requested_mode = normalize_auth_mode(str(server.get("auth_mode") or "key"))
+                # 提供了密码即视为密码模式；否则沿用表单所选模式。
+                mode = "password" if (new_password or requested_mode == "password") else requested_mode
+                if mode == "password" and not new_password:
+                    # 重保存时密码框留空：沿用内存中已有的临时密码，避免被覆盖为空。
+                    new_password = get_ssh_credential(host, user).password
+                set_ssh_credential(host, user, mode=mode, password=new_password)
 
         llm = payload.get("llm")
         if isinstance(llm, dict):
@@ -928,7 +970,7 @@ def create_app(
             ok = result.returncode == 0 and "RNASEQ_AGENT_SSH_OK" in result.stdout
             return {"ok": ok, "message": "SSH 连接成功" if ok else "SSH 连接失败"}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "message": f"SSH 连接失败：{type(exc).__name__}"}
+            return {"ok": False, "message": f"SSH 连接失败：{_connection_error_hint(exc)}"}
 
     @app.post("/api/container/pull")
     async def api_container_pull(request: Request):

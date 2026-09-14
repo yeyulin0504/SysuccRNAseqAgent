@@ -14,6 +14,7 @@ from rnaseq_agent.ssh_auth import (
     SSHCredential,
     clear_ssh_credential,
     get_ssh_credential,
+    normalize_auth_mode,
     set_ssh_credential,
 )
 
@@ -72,6 +73,34 @@ class SSHCredentialTests(unittest.TestCase):
 
         self.assertIsInstance(transport, ParamikoTransport)
         self.assertEqual(transport.port, 22)
+
+    def test_pass_alias_from_web_form_selects_password_mode(self) -> None:
+        """WEB 前端 settings.html 用 'pass' 作为按钮值，必须等价于 'password'。
+
+        否则 set_ssh_credential 会静默降级为 key 模式并丢弃密码，
+        用户明明填了密码却仍走密钥认证、报 Permission denied。
+        """
+        set_ssh_credential(
+            SERVER["host"],
+            SERVER["user"],
+            mode="pass",
+            password="temporary-secret",
+        )
+
+        credential = get_ssh_credential(SERVER["host"], SERVER["user"])
+
+        self.assertEqual(credential.mode, "password")
+        self.assertEqual(credential.password, "temporary-secret")
+        self.assertIsInstance(create_remote_transport({"server": SERVER}), ParamikoTransport)
+
+    def test_normalize_auth_mode_maps_aliases_and_unknown_values(self) -> None:
+        self.assertEqual(normalize_auth_mode("pass"), "password")
+        self.assertEqual(normalize_auth_mode("password"), "password")
+        self.assertEqual(normalize_auth_mode("key"), "key")
+        self.assertEqual(normalize_auth_mode("system"), "system")
+        self.assertEqual(normalize_auth_mode(""), "key")
+        self.assertEqual(normalize_auth_mode(None), "key")
+        self.assertEqual(normalize_auth_mode("nonsense"), "key")
 
 
 class SystemSSHTransportTests(unittest.TestCase):

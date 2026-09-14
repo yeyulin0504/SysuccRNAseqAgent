@@ -164,11 +164,12 @@ function flash() {
   setTimeout(() => el.classList.add("hidden"), 2500);
 }
 function setAuth(mode) {
-  authMode = mode;
-  document.getElementById("authKey").classList.toggle("active", mode === "key");
-  document.getElementById("authPass").classList.toggle("active", mode === "pass");
-  document.getElementById("srvPass").classList.toggle("hidden", mode !== "pass");
-  document.getElementById("srvKeyNote").classList.toggle("hidden", mode !== "key");
+  // 后端规范化后的模式是 "password"，UI 分段按钮用 "pass"；两者互认。
+  authMode = (mode === "password") ? "pass" : mode;
+  document.getElementById("authKey").classList.toggle("active", authMode === "key");
+  document.getElementById("authPass").classList.toggle("active", authMode === "pass");
+  document.getElementById("srvPass").classList.toggle("hidden", authMode !== "pass");
+  document.getElementById("srvKeyNote").classList.toggle("hidden", authMode !== "key");
 }
 function load() {
   api("/api/config").then(d => {
@@ -183,7 +184,6 @@ function load() {
     document.getElementById("srvRemoteBase").value = c.server.remote_base_dir || "";
     document.getElementById("srvRemoteDir").value = c.server.remote_workdir || "";
     if (c.server.auth_mode) setAuth(c.server.auth_mode);
-    if (c.server.port && Number(c.server.port) !== 22) setAuth("pass");
     document.getElementById("llmBase").value = c.llm.api_base || "";
     document.getElementById("llmModel").value = c.llm.model || "";
     document.getElementById("llmProvider").value = c.llm.provider || "";

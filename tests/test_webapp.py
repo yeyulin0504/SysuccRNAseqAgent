@@ -279,6 +279,112 @@ class TestWebApp:
         assert result["ok"] is True
         assert result["message"] == "SSH 连接成功"
 
+    def test_server_connection_failure_surfaces_real_reason(self, client, monkeypatch) -> None:
+        """连接失败时必须回传可读原因，而不是只回传异常类名。"""
+        import rnaseq_agent.webapp as webapp
+
+        token = _token(client)
+        _new_project(client, token)
+
+        def _boom(config):
+            raise RuntimeError(
+                "Command failed with exit code 255: ssh -o BatchMode=yes user@host\n"
+                "STDOUT:\n\nSTDERR:\n"
+                "user@host: Permission denied (publickey,password).\n"
+            )
+
+        monkeypatch.setattr(webapp, "test_server_connection", _boom)
+        result = client.post("/api/test-server", headers=_headers(token)).json()
+        assert result["ok"] is False
+        assert "RuntimeError" != result["message"]
+        assert "认证被拒绝" in result["message"]
+
+    def test_password_connection_failure_surfaces_password_hint(self, client, monkeypatch) -> None:
+        """密码认证失败应给出密码相关的可读提示。"""
+        import rnaseq_agent.webapp as webapp
+
+        token = _token(client)
+        _new_project(client, token)
+
+        def _boom_password(config):
+            raise RuntimeError("Authentication failed.")
+
+        monkeypatch.setattr(webapp, "test_server_connection", _boom_password)
+        result = client.post("/api/test-server", headers=_headers(token)).json()
+        assert result["ok"] is False
+        assert "RuntimeError" != result["message"]
+        assert "密码认证失败" in result["message"]
+
+    def test_password_auth_mode_from_web_form_is_used_and_echoed(self, client) -> None:
+        """前端认证按钮值为 'pass'，后端须按 password 模式保存并回显。"""
+        from rnaseq_agent.ssh_auth import clear_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+        resp = client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "pass", "password": "p@ssw0rd"}},
+            headers=_headers(token),
+        ).json()
+        assert "error" not in resp
+        assert resp["config"]["server"]["auth_mode"] == "password"
+
+        from rnaseq_agent.ssh_auth import get_ssh_credential
+
+        credential = get_ssh_credential("10.30.24.1", "yeyulin")
+        assert credential.mode == "password"
+        assert credential.password == "p@ssw0rd"
+
+    def test_pass_alias_is_persisted_as_canonical_password_mode(self, client, tmp_path) -> None:
+        """落盘前须把前端别名 'pass' 归一化为 'password'，避免状态歧义。"""
+        from rnaseq_agent.ssh_auth import clear_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "pass", "password": "x"}},
+            headers=_headers(token),
+        )
+        project = json.loads((tmp_path / "proj" / "project.json").read_text(encoding="utf-8"))
+        assert project["server"]["auth_mode"] == "password"
+
+    def test_resaving_password_mode_without_password_keeps_stored_secret(self, client) -> None:
+        """密码框留空重保存时不得把已存的临时密码清空。"""
+        from rnaseq_agent.ssh_auth import clear_ssh_credential, get_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password", "password": "keep-me"}},
+            headers=_headers(token),
+        )
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password"}},
+            headers=_headers(token),
+        )
+        assert get_ssh_credential("10.30.24.1", "yeyulin").password == "keep-me"
+
+    def test_password_auth_mode_persists_without_runtime_credential(self, client) -> None:
+        """进程重启后内存凭据丢失，仍应从持久化配置回显 password 模式。"""
+        from rnaseq_agent.ssh_auth import clear_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password", "password": "temp"}},
+            headers=_headers(token),
+        )
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+        config = client.get("/api/config", headers=_headers(token)).json()["config"]
+        assert config["server"]["auth_mode"] == "password"
+
     def test_llm_test_and_model_list_use_configured_api(self, client, monkeypatch) -> None:
         import requests
 
