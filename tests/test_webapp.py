@@ -317,6 +317,43 @@ class TestWebApp:
         assert "RuntimeError" != result["message"]
         assert "密码认证失败" in result["message"]
 
+    def test_browse_samples_surfaces_readable_failure(self, client, monkeypatch) -> None:
+        """「浏览服务器目录」失败时也要给出可读原因，而不是只报异常类名。"""
+        import rnaseq_agent.webapp as webapp
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={
+                "server": {
+                    "host": "h.example",
+                    "user": "u",
+                    "auth_mode": "password",
+                    "password": "x",
+                    "remote_workdir": "/data/reads",
+                }
+            },
+            headers=_headers(token),
+        )
+
+        # 让底层传输抛出带 SSH stderr 的 RuntimeError（真实失败形态）。
+        def _boom(config):
+            raise RuntimeError(
+                "Command failed with exit code 255: ssh -o BatchMode=yes u@h\n"
+                "STDOUT:\n\nSTDERR:\n"
+                "u@h: Permission denied (publickey,password).\n"
+            )
+
+        monkeypatch.setattr(webapp, "create_remote_transport", _boom)
+        result = client.post(
+            "/api/chat",
+            json={"message": "浏览我的服务器目录"},
+            headers=_headers(token),
+        ).json()
+        assert "RuntimeError" not in result["reply"]
+        assert "认证被拒绝" in result["reply"]
+
     def test_password_auth_mode_from_web_form_is_used_and_echoed(self, client) -> None:
         """前端认证按钮值为 'pass'，后端须按 password 模式保存并回显。"""
         from rnaseq_agent.ssh_auth import clear_ssh_credential

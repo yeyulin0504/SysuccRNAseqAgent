@@ -293,7 +293,7 @@ def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, A
         )
         return {"ok": True, "scanned_path": remote_dir, **detected}
     except Exception as exc:  # noqa: BLE001 - sanitized response
-        return {"ok": False, "message": f"远程目录扫描失败：{type(exc).__name__}"}
+        return {"ok": False, "message": f"远程目录扫描失败：{_connection_error_hint(exc)}"}
 def _interrupt_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract the JSON-safe payload(s) of a LangGraph interrupt result.
 
