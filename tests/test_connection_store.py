@@ -20,6 +20,7 @@ from rnaseq_agent.connection_store import (
     apply_llm_to_config,
     clear_password,
     connection_file_path,
+    llm_model_name,
     load_connection,
     load_llm,
     save_connection,
@@ -290,3 +291,29 @@ class TestApplyLlmToConfig:
         # 需要 api_key 才能调用 LLM，因此它必须进入运行时 config；
         # 但 _editable_config 负责在下发前端前抹掉它（见 webapp 测试）。
         assert merged["llm"]["api_key"] == "sk-secret"
+
+
+class TestLlmModelName:
+    """模型名统一从 ``config["llm"]["model"]`` 读取。
+
+    思考过程与状态行此前直接对顶层取 ``model``，永远取空，界面只好显示
+    「未指定模型」。收口到这里后调用方不必再记得层级。
+    """
+
+    def test_reads_nested_model(self) -> None:
+        assert llm_model_name({"llm": {"model": "DeepSeek-V4-Flash"}}) == "DeepSeek-V4-Flash"
+
+    def test_strips_whitespace(self) -> None:
+        assert llm_model_name({"llm": {"model": "  m  "}}) == "m"
+
+    def test_top_level_model_is_not_used(self) -> None:
+        # 顶层 model 不是配置契约的一部分，误读会掩盖真实缺配。
+        assert llm_model_name({"model": "top-level"}) == ""
+
+    def test_missing_or_odd_shapes_return_empty(self) -> None:
+        assert llm_model_name(None) == ""
+        assert llm_model_name({}) == ""
+        assert llm_model_name({"llm": None}) == ""
+        assert llm_model_name({"llm": {"model": None}}) == ""
+        assert llm_model_name({"llm": {"model": "   "}}) == ""
+        assert llm_model_name({"llm": "not-a-dict"}) == ""

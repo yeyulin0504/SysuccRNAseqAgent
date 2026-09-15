@@ -20,6 +20,7 @@ stays usable while the three-page surface is introduced.
 
 from __future__ import annotations
 
+import json
 import secrets
 import shlex
 import socket
@@ -29,7 +30,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -78,6 +84,7 @@ from .container_service import (
 from .connection_store import (
     apply_connection_to_config,
     apply_llm_to_config,
+    llm_model_name,
     load_connection,
     load_llm,
     save_connection,
@@ -250,6 +257,31 @@ def _connection_error_hint(exc: Exception) -> str:
     return lines[0][:300]
 
 
+def _llm_messages(text: str) -> list[dict[str, str]]:
+    """The system + user turn shared by the streaming and non-streaming paths."""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "你是 SYSU 多组学分析 Agent 的前端助手。用户正在配置一个"
+                "bulk RNA-seq 分析项目。能识别为可执行操作时，简短回复并提示"
+                "可继续点击「生成执行计划 / 确认并冻结契约 / 启用差异表达」。"
+            ),
+        },
+        {"role": "user", "content": text},
+    ]
+
+
+def _llm_endpoint(config: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Return ``(url, api_key, model)`` when a usable endpoint is configured."""
+    llm = config.get("llm", {})
+    if not llm.get("enabled") or not llm.get("api_key") or not llm.get("api_base"):
+        return None
+    api_base = str(llm.get("api_base", "")).rstrip("/")
+    model = str(llm.get("model", "")).strip() or "gpt-4o-mini"
+    return f"{api_base}/chat/completions", str(llm["api_key"]), model
+
+
 def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0) -> str | None:
     """Call the configured OpenAI-compatible chat endpoint.
 
@@ -257,36 +289,17 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
     not configured / the call fails — the caller falls back to the local
     rule router so the chat panel keeps working without a model.
     """
-    llm = config.get("llm", {})
-    if not llm.get("enabled") or not llm.get("api_key") or not llm.get("api_base"):
+    endpoint = _llm_endpoint(config)
+    if endpoint is None:
         return None
-    api_base = str(llm.get("api_base", "")).rstrip("/")
-    model = str(llm.get("model", "")).strip() or "gpt-4o-mini"
-    url = f"{api_base}/chat/completions"
+    url, api_key, model = endpoint
     try:
         import requests
 
         resp = requests.post(
             url,
-            headers={
-                "Authorization": f"Bearer {llm['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是 SYSU 多组学分析 Agent 的前端助手。用户正在配置一个"
-                            "bulk RNA-seq 分析项目。能识别为可执行操作时，简短回复并提示"
-                            "可继续点击「生成执行计划 / 确认并冻结契约 / 启用差异表达」。"
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ],
-                "temperature": 0.2,
-            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": _llm_messages(text), "temperature": 0.2},
             timeout=timeout,
         )
         if resp.status_code != 200:
@@ -295,6 +308,59 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
         return str(data["choices"][0]["message"]["content"]).strip()
     except Exception:  # noqa: BLE001 - any failure falls back to the rule router
         return None
+
+
+def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0):
+    """Yield the assistant reply in pieces so the UI can render as it arrives.
+
+    Prefers the endpoint's own ``stream=true`` SSE (real token streaming);
+    when that is unavailable the full reply is yielded as a single piece,
+    which still lets the caller keep one uniform code path. An empty
+    sequence means "no model reply" so the caller falls back to the rules.
+    """
+    endpoint = _llm_endpoint(config)
+    if endpoint is None:
+        return
+    url, api_key, model = endpoint
+    streamed = False
+    try:
+        import requests
+
+        with requests.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": _llm_messages(text), "temperature": 0.2, "stream": True},
+            timeout=timeout,
+            stream=True,
+        ) as resp:
+            if resp.status_code == 200:
+                for raw in resp.iter_lines(decode_unicode=True):
+                    if not raw:
+                        continue
+                    line = raw.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload)
+                    except ValueError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    piece = (choices[0].get("delta") or {}).get("content")
+                    if piece:
+                        streamed = True
+                        yield piece
+    except Exception:  # noqa: BLE001 - fall through to the non-streaming call
+        streamed = False
+    if streamed:
+        return
+    reply = _llm_reply_or_none(config, text, timeout=timeout)
+    if reply:
+        yield reply
 
 
 def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, Any]:
@@ -665,6 +731,23 @@ def create_app(
             request,
             "workbench.html",
             {"token": token, "project_id": project_id},
+        )
+
+    @app.get("/chat", response_class=HTMLResponse)
+    async def chat_page(request: Request):
+        """全屏对话页（Codex 风格）：大片消息流 + 思考过程 + 流式输出。
+
+        ``?project=<id>`` 绑定工作区项目；``?thread=<id>`` 可直达某个对话。
+        未提供或未注册时页面照常渲染，由前端列出项目/对话供选择。
+        """
+        project_id = str(request.query_params.get("project") or "").strip()
+        if project_id and workspace.get_project(project_id) is None:
+            project_id = ""
+        thread_id = str(request.query_params.get("thread") or "").strip()
+        return templates.TemplateResponse(
+            request,
+            "chat.html",
+            {"token": token, "project_id": project_id, "thread_id": thread_id},
         )
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -1177,6 +1260,79 @@ def create_app(
             return {"ok": False, "message": "请先保存服务器配置并填写远程 FASTQ 目录"}
         return _scan_remote_samples(scan_config, remote_dir)
 
+    def _fallback_reply(config: dict[str, Any] | None) -> str:
+        """Rule-router hint when the message is neither an action nor answerable."""
+        capabilities = ", ".join(
+            c.capability_id
+            for c in __import__(
+                "rnaseq_agent.capability", fromlist=["list_capabilities"]
+            ).list_capabilities()
+        )
+        return (
+            "我还没理解成可执行操作。可以试试："
+            + (
+                "生成计划 / 确认 / 把线程改成 16 / 关闭 arriba / 回滚 / 状态。"
+                if config is not None
+                else "先在左侧创建项目，然后对我说：生成计划、确认、把线程改成 16。"
+            )
+            + f"\n当前能力：{capabilities}"
+        )
+
+    def _browse_samples_reply(
+        session: ProjectSession,
+        intent: Any,
+        config: dict[str, Any] | None,
+        connection_config: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Read-only remote FASTQ discovery, shared by both chat paths."""
+        browse_config = config or connection_config
+        if browse_config is None:
+            return {"reply": "请先保存服务器连接配置。", "state": session.state}
+        remote_dir = str(
+            intent.params.get("path")
+            or browse_config.get("server", {}).get("remote_workdir")
+            or ""
+        ).strip()
+        if not remote_dir:
+            return {"reply": "请告诉我要浏览的绝对目录，或先保存远程工作目录。", "state": session.state}
+        result = _scan_remote_samples(browse_config, remote_dir)
+        if not result.get("ok"):
+            return {"reply": result.get("message", "远程目录扫描失败"), "state": session.state}
+        count = len(result["samples"])
+        return {
+            **result,
+            "action": "browse_samples",
+            "state": session.state,
+            "scanned_path": remote_dir,
+            "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。请检查后再应用到样本表。",
+        }
+
+    def _execute_chat_intent(session: ProjectSession, intent: Any) -> dict[str, Any]:
+        """Run a deterministic session action and normalise its reply text."""
+        result = execute_intent(session, intent)
+        if "error" in result:
+            result["reply"] = f"操作未完成：{result['error']}"
+        elif "reply" not in result:
+            result["reply"] = intent.message
+        return result
+
+    def _intent_label(intent: Any) -> str:
+        """Human-readable name for the thinking panel."""
+        labels = {
+            "plan": "生成执行计划",
+            "confirm": "确认并冻结契约",
+            "edit": "修改分析参数",
+            "rollback": "回滚变更",
+            "status": "读取项目状态",
+            "summary": "汇总项目摘要",
+            "help": "说明可用操作",
+            "new": "新建项目草稿",
+            "deg_status": "检查差异表达门禁",
+            "browse_samples": "浏览服务器目录",
+        }
+        action = getattr(intent, "action", "")
+        return labels.get(action, action or "会话动作")
+
     @app.post("/api/chat")
     async def api_chat(request: Request):
         """Chat panel endpoint: route intent -> audited session action.
@@ -1208,23 +1364,7 @@ def create_app(
         # browsed data that was never read through the SSH transport.
         intent = route_intent(text)
         if intent is not None and intent.action == "browse_samples":
-            browse_config = config or connection_config
-            if browse_config is None:
-                return {"reply": "请先保存服务器连接配置。", "state": session.state}
-            remote_dir = str(intent.params.get("path") or browse_config.get("server", {}).get("remote_workdir") or "").strip()
-            if not remote_dir:
-                return {"reply": "请告诉我要浏览的绝对目录，或先保存远程工作目录。", "state": session.state}
-            result = _scan_remote_samples(browse_config, remote_dir)
-            if not result.get("ok"):
-                return {"reply": result.get("message", "远程目录扫描失败"), "state": session.state}
-            count = len(result["samples"])
-            return {
-                **result,
-                "action": "browse_samples",
-                "state": session.state,
-                "scanned_path": remote_dir,
-                "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。请检查后再应用到样本表。",
-            }
+            return _browse_samples_reply(session, intent, config, connection_config)
 
         # 1) LLM path (when enabled and reachable).
         # 大模型配置是用户级共享的：项目里没有 project.json 时回退到全局
@@ -1237,28 +1377,174 @@ def create_app(
 
         # 2) Local rule router fallback.
         if intent is None:
-            has_project = config is not None
-            capabilities = ", ".join(
-                c.capability_id
-                for c in __import__(
-                    "rnaseq_agent.capability", fromlist=["list_capabilities"]
-                ).list_capabilities()
+            return {"reply": _fallback_reply(config), "state": session.state}
+
+        return _execute_chat_intent(session, intent)
+
+    @app.post("/api/chat/stream")
+    async def api_chat_stream(request: Request):
+        """SSE variant of ``/api/chat`` that exposes the thinking process.
+
+        Emits ``step`` events (understand / context / llm / tool) before the
+        answer, then the reply as ``delta`` chunks, and finally ``done``. The
+        user turn and the agent answer (with its steps) are persisted to the
+        target thread so the conversation survives a reload.
+
+        Event framing::
+
+            event: step
+            data: {"id":"understand","label":"…","status":"done","detail":"…"}
+
+            event: delta
+            data: {"text":"…"}
+
+            event: done
+            data: {"state":"…","via":"llm","reply":"…","thread_id":"…"}
+        """
+        _guard(request)
+        payload = await request.json()
+        text = str(payload.get("message", "")).strip()
+
+        def sse(event: str, data: dict[str, Any]) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        if not text:
+            return StreamingResponse(
+                iter([sse("error", {"message": "请输入想做的事。"})]),
+                media_type="text/event-stream",
             )
-            return {
-                "reply": (
-                    "我还没理解成可执行操作。可以试试："
-                    + ("生成计划 / 确认 / 把线程改成 16 / 关闭 arriba / 回滚 / 状态。" if has_project else "先在左侧创建项目，然后对我说：生成计划、确认、把线程改成 16。")
-                    + f"\n当前能力：{capabilities}"
-                ),
-                "state": session.state,
+
+        session = _session_for(_legacy_dir_for(request, payload))
+        config = session.config
+        connection_config = _connection_as_config()
+        project_id = _bound_project_id(request, payload)
+        project_dir = session.project_dir
+        requested_thread = str(payload.get("thread_id") or "").strip()
+
+        def run():
+            steps: list[dict[str, Any]] = []
+
+            def step(step_id: str, label: str, status: str, detail: str = "") -> str:
+                record = {"id": step_id, "label": label, "status": status, "detail": detail}
+                # 同名步骤后出现的状态覆盖前一条，前端据此原地更新。
+                steps.append(record)
+                return sse("step", record)
+
+            # 1) 理解问题：把「系统理解成了什么」先摊开给用户看。
+            yield step("understand", "理解你的问题", "running")
+            intent = route_intent(text)
+            intent_label = _intent_label(intent) if intent is not None else ""
+            if intent is not None:
+                yield step("understand", "理解你的问题", "done", f"识别为可执行操作：{intent_label}")
+            else:
+                yield step("understand", "理解你的问题", "done", "未匹配到可执行操作，按提问处理")
+
+            # 2) 读取项目上下文：有没有项目、配没配模型，直接决定后面走哪条路。
+            yield step("context", "读取项目上下文", "running")
+            has_project = config is not None
+            llm_config = config if has_project else _shared_llm_config()
+            context_detail = "已载入项目配置" if has_project else "该项目还没有分析会话，使用全局配置"
+            if llm_config is not None:
+                model_name = llm_model_name(llm_config) or "未指定模型"
+                context_detail += f"；大模型：{model_name}"
+            else:
+                context_detail += "；未配置大模型，使用规则路由"
+            yield step("context", "读取项目上下文", "done", context_detail)
+
+            via = "rule"
+            reply = ""
+
+            # 3a) 工具动作优先：可执行操作不让模型代劳。
+            payload_extra: dict[str, Any] = {}
+            if intent is not None and intent.action == "browse_samples":
+                yield step("tool", f"执行操作：{intent_label}", "running")
+                result = _browse_samples_reply(session, intent, config, connection_config)
+                reply = str(result.get("reply") or "")
+                yield step("tool", f"执行操作：{intent_label}", "done")
+                payload_extra = {
+                    k: result[k]
+                    for k in ("action", "samples", "unmatched", "scanned_path")
+                    if k in result
+                }
+            elif intent is not None:
+                yield step("tool", f"执行操作：{intent_label}", "running")
+                result = _execute_chat_intent(session, intent)
+                via = "tool"
+                reply = str(result.get("reply") or "")
+                failed = bool(result.get("error"))
+                yield step(
+                    "tool",
+                    f"执行操作：{intent_label}",
+                    "failed" if failed else "done",
+                    str(result.get("error") or ""),
+                )
+                payload_extra = {
+                    k: result[k]
+                    for k in ("steps", "summary", "gate", "contract_id")
+                    if k in result
+                }
+            # 3b) 提问：能连模型就让模型答，并逐段推给前端。
+            elif llm_config is not None:
+                model_name = llm_model_name(llm_config) or "未指定"
+                yield step("llm", "调用大模型生成答复", "running", f"模型：{model_name}")
+                chunks: list[str] = []
+                for piece in _llm_stream_chunks(llm_config, text):
+                    if not piece:
+                        continue
+                    chunks.append(piece)
+                    yield sse("delta", {"text": piece})
+                if chunks:
+                    via = "llm"
+                    reply = "".join(chunks)
+                    yield step("llm", "调用大模型生成答复", "done", f"已生成 {len(reply)} 字")
+                else:
+                    # 模型不可用：退回规则路由，界面不至于空着。
+                    yield step("llm", "调用大模型生成答复", "failed", "模型无响应，改用规则路由")
+            else:
+                reply = _fallback_reply(config)
+
+            if not reply:
+                reply = _fallback_reply(config)
+            if via != "llm":
+                # 规则/工具答复没有 token 流，整段推一次保持前端逻辑统一。
+                yield sse("delta", {"text": reply})
+
+            state = session.state
+            result: dict[str, Any] = {
+                "state": state,
+                "via": via,
+                "reply": reply,
+                **payload_extra,
             }
 
-        result = execute_intent(session, intent)
-        if "error" in result:
-            result["reply"] = f"操作未完成：{result['error']}"
-        elif "reply" not in result:
-            result["reply"] = intent.message
-        return result
+            # 4) 落盘：用户提问 + Agent 答复（含思考步骤），刷新后仍可回看。
+            thread_id = requested_thread
+            try:
+                if project_id is not None:
+                    if not thread_id:
+                        existing = list_threads(project_dir)
+                        thread_id = existing[0]["thread_id"] if existing else "main"
+                    try:
+                        get_thread(project_dir, thread_id)
+                    except ThreadError:
+                        create_thread(project_dir, thread_id, title="主分析流程")
+                    append_message(project_dir, thread_id, role="user", content=text)
+                    saved = append_message(
+                        project_dir,
+                        thread_id,
+                        role="agent",
+                        content=reply,
+                        references={"via": via, "steps": steps},
+                    )
+                    result["thread_id"] = thread_id
+                    result["message_id"] = saved["message_id"]
+                    workspace.set_thread_count(project_id, len(list_threads(project_dir)))
+            except (ThreadError, OSError):  # noqa: BLE001 - 落盘失败不该毁掉这次回答
+                pass
+
+            yield sse("done", result)
+
+        return StreamingResponse(run(), media_type="text/event-stream")
 
     # -- workspace API (multi-project registry) --------------------------
 

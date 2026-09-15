@@ -221,6 +221,47 @@ class TestRouteIntent:
         assert intent.params == {}
 
 
+class TestKnowledgeQuestionsAreNotHijacked:
+    """知识提问必须放行给大模型，不能被工具意图抢走。
+
+    用户诉求（2026-09-15）：「我需要 llm 的思考执行结果」。此前「解释一下
+    差异表达的原理」「测序深度对差异表达有什么影响」这类纯提问会命中
+    ``_match_diffexp``，被当成步骤开关 / 状态查询，导致配好大模型也拿不到
+    模型答复，只能看到一句生硬的规则文案。
+    """
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "解释一下差异表达的原理",
+            "什么是差异表达",
+            "差异表达和差异分析的区别是什么",
+            "为什么做差异分析需要生物学重复",
+            "不太理解测序深度对差异表达的影响",
+            "请用两三句话解释一下什么是测序深度，以及它对差异表达结果有什么影响。",
+            "用两三句话解释一下 RNA-seq 里 TPM 和 FPKM 的区别，以及做差异分析时更推荐哪一个。",
+            "帮我讲讲 DESeq2 和 edgeR 有什么区别",
+        ],
+    )
+    def test_knowledge_question_routes_to_none(self, question: str) -> None:
+        assert route_intent(question) is None, f"提问被误判成工具动作：{question}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "帮我做差异表达",
+            "启用差异表达",
+            "以 control 为对照做差异表达",
+            "关闭差异表达",
+            "差异表达设计是不是合格",
+            "这个差异表达的结果怎么解读",
+        ],
+    )
+    def test_real_commands_still_route(self, command: str) -> None:
+        # 命令语义不能被「放行提问」的守卫误伤。
+        assert route_intent(command) is not None, f"命令被误放行：{command}"
+
+
 class TestExecuteIntent:
     def test_plan_updates_session(self, tmp_path: Path) -> None:
         session = _make_session(tmp_path)

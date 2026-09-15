@@ -174,6 +174,7 @@
   <span id="stateBadge" class="state"></span>
   <nav>
     <a href="/">项目首页</a>
+    <a href="/chat" id="chatPageLink">全屏对话</a>
     <a href="/settings">设置</a>
   </nav>
 </header>
@@ -378,7 +379,9 @@
 
     <!-- 中栏下半：放大 Agent 对话 #agentConversation -->
     <div class="conversation-main" id="agentConversation">
-      <h2 style="margin-top:0">Agent 对话</h2>
+      <h2 style="margin-top:0">Agent 对话
+        <a href="/chat" id="chatPageLink2" style="float:right;text-transform:none;font-size:12px">在对话页打开 ↗</a>
+      </h2>
       <div id="chatMessages" class="muted"></div>
       <div class="quick-row">
         <button class="small secondary" onclick="quickChat('生成执行计划')">生成计划</button>
@@ -502,6 +505,7 @@ function selectProject(id) {
   url.searchParams.set("project", id);
   history.pushState({}, "", url);
   document.getElementById("projectName").textContent = id;
+  syncChatPageLink();
   const chatBox = document.getElementById("chatMessages");
   if (chatBox) chatBox.innerHTML = "";
   const reply = document.getElementById("chatReply");
@@ -510,6 +514,15 @@ function selectProject(id) {
   loadThreads();
   loadWizardData();
   refreshAll();
+}
+
+/* 全屏对话页与本页同项目绑定，保证跳过去看到同一份记录。 */
+function syncChatPageLink() {
+  ["chatPageLink", "chatPageLink2"].forEach(id => {
+    const link = document.getElementById(id);
+    if (!link) return;
+    link.href = currentProject ? "/chat?project=" + encodeURIComponent(currentProject) : "/chat";
+  });
 }
 
 /* ---------- 左栏 #toolPanel：对话 ---------- */
@@ -1428,6 +1441,7 @@ function cmsGate() {
 
 /* ---------- 初始化 ---------- */
 document.getElementById("projectName").textContent = currentProject || "未选择项目";
+syncChatPageLink();
 addFastqSampleRow({});
 addFastqSampleRow({});
 addLocalFastqSampleRow({});

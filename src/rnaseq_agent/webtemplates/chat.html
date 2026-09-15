@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SYSU 多组学分析 Agent — 对话</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f6f8fa; --border: #d0d7de;
+    --text: #1f2328; --muted: #656d76; --accent: #0969da;
+    --accent-weak: #ddf4ff; --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+    --shadow: 0 1px 2px rgba(31,35,40,.06);
+    --user-bubble: #ddf4ff; --agent-bubble: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+  header { padding: 11px 22px; border-bottom: 1px solid var(--border);
+           display: flex; align-items: center; gap: 14px; background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .crumb { color: var(--muted); font-size: 13px; }
+  nav { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+  nav a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  nav a:hover { text-decoration: underline; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px;
+           border: 1px solid var(--border); color: var(--muted); background: var(--bg); }
+  .state { font-size: 12px; padding: 3px 10px; border-radius: 20px; white-space: nowrap;
+           background: rgba(101,109,118,.14); color: var(--muted); }
+  .state.planned { background: rgba(9,105,218,.12); color: var(--accent); }
+  .state.confirmed, .state.completed { background: rgba(26,127,55,.12); color: var(--ok); }
+  .state.waiting_user, .state.waiting { background: rgba(154,103,0,.14); color: var(--warn); }
+  .state.failed, .state.error { background: rgba(207,34,46,.12); color: var(--err); }
+
+  /* ---- 两栏：左对话列表 + 右大片消息流 ---- */
+  .shell { display: grid; grid-template-columns: 258px minmax(0, 1fr); height: calc(100vh - 55px); }
+  .side { border-right: 1px solid var(--border); padding: 12px; overflow: auto; background: var(--panel); }
+  .side h2 { font-size: 11px; color: var(--muted); text-transform: uppercase;
+             letter-spacing: .5px; margin: 12px 0 6px; }
+  .side h2:first-child { margin-top: 0; }
+  .list { list-style: none; margin: 0; padding: 0; }
+  .list li { padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 13px;
+             margin-bottom: 4px; border: 1px solid transparent; }
+  .list li:hover { background: var(--bg); }
+  .list li.active { background: var(--accent-weak); border-color: var(--accent); }
+  .list .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .list .muted { color: var(--muted); font-size: 12px; padding: 6px 2px; }
+  .side .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+  button { background: var(--accent); color: #fff; border: none; border-radius: 6px;
+           padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  button.secondary { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+  button.secondary:hover { background: var(--panel); }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* ---- 主区：消息流 ---- */
+  .main { display: flex; flex-direction: column; min-width: 0; }
+  .stream { flex: 1; overflow-y: auto; padding: 26px 0 12px; }
+  .stream-inner { max-width: 860px; margin: 0 auto; padding: 0 26px; }
+
+  .turn { margin-bottom: 26px; display: flex; gap: 12px; }
+  .turn .who { flex: 0 0 34px; height: 34px; border-radius: 8px; display: flex;
+               align-items: center; justify-content: center; font-size: 12px;
+               font-weight: 700; border: 1px solid var(--border); background: var(--panel); }
+  .turn.user .who { background: var(--user-bubble); border-color: var(--accent); color: var(--accent); }
+  .turn.agent .who { background: var(--panel); color: var(--muted); }
+  .turn .body { flex: 1; min-width: 0; }
+  .turn .bubble { border: 1px solid var(--border); background: var(--agent-bubble);
+                  border-radius: 10px; padding: 12px 15px; box-shadow: var(--shadow);
+                  white-space: pre-wrap; word-break: break-word; line-height: 1.62; }
+  .turn.user .bubble { background: var(--user-bubble); border-color: rgba(9,105,218,.35); }
+  .turn .stamp { font-size: 11px; color: var(--muted); margin-top: 5px; }
+  .turn.agent .bubble.plain { background: transparent; border: none; box-shadow: none;
+                              padding: 2px 0; }
+
+  /* ---- 思考过程（折叠块，像 Codex 一样可展开） ---- */
+  details.think { margin: 0 0 10px; border: 1px solid var(--border); border-radius: 9px;
+                  background: var(--panel); overflow: hidden; }
+  details.think > summary { cursor: pointer; padding: 7px 12px; font-size: 12px;
+                            color: var(--muted); user-select: none; list-style: none; }
+  details.think > summary::-webkit-details-marker { display: none; }
+  details.think > summary::before { content: "▸ "; }
+  details.think[open] > summary::before { content: "▾ "; }
+  details.think .think-body { padding: 2px 12px 10px; border-top: 1px dashed var(--border); }
+  .tstep { display: flex; gap: 8px; align-items: baseline; font-size: 12px;
+           padding: 4px 0; color: var(--muted); }
+  .tstep .dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%;
+                background: var(--border); margin-top: 5px; }
+  .tstep.running .dot { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+  .tstep.done .dot { background: var(--ok); }
+  .tstep.failed .dot { background: var(--err); }
+  .tstep .lbl { color: var(--text); font-weight: 600; }
+  .tstep .det { color: var(--muted); font-size: 11px; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+  .caret { display: inline-block; width: 7px; height: 14px; background: var(--accent);
+           vertical-align: text-bottom; margin-left: 2px; animation: pulse 1s step-end infinite; }
+
+  .errbox { background: rgba(207,34,46,.08); border: 1px solid rgba(207,34,46,.3);
+            color: var(--err); padding: 8px 10px; border-radius: 8px; font-size: 12px;
+            margin-top: 8px; white-space: pre-wrap; }
+  .step { font-size: 12px; color: var(--muted); padding: 2px 0; }
+  .gate { font-size: 12px; color: var(--warn); padding: 2px 0; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .hidden { display: none !important; }
+
+  /* ---- 底部输入区 ---- */
+  .composer-wrap { border-top: 1px solid var(--border); background: var(--bg); padding: 12px 0 16px; }
+  .composer-inner { max-width: 860px; margin: 0 auto; padding: 0 26px; }
+  .quick-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+  .composer { display: flex; gap: 10px; align-items: flex-end; }
+  textarea { flex: 1; min-height: 62px; max-height: 220px; resize: vertical;
+             background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+             color: var(--text); padding: 10px 12px; font-size: 14px;
+             font-family: "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.5; }
+  textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(9,105,218,.12); }
+  .composer button { padding: 11px 20px; }
+  .composer-hint { font-size: 11px; color: var(--muted); margin-top: 7px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SYSU 多组学分析 Agent</h1>
+  <span class="badge">对话</span>
+  <span class="crumb" id="projectName">未选择项目</span>
+  <span id="stateBadge" class="state">idle</span>
+  <nav>
+    <a href="/">项目首页</a>
+    <a href="/workbench">分析工作台</a>
+    <a href="/settings">设置</a>
+  </nav>
+</header>
+
+<div class="shell">
+  <!-- ============ 左栏：项目 + 对话列表 ============ -->
+  <div class="side">
+    <h2>项目</h2>
+    <ul class="list" id="projectList"><li class="muted">加载中…</li></ul>
+
+    <h2>对话</h2>
+    <ul class="list" id="threadList"><li class="muted">请先选择项目。</li></ul>
+    <div class="row">
+      <button class="small" id="newChat" onclick="newThread()">＋ 新对话</button>
+      <button class="small secondary" onclick="renameThread()">重命名</button>
+    </div>
+  </div>
+
+  <!-- ============ 右栏：大片消息流 + 输入框 ============ -->
+  <div class="main">
+    <div class="stream" id="chatStream">
+      <div class="stream-inner">
+        <div class="muted" id="emptyHint">选择左侧对话，或在下方直接提问。</div>
+      </div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer-inner">
+        <div class="quick-row">
+          <button class="small secondary" onclick="quickAsk('生成执行计划')">生成计划</button>
+          <button class="small secondary" onclick="quickAsk('解释当前门禁')">解释当前门禁</button>
+          <button class="small secondary" onclick="quickAsk('浏览我的服务器目录')">浏览服务器目录</button>
+          <button class="small secondary" onclick="quickAsk('当前状态如何')">当前状态</button>
+        </div>
+        <div class="composer" id="chatComposer">
+          <textarea id="chatInput" rows="3"
+            placeholder="问点什么，或直接说「生成计划」「把线程改成 16」…（Enter 发送，Shift+Enter 换行）"></textarea>
+          <button id="chatSend" onclick="sendMessage()">发送</button>
+        </div>
+        <div class="composer-hint" id="viaHint"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "{{ token }}";
+const INITIAL_PROJECT = "{{ project_id }}";
+const INITIAL_THREAD = "{{ thread_id }}";
+let currentProject = INITIAL_PROJECT || "";
+let currentThread = INITIAL_THREAD || "";
+let streaming = false;
+
+/* ---------------- 基础工具 ---------------- */
+async function api(method, path, body) {
+  const opts = { method, headers: { "x-session-token": TOKEN } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const resp = await fetch(path, opts);
+  if (!resp.ok) {
+    const text = await resp.text();
+    return { error: text, status: resp.status };
+  }
+  return resp.json();
+}
+
+function wizardPath(rel) {
+  return "/api/projects/" + encodeURIComponent(currentProject) + rel;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/&#39;/g, "&#39;");
+}
+
+function humanTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(0, 19).replace("T", " ");
+  return d.toLocaleString();
+}
+
+function setState(state) {
+  const badge = document.getElementById("stateBadge");
+  const s = String(state || "idle");
+  badge.textContent = s;
+  badge.className = "state " + s.toLowerCase();
+}
+
+/* ---------------- 项目 / 对话列表 ---------------- */
+function loadProjects() {
+  api("GET", "/api/projects").then(d => {
+    const el = document.getElementById("projectList");
+    const rows = d.projects || [];
+    if (!rows.length) {
+      el.innerHTML = "<li class='muted'>还没有项目，请到「项目首页」新建。</li>";
+      return;
+    }
+    el.innerHTML = rows.map(p => `
+      <li class="${p.project_id === currentProject ? 'active' : ''}"
+          onclick="selectProject('${escapeHtml(p.project_id)}')">
+        <div>${escapeHtml(p.title || p.project_id)}</div>
+        <div class="sub">${escapeHtml(p.visible_state || p.state || '')}</div>
+      </li>`).join("");
+  });
+}
+
+function selectProject(id) {
+  currentProject = id;
+  currentThread = "";
+  const url = new URL(window.location.href);
+  url.searchParams.set("project", id);
+  url.searchParams.delete("thread");
+  history.pushState({}, "", url);
+  document.getElementById("projectName").textContent = id;
+  document.getElementById("emptyHint") && (document.getElementById("emptyHint").textContent = "");
+  clearStream();
+  loadProjects();
+  loadThreads();
+  refreshState();
+}
+
+function renderThreads(rows) {
+  const el = document.getElementById("threadList");
+  if (!currentProject) { el.innerHTML = "<li class='muted'>请先选择项目。</li>"; return; }
+  if (!rows || !rows.length) { el.innerHTML = "<li class='muted'>该项目还没有对话。</li>"; return; }
+  el.innerHTML = rows.map(t => `
+    <li class="${t.thread_id === currentThread ? 'active' : ''}"
+        onclick="selectThread('${escapeHtml(t.thread_id)}')">
+      <div>${escapeHtml(t.title || t.thread_id)}</div>
+      <div class="sub">${t.message_count || 0} 条消息</div>
+    </li>`).join("");
+}
+
+function loadThreads() {
+  if (!currentProject) { renderThreads([]); return; }
+  api("GET", wizardPath("/threads")).then(d => {
+    const rows = d.threads || [];
+    renderThreads(rows);
+    // 未指定对话时自动选中最近一个，避免新消息无处落盘。
+    if (!currentThread && rows.length) {
+      currentThread = rows[0].thread_id;
+      renderThreads(rows);
+      loadMessages();
+    } else if (currentThread) {
+      loadMessages();
+    }
+  });
+}
+
+function selectThread(tid) {
+  currentThread = tid;
+  const url = new URL(window.location.href);
+  url.searchParams.set("thread", tid);
+  history.pushState({}, "", url);
+  loadThreads();
+}
+
+function newThread() {
+  if (!currentProject) { alert("请先选择一个项目。"); return; }
+  const title = prompt("新对话标题（留空自动生成）", "");
+  api("POST", wizardPath("/threads"), { title: title || "" }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    currentThread = d.thread_id;
+    loadThreads();
+  });
+}
+
+function renameThread() {
+  if (!currentProject || !currentThread) { alert("请先选择一个对话。"); return; }
+  const title = prompt("重命名对话", currentThread);
+  if (title === null) return;
+  api("PATCH", wizardPath("/threads/" + encodeURIComponent(currentThread)), { title }).then(d => {
+    if (d.error) { alert(d.error); return; }
+    loadThreads();
+  });
+}
+
+/* ---------------- 消息流渲染 ---------------- */
+function clearStream() {
+  const el = document.getElementById("chatStream");
+  el.innerHTML = '<div class="stream-inner"><div class="muted" id="emptyHint">选择左侧对话，或在下方直接提问。</div></div>';
+}
+
+function streamInner() {
+  const el = document.getElementById("chatStream");
+  let inner = el.querySelector(".stream-inner");
+  if (!inner) {
+    inner = document.createElement("div");
+    inner.className = "stream-inner";
+    el.appendChild(inner);
+  }
+  return inner;
+}
+
+function scrollToBottom() {
+  const el = document.getElementById("chatStream");
+  el.scrollTop = el.scrollHeight;
+}
+
+/* 渲染一条已落盘的消息（含上次的思考过程）。 */
+function renderMessage(role, content, references, createdAt) {
+  const isUser = role === "user";
+  const inner = streamInner();
+  const hint = document.getElementById("emptyHint");
+  if (hint) hint.remove();
+
+  const turn = document.createElement("div");
+  turn.className = "turn " + (isUser ? "user" : "agent");
+
+  let thinkHtml = "";
+  const steps = references && references.steps;
+  if (!isUser && Array.isArray(steps) && steps.length) {
+    const via = references.via === "llm" ? "大模型" : (references.via === "tool" ? "执行操作" : "规则");
+    thinkHtml = `
+      <details class="think">
+        <summary>思考过程 · ${steps.length} 步 · ${escapeHtml(via)}</summary>
+        <div class="think-body">
+          ${steps.map(s => `
+            <div class="tstep ${escapeHtml(s.status || '')}">
+              <span class="dot"></span>
+              <span><span class="lbl">${escapeHtml(s.label || '')}</span>
+                ${s.detail ? `<span class="det">— ${escapeHtml(s.detail)}</span>` : ""}</span>
+            </div>`).join("")}
+        </div>
+      </details>`;
+  }
+
+  turn.innerHTML = `
+    <div class="who">${isUser ? "你" : "AI"}</div>
+    <div class="body">
+      ${thinkHtml}
+      <div class="bubble">${escapeHtml(content)}</div>
+      ${createdAt ? `<div class="stamp">${escapeHtml(humanTime(createdAt))}</div>` : ""}
+    </div>`;
+  inner.appendChild(turn);
+  scrollToBottom();
+  return turn;
+}
+
+function loadMessages() {
+  if (!currentProject || !currentThread) { clearStream(); return; }
+  api("GET", wizardPath("/threads/" + encodeURIComponent(currentThread) + "/messages")).then(d => {
+    const msgs = d.messages || [];
+    clearStream();
+    if (!msgs.length) {
+      streamInner().innerHTML = '<div class="muted">这个对话还没有消息。在下方提问开始吧。</div>';
+      return;
+    }
+    const inner = streamInner();
+    inner.innerHTML = "";
+    msgs.forEach(m => renderMessage(m.role, m.content, m.references, m.created_at));
+  });
+}
+
+function refreshState() {
+  if (!currentProject) { setState("idle"); return; }
+  api("GET", "/api/state?project=" + encodeURIComponent(currentProject)).then(d => {
+    if (d && d.state) setState(d.state);
+  });
+}
+
+/* ---------------- 流式发送 ---------------- */
+function setComposerBusy(busy) {
+  streaming = busy;
+  const btn = document.getElementById("chatSend");
+  const ta = document.getElementById("chatInput");
+  if (btn) { btn.disabled = busy; btn.textContent = busy ? "生成中…" : "发送"; }
+  if (ta) ta.disabled = busy;
+}
+
+/* 本轮进行中的思考块：步骤原地更新，正文逐段追加。 */
+function beginLiveTurn(question) {
+  renderMessage("user", question, null, new Date().toISOString());
+
+  const inner = streamInner();
+  const turn = document.createElement("div");
+  turn.className = "turn agent";
+  turn.innerHTML = `
+    <div class="who">AI</div>
+    <div class="body">
+      <details class="think" open>
+        <summary id="liveThinkSummary">思考过程 · 进行中</summary>
+        <div class="think-body" id="liveSteps"></div>
+      </details>
+      <div class="bubble plain" id="liveReply"></div>
+    </div>`;
+  inner.appendChild(turn);
+  scrollToBottom();
+  return turn;
+}
+
+function upsertStep(step) {
+  const wrap = document.getElementById("liveSteps");
+  if (!wrap) return;
+  let row = wrap.querySelector(`[data-step="${step.id}"]`);
+  if (!row) {
+    row = document.createElement("div");
+    row.dataset.step = step.id;
+    wrap.appendChild(row);
+  }
+  row.className = "tstep " + (step.status || "");
+  row.innerHTML = `
+    <span class="dot"></span>
+    <span><span class="lbl">${escapeHtml(step.label || '')}</span>
+      ${step.detail ? `<span class="det">— ${escapeHtml(step.detail)}</span>` : ""}</span>`;
+  const summary = document.getElementById("liveThinkSummary");
+  if (summary) {
+    const n = wrap.querySelectorAll("[data-step]").length;
+    const running = wrap.querySelector(".tstep.running");
+    summary.textContent = `思考过程 · ${n} 步${running ? " · 进行中" : " · 完成"}`;
+  }
+  scrollToBottom();
+}
+
+function appendDelta(text) {
+  const bubble = document.getElementById("liveReply");
+  if (!bubble) return;
+  let span = bubble.querySelector(".live-text");
+  if (!span) {
+    bubble.innerHTML = '<span class="live-text"></span><span class="caret"></span>';
+    span = bubble.querySelector(".live-text");
+  }
+  span.textContent += text;
+  scrollToBottom();
+}
+
+function finishLiveTurn(settled) {
+  const bubble = document.getElementById("liveReply");
+  if (bubble) {
+    const caret = bubble.querySelector(".caret");
+    if (caret) caret.remove();
+    if (!bubble.textContent.trim()) {
+      bubble.textContent = settled && settled.reply ? settled.reply : "（没有返回内容）";
+    }
+    const body = bubble.parentElement;
+    const stamp = document.createElement("div");
+    stamp.className = "stamp";
+    stamp.textContent = humanTime(new Date().toISOString());
+    body.appendChild(stamp);
+  }
+  const details = document.querySelector("details.think[open] #liveSteps");
+  if (details) {
+    const wrap = details.parentElement;
+    if (wrap && wrap.tagName === "DETAILS") wrap.open = false;  // 完成后收起，保持版面干净
+  }
+  const summary = document.getElementById("liveThinkSummary");
+  if (summary) summary.textContent = summary.textContent.replace("进行中", "完成");
+  // 清掉本轮临时 id，避免下一轮误命中。
+  ["liveSteps", "liveReply", "liveThinkSummary"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.removeAttribute("id");
+  });
+}
+
+function sendMessage() {
+  if (!currentProject) { alert("请先在左侧选择一个项目。"); return; }
+  if (streaming) return;
+  const input = document.getElementById("chatInput");
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = "";
+  dispatch(q);
+}
+
+function quickAsk(text) {
+  if (!currentProject) { alert("请先在左侧选择一个项目。"); return; }
+  if (streaming) return;
+  dispatch(text);
+}
+
+/* 与后端 /api/chat/stream 打交道：POST + 手工解析 SSE（fetch 的流式读取）。 */
+async function dispatch(q) {
+  setComposerBusy(true);
+  beginLiveTurn(q);
+  const hint = document.getElementById("viaHint");
+  if (hint) hint.textContent = "";
+
+  let settled = null;
+  const url = "/api/chat/stream?project=" + encodeURIComponent(currentProject)
+            + (currentThread ? "&thread=" + encodeURIComponent(currentThread) : "");
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "x-session-token": TOKEN, "content-type": "application/json" },
+      body: JSON.stringify({ message: q, thread_id: currentThread || undefined }),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      showStreamError(text || ("HTTP " + resp.status));
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE 以空行分隔事件；最后一段可能不完整，留在 buffer 里。
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        handleEvent(block, ev => { if (ev.event === "done") settled = ev.data; });
+      }
+    }
+    if (buffer.trim()) handleEvent(buffer, ev => { if (ev.event === "done") settled = ev.data; });
+  } catch (err) {
+    showStreamError("请求失败：" + String(err));
+    return;
+  } finally {
+    finishLiveTurn(settled);
+    setComposerBusy(false);
+    if (settled) {
+      if (settled.state) setState(settled.state);
+      if (hint) {
+        const via = settled.via === "llm" ? "大模型" : (settled.via === "tool" ? "执行操作" : "规则路由");
+        hint.textContent = "本轮由" + via + "完成。" + (settled.gate ? " 门禁：" + settled.gate : "");
+      }
+      // 让新消息进入会话记录：重拉列表（首次对话会被自动创建）。
+      if (settled.thread_id && settled.thread_id !== currentThread) {
+        currentThread = settled.thread_id;
+      }
+      loadThreads();
+    }
+  }
+}
+
+function handleEvent(block, onDone) {
+  let name = "";
+  const dataLines = [];
+  block.replace(/\r\n/g, "\n").split("\n").forEach(line => {
+    if (line.startsWith("event:")) name = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+  });
+  if (!name) return;
+  let data = {};
+  const raw = dataLines.join("\n");
+  if (raw) { try { data = JSON.parse(raw); } catch (e) { data = {}; } }
+
+  if (name === "step") upsertStep(data);
+  else if (name === "delta") appendDelta(data.text || "");
+  else if (name === "error") showStreamError(data.message || "出错了");
+  else if (name === "done") onDone({ event: name, data });
+}
+
+function showStreamError(message) {
+  const bubble = document.getElementById("liveReply");
+  if (bubble) bubble.innerHTML = `<span class="errbox">${escapeHtml(message)}</span>`;
+}
+
+/* ---------------- 启动 ---------------- */
+document.getElementById("chatInput").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+if (currentProject) document.getElementById("projectName").textContent = currentProject;
+loadProjects();
+loadThreads();
+refreshState();
+</script>
+</body>
+</html>

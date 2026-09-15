@@ -43,6 +43,36 @@ class ChatIntent:
 
 # -- intent matching --------------------------------------------------------
 
+# 知识提问的识别标记：用户在问概念 / 原理 / 区别，而不是在下指令。
+_QUESTION_MARKERS = (
+    "解释", "什么是", "什么叫", "区别", "为什么", "原理",
+    "怎么理解", "介绍一下", "讲讲", "讲一下", "说明一下", "有什么不同",
+    "有何不同", "影响", "含义", "是什么意思", "科普", "怎么看", "合理吗",
+    "需要注意", "注意事项", "教我",
+)
+
+# 明确的执行指令：出现这些词说明用户确实要系统去做事，提问守卫随即失效，
+# 交回下面的规则分支（否则「帮我做差异表达」会被误当成提问放走）。
+_EXECUTION_MARKERS = (
+    "帮我做", "帮我跑", "帮我生成", "帮我执行", "给我做", "替我",
+    "启用", "打开", "开启", "关闭", "关掉", "停用", "禁用", "加上",
+    "去掉", "取消", "为对照", "作为参照", "作为对照",
+    "生成计划", "制定计划", "确认冻结", "回滚", "撤销",
+)
+
+
+def _is_knowledge_question(text: str) -> bool:
+    """True when the message asks about concepts rather than ordering work.
+
+    用户诉求（2026-09-15）：「我需要 llm 的思考执行结果」。此前
+    「解释一下差异表达的原理」「测序深度对差异表达有什么影响」这类提问会
+    命中下面的规则意图（被当成步骤开关 / 状态查询），于是配好大模型也只能
+    拿到一句生硬的规则文案。这里先做一次守卫，把纯提问放行给大模型。
+    """
+    if not _has(text, list(_QUESTION_MARKERS)):
+        return False
+    return not _has(text, list(_EXECUTION_MARKERS))
+
 
 def route_intent(text: str) -> ChatIntent | None:
     """Map a free-text user message to a session action.
@@ -52,6 +82,10 @@ def route_intent(text: str) -> ChatIntent | None:
     """
     lowered = text.strip().lower()
     if not lowered:
+        return None
+
+    # 概念性提问优先交回调用方（大模型）回答，而不是被规则意图抢走。
+    if _is_knowledge_question(lowered):
         return None
 
     # Read-only remote sample discovery.  The executor owns SSH and command

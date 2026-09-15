@@ -282,6 +282,21 @@ def apply_llm_to_config(config: dict[str, Any], shared: dict[str, Any]) -> dict[
     return merged
 
 
+def llm_model_name(config: dict[str, Any] | None) -> str:
+    """Return the configured model name from a runtime config, or ``""``.
+
+    模型名嵌在 ``config["llm"]["model"]``。状态行、思考过程等展示位经常直接
+    对顶层取 ``model`` 而永远取空（界面遂显示「未指定模型」），统一收口到
+    这里，调用方不必再记得层级。
+    """
+    if not isinstance(config, dict):
+        return ""
+    block = config.get("llm")
+    if not isinstance(block, dict):
+        return ""
+    return str(block.get("model") or "").strip()
+
+
 def apply_connection_to_config(
     config: dict[str, Any], connection: dict[str, Any]
 ) -> dict[str, Any]:
