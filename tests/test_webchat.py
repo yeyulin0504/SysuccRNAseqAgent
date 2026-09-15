@@ -262,6 +262,55 @@ class TestKnowledgeQuestionsAreNotHijacked:
         assert route_intent(command) is not None, f"命令被误放行：{command}"
 
 
+class TestMissingProjectIsActionable:
+    """没有 project.json 时不能把状态机的裸错误抛给用户。
+
+    用户实测（2026-09-15）：在尚未建立分析会话的项目里问「生成执行计划」，
+    收到的是「操作未完成：当前状态 idle 不允许该操作；允许的状态：
+    drafting/planned/confirmed」——那是实现细节。此时状态恒为 idle，用户
+    真正需要的是「先去哪一步」。
+    """
+
+    @pytest.mark.parametrize("action", ["plan", "confirm", "edit", "rollback", "deg_status", "summary"])
+    def test_bare_state_machine_error_is_replaced(self, tmp_path: Path, action: str) -> None:
+        from rnaseq_agent.session import ProjectSession
+
+        project_dir = tmp_path / "empty"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        session = ProjectSession(project_dir)
+        session.load_session()
+        assert session.config is None
+
+        result = execute_intent(session, ChatIntent(action, params={"server": {"threads": 8}}))
+
+        # 不得再出现裸状态机文案，也不得走异常分支。
+        reply = result.get("reply", "")
+        assert "error" not in result, result
+        assert "idle" not in reply, reply
+        assert "不允许该操作" not in reply, reply
+        assert reply.strip(), f"{action} 必须给出可操作指引"
+        assert result["state"] == "idle"
+
+    def test_plan_reply_points_at_the_workbench(self, tmp_path: Path) -> None:
+        from rnaseq_agent.session import ProjectSession
+
+        project_dir = tmp_path / "empty2"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        session = ProjectSession(project_dir)
+        session.load_session()
+
+        result = execute_intent(session, ChatIntent("plan"))
+        assert "工作台" in result["reply"]
+        assert "project.json" in result["reply"]
+
+    def test_real_session_still_plans(self, tmp_path: Path) -> None:
+        """守卫只在 session.config is None 时生效，不能误伤正常项目。"""
+        session = _make_session(tmp_path)
+        result = execute_intent(session, ChatIntent("plan", message="生成计划"))
+        assert "steps" in result
+        assert session.state == "planned"
+
+
 class TestExecuteIntent:
     def test_plan_updates_session(self, tmp_path: Path) -> None:
         session = _make_session(tmp_path)

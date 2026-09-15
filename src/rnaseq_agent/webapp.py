@@ -104,6 +104,9 @@ def _default_workspace_dir() -> Path:
 def _session_for(project_dir: Path) -> ProjectSession:
     session = ProjectSession(project_dir)
     session.load_session()
+    # 任何会话入口都先恢复全局凭据：密码只存在用户级配置里（DPAPI 加密），
+    # 进程重启后内存凭据为空，不在这里补齐就会出现「每次进来都要重填密码」。
+    _restore_runtime_credential()
     # 用户级共享连接与大模型：所有项目共用同一套配置（配一次即可）。仅在
     # 项目已有配置时在内存中覆盖，不回写磁盘，避免污染项目自身记录。
     if session.config is not None:
@@ -130,10 +133,15 @@ def _connection_as_config() -> dict[str, Any] | None:
     ``create_remote_transport`` expects a config dict with a ``server`` block.
     The user-level connection is a flat field map, so adapt it here; return
     None when no usable host is configured.
+
+    顺带把凭据恢复进运行时存储：调用方拿到 config 后经常直接建 transport，
+    若这里不注入，`create_remote_transport` 会因为「本次程序中没有临时密码」
+    直接失败，用户就不得不反复重填密码。
     """
     shared = load_connection()
     if not shared.get("host"):
         return None
+    _restore_runtime_credential(shared)
     from copy import deepcopy
 
     return {"server": deepcopy(shared)}
@@ -263,9 +271,19 @@ def _llm_messages(text: str) -> list[dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "你是 SYSU 多组学分析 Agent 的前端助手。用户正在配置一个"
-                "bulk RNA-seq 分析项目。能识别为可执行操作时，简短回复并提示"
-                "可继续点击「生成执行计划 / 确认并冻结契约 / 启用差异表达」。"
+                "你是 SYSU 多组学分析 Agent 的前端助手，用户正在配置一个 "
+                "bulk RNA-seq 分析项目。\n"
+                "\n"
+                "重要约束：你没有执行任何工具的能力，也看不到文件系统。"
+                "绝对不要声称你已经「保存了配置」「写入了文件」「修改了参数」"
+                "或「完成了分析」——这些只有系统的确定性代码才能做。"
+                "当用户给你路径、样本或参考基因组信息时，"
+                "只做归纳与确认（例如列出识别到的样本和参考文件），"
+                "然后明确提示用户：真正的写入需要点击界面按钮，"
+                "或让我代为执行（可执行动作会由系统真实执行并回报结果）。\n"
+                "\n"
+                "涉及可执行操作时，简短回复并提示可继续点「生成执行计划 / "
+                "确认并冻结契约 / 启用差异表达」。"
             ),
         },
         {"role": "user", "content": text},

@@ -1440,6 +1440,16 @@ function cmsGate() {
 }
 
 /* ---------- 初始化 ---------- */
+/* Enter 发送 / Shift+Enter 换行。之前这里没有绑定，用户只能点「发送」按钮。 */
+document.addEventListener("keydown", e => {
+  const t = e.target;
+  if (!t || t.id !== "chatInput") return;
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    sendChat();
+  }
+});
+
 document.getElementById("projectName").textContent = currentProject || "未选择项目";
 syncChatPageLink();
 addFastqSampleRow({});

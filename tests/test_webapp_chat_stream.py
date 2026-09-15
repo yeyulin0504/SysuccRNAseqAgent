@@ -353,6 +353,49 @@ class TestThreadPersistence:
         assert state["state"] == "planned"
 
 
+class TestPlanWithoutProjectIsActionable:
+    """没有 project.json 的项目里问「生成执行计划」，要给下一步而不是裸错误。
+
+    用户实测（2026-09-15）：AI 先谎称「配置已保存 ✓」，随后「生成执行计划」
+    返回「操作未完成：当前状态 idle 不允许该操作；允许的状态：
+    drafting/planned/confirmed」。根因是项目根本没有分析会话，
+    ``session.config is None`` 使状态恒为 idle。
+    """
+
+    def test_stream_reply_is_not_a_bare_state_error(self, client) -> None:
+        token = _token(client)
+        # 只注册项目，不建分析会话（等价于用户当时的状态）。
+        _create_project(client, token, "no_session")
+
+        events = _stream(client, token, "生成执行计划", project="no_session")
+        done = events[-1]["data"]
+
+        assert done["state"] == "idle"
+        reply = done["reply"]
+        assert "不允许该操作" not in reply, reply
+        assert "当前状态" not in reply, reply
+        # 必须指向下一步。
+        assert "工作台" in reply, reply
+        assert "project.json" in reply, reply
+
+    def test_state_endpoint_confirms_no_config(self, client) -> None:
+        """守住前提：这个场景确实是缺 project.json，而不是判定逻辑出错。"""
+        token = _token(client)
+        _create_project(client, token, "no_session2")
+        state = client.get("/api/state?project=no_session2", headers=_headers(token)).json()
+        assert state["state"] == "idle"
+        assert state["config"] is None
+
+    def test_project_with_session_still_plans(self, client) -> None:
+        """守卫不能误伤有配置的项目。"""
+        token = _token(client)
+        _create_project(client, token, "has_session")
+        _with_session(client, token, "has_session")
+
+        events = _stream(client, token, "生成执行计划", project="has_session")
+        assert events[-1]["data"]["state"] == "planned"
+
+
 class TestChatPage:
     def test_chat_page_renders(self, client) -> None:
         resp = client.get("/chat")
@@ -378,3 +421,71 @@ class TestChatPage:
     def test_workbench_links_to_chat_page(self, client) -> None:
         page = client.get("/workbench").text
         assert 'href="/chat' in page
+
+
+class TestChatPageScrollsToLatest:
+    """发消息后要停在最新结果，而不是弹回顶部。
+
+    用户实测（2026-09-15）：「发送对话后这个界面自动滚到最顶部了，而不是
+    展示下面的对话结果」。根因是 ``.stream`` 作为 flex 子项没有
+    ``min-height: 0``，被内容撑高后自身不滚动，``scrollTop`` 写它无效；
+    再加上内容刚 append 时高度未结算，同步赋值会落在旧高度上。
+    """
+
+    def test_stream_is_a_bounded_scroll_container(self, client) -> None:
+        page = client.get("/chat").text
+        # flex 子项默认 min-height:auto，必须显式归零才能成为滚动容器。
+        assert re.search(r"\.main\s*\{[^}]*min-height:\s*0", page), "`.main` 缺少 min-height:0"
+        assert re.search(r"\.stream\s*\{[^}]*min-height:\s*0", page), "`.stream` 缺少 min-height:0"
+        assert re.search(r"\.stream\s*\{[^}]*overflow-y:\s*auto", page), "`.stream` 未成为滚动容器"
+
+    def test_scroll_to_bottom_waits_for_layout(self, client) -> None:
+        page = client.get("/chat").text
+        # 内容 append 后高度未结算，需在下一帧再滚一次。
+        assert "function scrollToBottom()" in page
+        assert "requestAnimationFrame" in page, "滚动未等待布局完成"
+        assert "el.scrollTop = el.scrollHeight" in page
+
+    def test_manual_scroll_up_is_not_interrupted(self, client) -> None:
+        """用户往上翻时不能被流式输出拽回底部。"""
+        page = client.get("/chat").text
+        assert "function isNearBottom" in page
+        # appendDelta 必须条件跟随，而不是无条件滚动。
+        delta = page.split("function appendDelta(text)")[1].split("function ")[0]
+        assert "isNearBottom()" in delta, "appendDelta 未做「贴近底部才跟随」判断"
+
+
+class TestComposerSendsOnEnter:
+    """Enter 发送、Shift+Enter 换行。
+
+    用户实测（2026-09-15）：「点击键盘 enter 并不能发送，只能点击发送按钮」。
+    ``workbench.html`` 里根本没有为 ``#chatInput`` 绑过 ``keydown``——用户当时
+    就在工作台对话；``chat.html`` 虽绑了，但直接绑到元素上，脚本顺序一变就
+    整体中断。两个页面统一改成 document 级委托。
+    """
+
+    @pytest.mark.parametrize("path", ["/chat", "/workbench"])
+    def test_composer_binds_enter_via_delegation(self, client, path: str) -> None:
+        page = client.get(path).text
+        assert 'document.addEventListener("keydown"' in page, f"{path} 没有键盘监听"
+        handler = page.split('document.addEventListener("keydown"')[1].split("});")[0]
+        assert "chatInput" in handler, f"{path} 的键盘监听未覆盖 #chatInput"
+        assert 'e.key === "Enter"' in handler, f"{path} 未处理 Enter"
+
+    @pytest.mark.parametrize("path", ["/chat", "/workbench"])
+    def test_shift_enter_and_ime_are_respected(self, client, path: str) -> None:
+        page = client.get(path).text
+        handler = page.split('document.addEventListener("keydown"')[1].split("});")[0]
+        # Shift+Enter 换行：不得在按下 Shift 时发送。
+        assert "!e.shiftKey" in handler, f"{path} 会吞掉 Shift+Enter 的换行"
+        # 中文输入法组合态按 Enter 是选词，不能当发送。
+        assert "e.isComposing" in handler, f"{path} 未排除输入法组合态"
+
+    @pytest.mark.parametrize(
+        "path,submit",
+        [("/chat", "sendMessage()"), ("/workbench", "sendChat()")],
+    )
+    def test_enter_calls_the_page_submit_function(self, client, path: str, submit: str) -> None:
+        page = client.get(path).text
+        handler = page.split('document.addEventListener("keydown"')[1].split("});")[0]
+        assert submit in handler, f"{path} 的 Enter 未调用 {submit}"

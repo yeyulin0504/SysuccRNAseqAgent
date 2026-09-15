@@ -253,6 +253,31 @@ def _match_reference_condition(text: str) -> str | None:
 
 # -- execution -------------------------------------------------------------
 
+# 需要真实项目配置（project.json）才能执行的动作。项目尚未建立时状态恒为
+# ``idle``，StateMachine 会抛「当前状态 idle 不允许该操作」——那是实现细节，
+# 用户需要的是「先去哪一步」。
+_NEEDS_PROJECT = {"plan", "confirm", "edit", "rollback", "deg_status", "summary"}
+
+
+def _missing_project_reply(action: str) -> str:
+    """Turn a bare state-machine rejection into an actionable next step."""
+    if action == "plan":
+        return (
+            "这个项目还没有分析会话（缺 project.json），所以暂时无法生成执行计划。\n"
+            "请先在「分析工作台」完成输入与样本配置：\n"
+            "  1) 选择数据来源（远程路径 / 本地上传 / counts 矩阵）；\n"
+            "  2) 填好目录与参考基因组，应用样本表；\n"
+            "做完这步我就能生成执行计划了。"
+        )
+    if action == "confirm":
+        return "还没有可冻结的执行计划。请先完成输入配置并生成执行计划。"
+    if action == "deg_status":
+        return "这个项目还没有分析会话。请先在工作台完成输入与样本配置。"
+    return (
+        "这个项目还没有分析会话（缺 project.json），无法执行该操作。"
+        "请先在「分析工作台」完成数据来源与样本配置。"
+    )
+
 
 def execute_intent(session, intent: ChatIntent) -> dict[str, Any]:
     """Execute a routed intent against the audited ProjectSession.
@@ -263,6 +288,13 @@ def execute_intent(session, intent: ChatIntent) -> dict[str, Any]:
     from .session import SessionError
 
     action = intent.action
+
+    # 没有项目配置时状态恒为 idle，任何状态机动作都会抛出
+    # 「当前状态 idle 不允许该操作」这类裸错误——用户看不懂该干什么。
+    # 这里统一换成「下一步做什么」的可操作指引。
+    if action in _NEEDS_PROJECT and session.config is None:
+        return {"state": session.state, "reply": _missing_project_reply(action)}
+
     try:
         if action == "new":
             if session.config is not None:

@@ -54,8 +54,12 @@
   button:disabled { opacity: .5; cursor: not-allowed; }
 
   /* ---- 主区：消息流 ---- */
-  .main { display: flex; flex-direction: column; min-width: 0; }
-  .stream { flex: 1; overflow-y: auto; padding: 26px 0 12px; }
+  /* min-height:0 是关键：flex 子项默认 min-height:auto，会被内容撑高，
+     导致 .stream 自身不滚动（overflow 失效）、scrollTop 写在它身上没反应。
+     min-height:0 让 .stream 成为真正受限的滚动容器。 */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .stream { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-anchor: none;
+            padding: 26px 0 12px; }
   .stream-inner { max-width: 860px; margin: 0 auto; padding: 0 26px; }
 
   .turn { margin-bottom: 26px; display: flex; gap: 12px; }
@@ -324,9 +328,25 @@ function streamInner() {
   return inner;
 }
 
+/* 滚到底部：消息流是受限容器，但内容刚 append 时高度还没结算，
+   直接同步 scrollTop 有时会落在旧高度上（表现为「跳到顶部」）。
+   用 rAF 等一帧布局完成后再滚，并在下一帧再补一次以防图片/换行撑高。 */
 function scrollToBottom() {
   const el = document.getElementById("chatStream");
-  el.scrollTop = el.scrollHeight;
+  if (!el) return;
+  const pin = () => { el.scrollTop = el.scrollHeight; };
+  pin();
+  requestAnimationFrame(() => {
+    pin();
+    requestAnimationFrame(pin);
+  });
+}
+
+/* 用户手动往上翻时不打断阅读：只有已经贴近底部才自动跟随。 */
+function isNearBottom(slack = 120) {
+  const el = document.getElementById("chatStream");
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= slack;
 }
 
 /* 渲染一条已落盘的消息（含上次的思考过程）。 */
@@ -447,13 +467,15 @@ function upsertStep(step) {
 function appendDelta(text) {
   const bubble = document.getElementById("liveReply");
   if (!bubble) return;
+  // 流式期间只在用户已贴近底部时跟随，避免把正在往上翻的人拽回去。
+  const follow = isNearBottom();
   let span = bubble.querySelector(".live-text");
   if (!span) {
     bubble.innerHTML = '<span class="live-text"></span><span class="caret"></span>';
     span = bubble.querySelector(".live-text");
   }
   span.textContent += text;
-  scrollToBottom();
+  if (follow) scrollToBottom();
 }
 
 function finishLiveTurn(settled) {
@@ -582,8 +604,16 @@ function showStreamError(message) {
 }
 
 /* ---------------- 启动 ---------------- */
-document.getElementById("chatInput").addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+/* Enter 发送 / Shift+Enter 换行。用 document 级委托而不是直接绑到
+   #chatInput：元素一旦缺失或脚本顺序变化，直接绑会抛错并让后续初始化
+   全部中断（表现就是「点按钮能发、Enter 没反应」）。 */
+document.addEventListener("keydown", e => {
+  const t = e.target;
+  if (!t || t.id !== "chatInput") return;
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    sendMessage();
+  }
 });
 
 if (currentProject) document.getElementById("projectName").textContent = currentProject;

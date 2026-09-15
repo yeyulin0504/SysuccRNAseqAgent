@@ -514,6 +514,80 @@ class TestWebApp:
         assert credential.mode == "password"
         assert credential.password == "restore-me"
 
+    def test_restart_restores_password_on_any_session_entry(self, client) -> None:
+        """重启后只要进任何会话入口就该恢复密码，不必先去设置页点一下。
+
+        用户诉求（2026-09-15）：「我不想每次重新进去都要重新写一遍我的服务器
+        账号密码……就算我关了重新运行也不需要重新配置」。此前恢复只发生在
+        ``GET /api/config``，用户直接打开工作台 / 对话页时运行时凭据仍为空，
+        ``create_remote_transport`` 于是报「本次程序中没有临时密码」。
+        """
+        from rnaseq_agent.ssh_auth import clear_ssh_credential, get_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password", "password": "keep-me"}},
+            headers=_headers(token),
+        )
+
+        # 模拟重启：进程内凭据清空。
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+        assert get_ssh_credential("10.30.24.1", "yeyulin").password == ""
+
+        # 只读一次项目状态（工作台/对话页打开时就会调用），不碰 /api/config。
+        assert client.get("/api/state", headers=_headers(token)).status_code == 200
+
+        credential = get_ssh_credential("10.30.24.1", "yeyulin")
+        assert credential.mode == "password"
+        assert credential.password == "keep-me"
+
+    def test_connection_as_config_restores_password_for_transport(self, client) -> None:
+        """``_connection_as_config()`` 取回连接后必须能立刻建 transport。
+
+        这条路径是「项目还没有 project.json 就浏览服务器目录」时用的；
+        如果它只返回字段而不注入凭据，密码用户会直接撞上
+        「本次程序中没有临时密码」。
+        """
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.ssh_auth import clear_ssh_credential, get_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password", "password": "pw-123456789"}},
+            headers=_headers(token),
+        )
+        clear_ssh_credential("10.30.24.1", "yeyulin")
+
+        resolved = webapp._connection_as_config()
+        assert resolved is not None
+        assert resolved["server"]["host"] == "10.30.24.1"
+
+        credential = get_ssh_credential("10.30.24.1", "yeyulin")
+        assert credential.mode == "password"
+        assert credential.password == "pw-123456789"
+
+    def test_runtime_credential_is_not_clobbered_by_stale_shared_config(self, client) -> None:
+        """当前进程里刚填的密码优先于磁盘上的旧值，避免被还原逻辑覆盖。"""
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.ssh_auth import set_ssh_credential, get_ssh_credential
+
+        token = _token(client)
+        _new_project(client, token)
+        client.post(
+            "/api/config",
+            json={"server": {"host": "10.30.24.1", "user": "yeyulin", "auth_mode": "password", "password": "on-disk"}},
+            headers=_headers(token),
+        )
+        # 用户在本次进程里改成了新密码。
+        set_ssh_credential("10.30.24.1", "yeyulin", mode="password", password="in-memory")
+
+        webapp._restore_runtime_credential()
+        assert get_ssh_credential("10.30.24.1", "yeyulin").password == "in-memory"
+
     def test_llm_test_and_model_list_use_configured_api(self, client, monkeypatch) -> None:
         import requests
 
@@ -714,6 +788,40 @@ class TestWebApp:
         # Rule router takes over.
         assert resp.get("state") == "planned"
         assert "steps" in resp
+
+
+class TestSystemPromptForbidsFakeWrites:
+    """大模型不得声称自己「保存了配置」——它没有工具能力。
+
+    用户实测（2026-09-15）：粘贴 FASTQ 路径与参考基因组后，AI 回了一句
+    「已识别为配置保存操作……配置已保存 ✓」，但项目里根本没有 project.json，
+    紧接着「生成执行计划」就报状态错误。那条「配置已保存」是模型编造的：
+    真正写盘的只有确定性代码。因此系统提示词必须明确禁止这类声明。
+    """
+
+    def test_prompt_states_no_tool_capability(self) -> None:
+        import rnaseq_agent.webapp as webapp
+
+        system = next(m["content"] for m in webapp._llm_messages("测试") if m["role"] == "system")
+        assert "没有执行任何工具的能力" in system
+        assert "绝对不要声称" in system
+
+    @pytest.mark.parametrize(
+        "claim",
+        ["保存了配置", "写入了文件", "修改了参数", "完成了分析"],
+    )
+    def test_prompt_lists_the_forbidden_claims(self, claim: str) -> None:
+        import rnaseq_agent.webapp as webapp
+
+        system = next(m["content"] for m in webapp._llm_messages("测试") if m["role"] == "system")
+        assert claim in system, f"提示词未禁止声称「{claim}」"
+
+    def test_prompt_tells_the_model_to_point_at_real_buttons(self) -> None:
+        import rnaseq_agent.webapp as webapp
+
+        system = next(m["content"] for m in webapp._llm_messages("测试") if m["role"] == "system")
+        assert "生成执行计划" in system
+        assert "确认并冻结契约" in system
 
 
 class TestSharedLlmConfig:
