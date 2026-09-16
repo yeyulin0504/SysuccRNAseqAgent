@@ -76,6 +76,10 @@ Full Chinese usage guide: [docs/usage.md](docs/usage.md)
 
 Project flow diagrams: [docs/flow.md](docs/flow.md)
 
+LLM tool permission model: [docs/llm_tool_permission_model.md](docs/llm_tool_permission_model.md)
+
+Testing and numerical evaluation roadmap: [docs/testing_and_evaluation_roadmap.md](docs/testing_and_evaluation_roadmap.md)
+
 From this repository without installation:
 
 ```powershell
