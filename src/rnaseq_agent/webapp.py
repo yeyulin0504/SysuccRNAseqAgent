@@ -266,7 +266,12 @@ def _connection_error_hint(exc: Exception) -> str:
 
 
 def _llm_messages(text: str) -> list[dict[str, str]]:
-    """The system + user turn shared by the streaming and non-streaming paths."""
+    """The system + user turn for the **fallback** plain-text LLM path.
+
+    这条通道只在对话图不可用（未装 langgraph、图构建失败）时使用，模型确实
+    没有可调用的工具——所以措辞要如实：不要声称写盘，交给确定性代码。
+    正常路径的提示词在 ``chat_graph.SYSTEM_PROMPT``（那里模型是有工具的）。
+    """
     return [
         {
             "role": "system",
@@ -274,7 +279,7 @@ def _llm_messages(text: str) -> list[dict[str, str]]:
                 "你是 SYSU 多组学分析 Agent 的前端助手，用户正在配置一个 "
                 "bulk RNA-seq 分析项目。\n"
                 "\n"
-                "重要约束：你没有执行任何工具的能力，也看不到文件系统。"
+                "重要约束：这条通道里你没有可调用的工具，也看不到文件系统。"
                 "绝对不要声称你已经「保存了配置」「写入了文件」「修改了参数」"
                 "或「完成了分析」——这些只有系统的确定性代码才能做。"
                 "当用户给你路径、样本或参考基因组信息时，"
@@ -1283,16 +1288,15 @@ def create_app(
         session: ProjectSession,
         history_text: list[str],
     ) -> dict[str, Any]:
-        """把对话里的配置**真正写入项目**（用户诉求 2026-09-16）。
+        """把**对话文本**里的配置真正写入项目（正则兜底路径）。
 
-        与 ``POST /api/projects/{id}/fastq/session`` 完全共用同一条落盘链路
-        （``save_intake`` + ``_default_config`` + ``session.new_project``），
-        所以对话写盘和界面按钮写盘产生的结果没有任何差别，审计记录一致。
+        只负责「从自然语言里抽取」，抽完交给 ``_write_project_session`` 落盘。
+        有 LLM 时走的是 ``_tool_write_project_config``——模型直接给出结构化参数，
+        无需抽取，但两条路最终落到同一个写盘函数，所以结果与审计完全一致。
 
-        ``history_text`` 是**当前对话的全部用户消息**（最新的在前或后都可以，
-        按时间顺序拼接）。只取单条消息是不够的：用户经常第一条消息贴 FASTQ
-        路径、第二条消息补参考基因组、第三条才说「你帮我执行」——配置信息
-        必须从整个对话里汇总。
+        ``history_text`` 是**当前对话的全部用户消息**（按时间顺序）。只取单条
+        是不够的：用户经常第一条消息贴 FASTQ 路径、第二条补参考基因组、第三条
+        才说「你帮我执行」——配置信息必须从整个对话里汇总。
         """
         from .config_intake import extract_config_draft
 
@@ -1314,10 +1318,38 @@ def create_app(
                 lines.extend(f"  - {item}" for item in draft.warnings)
             return {"reply": "\n".join(lines), "state": session.state}
 
+        return _write_project_session(
+            project_id,
+            session,
+            {**draft.to_payload(), "project_id": project_id},
+            warnings=draft.warnings,
+        )
+
+    def _write_project_session(
+        project_id: str,
+        session: ProjectSession,
+        payload: dict[str, Any],
+        *,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Write a project session to disk. **The single write path.**
+
+        正则抽取路径（``_configure_project_from_chat``）与 LLM 工具路径
+        （``_run_tool`` 的 ``write_project_config``）都走这里，所以「对话写盘」
+        「按钮写盘」「模型写盘」三者产生的结果没有任何差别，审计记录一致。
+
+        ``payload`` 的形状与 ``POST /api/projects/{id}/fastq/session`` 一致。
+        """
+        samples = list(payload.get("samples") or [])
+        layout = str(payload.get("layout") or "paired")
+        data_source = str(payload.get("data_source") or "remote_path")
+        fastq_dir = str(payload.get("fastq_dir") or payload.get("remote_fastq_dir") or "")
+
         # 已有会话：不覆盖。与 fastq/session 的 SESSION_EXISTS 语义一致，
-        # 避免对话反复把用户已经确认过的样本设计冲掉。
+        # 避免反复把用户已经确认过的样本设计冲掉。
         if (session.project_dir / "session.json").is_file():
             return {
+                "ok": False,
                 "reply": (
                     "这个项目已经有分析会话了，我没有重复写入（避免覆盖你已确认的样本设计）。\n"
                     "如果确实要用新配置，请先在工作台删除/回滚该项目，或换一个项目。"
@@ -1325,22 +1357,21 @@ def create_app(
                 "state": session.state,
             }
 
-        payload = {**draft.to_payload(), "project_id": project_id}
         try:
             save_intake(
                 session.project_dir,
                 {
                     "route": "bulk_rna",
                     "input_type": (
-                        "remote_fastq" if draft.data_source == "remote_path" else "local_fastq"
+                        "remote_fastq" if data_source == "remote_path" else "local_fastq"
                     ),
                     "state": "input_ready",
                     "fastq": {
-                        "data_source": draft.data_source,
-                        "remote_fastq_dir": draft.fastq_dir if draft.data_source == "remote_path" else "",
-                        "fastq_dir": draft.fastq_dir if draft.data_source != "remote_path" else "",
+                        "data_source": data_source,
+                        "remote_fastq_dir": fastq_dir if data_source == "remote_path" else "",
+                        "fastq_dir": fastq_dir if data_source != "remote_path" else "",
                     },
-                    "samples": draft.samples,
+                    "samples": samples,
                 },
             )
             config = _default_config(session.project_dir, payload)
@@ -1353,35 +1384,35 @@ def create_app(
                 session.project_dir,
                 {
                     "type": "sample_design",
-                    "name": "样本分组（来自对话）",
+                    "name": "样本分组",
                     "state": created.state,
-                    "details": {"count": len(draft.samples), "layout": payload.get("layout")},
+                    "details": {"count": len(samples), "layout": layout},
                 },
             )
         except (SessionError, OSError, ValueError) as exc:
-            return {"reply": f"写入配置时出错：{exc}", "state": session.state}
+            return {"ok": False, "reply": f"写入配置时出错：{exc}", "state": session.state}
 
         lines = [
-            f"已写入项目 {project_id}（{len(draft.samples)} 个样本，"
-            f"{payload.get('layout')} 布局）。"
+            f"已写入项目 {project_id}（{len(samples)} 个样本，{layout} 布局）。"
         ]
         lines.append("样本与分组：")
         lines.extend(
-            f"  {index}. {sample['sample_id']} → {sample.get('condition') or '未分组'}"
-            for index, sample in enumerate(draft.samples, start=1)
+            f"  {index}. {sample.get('sample_id')} → {sample.get('condition') or '未分组'}"
+            for index, sample in enumerate(samples, start=1)
         )
-        lines.append(f"链特异性：{draft.strandedness}")
-        if draft.warnings:
+        lines.append(f"链特异性：{payload.get('strandedness') or 'auto'}")
+        if warnings:
             lines.append("需要你知道：")
-            lines.extend(f"  - {item}" for item in draft.warnings)
+            lines.extend(f"  - {item}" for item in warnings)
         lines.extend(gate.formatted())
         lines.append("下一步：对我说「生成执行计划」。")
         return {
+            "ok": True,
             "reply": "\n".join(lines),
             "state": created.state,
             "gate": gate.formatted(),
             "action": "configure_project",
-            "samples": draft.samples,
+            "samples": samples,
         }
 
     def _fallback_reply(config: dict[str, Any] | None) -> str:
@@ -1440,6 +1471,369 @@ def create_app(
         elif "reply" not in result:
             result["reply"] = intent.message
         return result
+
+    def _chat_history_messages(project_dir: Path, thread_id: str) -> list[dict[str, Any]]:
+        """Prior turns of this thread as OpenAI messages, for graph continuity.
+
+        只取 ``user`` / ``agent`` 两类并映射成 ``user`` / ``assistant``。工具调用
+        与工具结果由**图自己的 checkpoint** 保存，不从这里重建——否则会把历史
+        当成「模型说过的话」，污染上下文。
+        """
+        history: list[dict[str, Any]] = []
+        try:
+            for message in messages(project_dir, thread_id):
+                role = message.get("role")
+                content = str(message.get("content") or "")
+                if not content:
+                    continue
+                if role == "user":
+                    history.append({"role": "user", "content": content})
+                elif role == "agent":
+                    history.append({"role": "assistant", "content": content})
+        except (ThreadError, OSError):
+            return []
+        return history
+
+    def _drive_chat_graph(
+        project_id: str,
+        project_dir: Path,
+        thread_id: str,
+        text: str,
+        llm_config: dict[str, Any],
+        outcome: dict[str, Any],
+        *,
+        resume: dict[str, Any] | None = None,
+    ):
+        """Run one conversational turn through the tool-calling graph.
+
+        Yields ``(event, data)`` pairs for streaming progress only (``delta`` /
+        ``step`` / ``confirm``); the caller encodes them as SSE, keeps the step
+        ledger for persistence, and emits the final ``done`` event itself.
+        结果写入 ``outcome``（reply / via / awaiting_confirmation / confirmation /
+        tool_log），把「生成器 yield」与「返回值」两件事分开，避免闭包赋值。
+
+        ``resume`` 非空时用 ``Command(resume=...)`` 恢复被 ``interrupt`` 挂起的
+        线程：此时**不再传入新的用户输入**，图会从守卫节点继续往下走到执行节点。
+        恢复必须带 checkpointer，所以此处与普通回合共用同一个 SqliteSaver。
+
+        抛异常表示图不可用（缺 langgraph、构建失败等），调用方退回规则路由——
+        与项目其它可选依赖的处理方式一致。
+        """
+        from .agent_graph import sqlite_checkpointer_for
+        from .chat_graph import build_chat_graph, chat_thread_config
+
+        config = chat_thread_config(project_id, thread_id)
+        with sqlite_checkpointer_for(project_dir) as checkpointer:
+            graph = build_chat_graph(
+                executor=_run_tool,
+                llm_config=llm_config,
+                checkpointer=checkpointer,
+            )
+            if resume is not None:
+                from langgraph.types import Command
+
+                graph_input: Any = Command(resume=resume)
+            else:
+                snapshot = graph.get_state(config)
+                seeded = list((snapshot.values or {}).get("messages") or [])
+                if seeded:
+                    # 图自己的 checkpoint 已存了完整消息（含工具调用与工具结果），
+                    # 只追加本轮用户输入，不重复灌入 thread 历史。
+                    graph_input = {
+                        "messages": [{"role": "user", "content": text}],
+                        "iterations": 0,
+                    }
+                else:
+                    graph_input = {
+                        "project_dir": str(project_dir),
+                        "project_id": project_id,
+                        "thread_id": thread_id,
+                        "messages": [
+                            *_chat_history_messages(project_dir, thread_id),
+                            {"role": "user", "content": text},
+                        ],
+                        "iterations": 0,
+                        "tool_log": [],
+                    }
+
+            reply_parts: list[str] = []
+            tool_log: list[dict[str, Any]] = []
+            interrupted: dict[str, Any] | None = None
+
+            for mode, chunk in graph.stream(
+                graph_input, config=config, stream_mode=["custom", "updates"]
+            ):
+                if mode == "custom":
+                    if isinstance(chunk, dict) and chunk.get("type") == "delta":
+                        reply_parts.append(str(chunk.get("text") or ""))
+                        yield "delta", {"text": chunk.get("text")}
+                    continue
+
+                if "__interrupt__" in chunk:
+                    raw = chunk["__interrupt__"]
+                    first = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
+                    interrupted = getattr(first, "value", first)
+                    continue
+
+                for node, values in chunk.items():
+                    if not isinstance(values, dict):
+                        continue
+                    if values.get("tool_log"):
+                        tool_log = list(values["tool_log"])
+                    if node == "agent" and values.get("pending_calls"):
+                        names = "、".join(
+                            str(call.get("name")) for call in values["pending_calls"]
+                        )
+                        yield "step", {
+                            "id": "tool",
+                            "label": f"模型请求工具：{names}",
+                            "status": "running",
+                            "detail": "",
+                        }
+
+            if interrupted:
+                # 挂起：确认卡片交给前端，等 /api/chat/resume。
+                labels = "；".join(
+                    str(call.get("label")) for call in (interrupted.get("calls") or [])
+                )
+                yield "step", {
+                    "id": "confirm",
+                    "label": "等待你确认",
+                    "status": "running",
+                    "detail": labels,
+                }
+                yield "confirm", interrupted
+                outcome.update(
+                    {
+                        "reply": str(interrupted.get("message") or ""),
+                        "via": "tool",
+                        "status": "ok",
+                        "awaiting_confirmation": True,
+                        "confirmation": interrupted,
+                        "tool_log": tool_log,
+                    }
+                )
+                return
+
+            final_state = graph.get_state(config).values or {}
+            outcome.update(
+                {
+                    "reply": str(final_state.get("reply") or "".join(reply_parts) or ""),
+                    "via": str(final_state.get("via") or "llm"),
+                    "streamed": bool(final_state.get("streamed")),
+                    "tool_log": tool_log,
+                    # 透出终态，调用方据此判断模型是否报错、要不要退回规则路由。
+                    "status": str(final_state.get("status") or "ok"),
+                    "error": str(final_state.get("error") or ""),
+                }
+            )
+
+    def _run_tool(
+        name: str,
+        arguments: dict[str, Any],
+        project_dir: Path,
+        approved: bool,
+    ) -> dict[str, Any]:
+        """Execute one LLM-requested tool against the audited session.
+
+        这是对话图与真实系统之间**唯一**的桥。每个工具都必须映射到既有的确定性
+        实现，绝不允许模型自己拼路径、拼命令、或者绕过门禁：
+
+        - ``read_project_state``  → 只读 ``ProjectSession``；
+        - ``browse_remote_samples`` → 复用 ``_scan_remote_samples``（只读 SSH）；
+        - ``write_project_config``  → 复用 ``_write_project_session``（与按钮同一条链路）；
+        - ``configure_pipeline`` / ``set_run_resources`` / ``set_diffexp_reference``
+          / ``rollback_changes`` → 复用 ``session.edit`` / ``rollback``；
+        - ``generate_plan`` / ``confirm_contract`` → 复用 ``session.plan`` / ``confirm``；
+        - ``run_analysis`` → 复用 ``session.execute``。
+
+        ``approved`` 由图上的人工确认关卡给出。写盘/执行类工具在没有批准时一律
+        拒绝——这是纵深防御：即使图的守卫被绕过，这里仍然拦得住。
+        """
+        from .agent_tools import RISK_READ, normalize_write_arguments, risk_of
+
+        session = _session_for(project_dir)
+        # Workspace 里项目目录就是 root / project_id，所以目录名即 project_id。
+        # 旧版单项目模式（legacy_project_dir）下取目录名同样是合理标识。
+        project_id = project_dir.name
+
+        if risk_of(name) != RISK_READ and not approved:
+            return {
+                "ok": False,
+                "error": "这个操作会修改项目，但还没有得到你的确认，所以没有执行。",
+            }
+
+        if name == "read_project_state":
+            config = session.config
+            if config is None:
+                return {
+                    "ok": True,
+                    "reply": "这个项目还没有分析会话（缺 project.json），所以还没有样本表。",
+                    "state": session.state,
+                    "has_session": False,
+                }
+            samples = config.get("samples", {}).get("items", [])
+            payload = {
+                "ok": True,
+                "state": session.state,
+                "has_session": True,
+                "layout": config.get("sequencing", {}).get("layout"),
+                "strandedness": config.get("sequencing", {}).get("strandedness"),
+                "reference": config.get("reference", {}),
+                "pipeline": {
+                    step: bool(value.get("enabled"))
+                    for step, value in (config.get("pipeline") or {}).items()
+                    if isinstance(value, dict)
+                },
+                "samples": [
+                    {
+                        "sample_id": sample.get("sample_id"),
+                        "condition": sample.get("condition"),
+                        "fastq_1": sample.get("fastq_1"),
+                        "fastq_2": sample.get("fastq_2"),
+                    }
+                    for sample in samples
+                ],
+            }
+            conditions = sorted(
+                {str(s.get("condition") or "") for s in samples} - {""}
+            )
+            payload["reply"] = (
+                f"当前状态 {session.state}，{len(samples)} 个样本，"
+                f"分组 {conditions or '（无）'}，"
+                f"链特异性 {payload['strandedness'] or '未设置'}。"
+            )
+            return payload
+
+        if name == "browse_remote_samples":
+            remote_dir = str(arguments.get("path") or "").strip()
+            scan_config = session.config or _connection_as_config()
+            if scan_config is None:
+                return {"ok": False, "error": "请先保存服务器连接配置。"}
+            result = _scan_remote_samples(scan_config, remote_dir)
+            if not result.get("ok"):
+                return {"ok": False, "error": result.get("message", "远程目录扫描失败")}
+            count = len(result.get("samples") or [])
+            return {
+                **result,
+                "ok": True,
+                "scanned_path": remote_dir,
+                "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。",
+            }
+
+        if name == "write_project_config":
+            normalized = normalize_write_arguments(arguments)
+            payload = {
+                "data_source": normalized.get("data_source") or "remote_path",
+                "samples": normalized.get("samples") or [],
+                "strandedness": normalized.get("strandedness") or "unknown",
+                "layout": (
+                    "paired"
+                    if any(s.get("fastq_2") for s in normalized.get("samples") or [])
+                    else "single"
+                ),
+                "project_id": project_id,
+            }
+            directory = str(normalized.get("fastq_dir") or "")
+            if payload["data_source"] == "remote_path":
+                payload["remote_fastq_dir"] = directory
+            else:
+                payload["fastq_dir"] = directory
+            for key in ("gtf", "genome_fasta", "star_index", "rsem_prefix"):
+                if normalized.get(key):
+                    payload[key] = normalized[key]
+            return _write_project_session(project_id, session, payload)
+
+        if name == "configure_pipeline":
+            patch = {"pipeline": {arguments["step"]: {"enabled": bool(arguments["enabled"])}}}
+            verb = "启用" if arguments["enabled"] else "关闭"
+            result = execute_intent(
+                session,
+                ChatIntent(
+                    "edit",
+                    message=f"已{verb} {arguments['step']}。",
+                    params=patch,
+                    note=f"模型修改：{verb} {arguments['step']}",
+                ),
+            )
+            return _tool_result_from_intent(result)
+
+        if name == "set_run_resources":
+            server: dict[str, Any] = {}
+            parts = []
+            if arguments.get("threads") is not None:
+                server["threads"] = int(arguments["threads"])
+                parts.append(f"线程数 → {arguments['threads']}")
+            if arguments.get("memory_gb") is not None:
+                server["memory_gb"] = int(arguments["memory_gb"])
+                parts.append(f"内存 → {arguments['memory_gb']} GB")
+            result = execute_intent(
+                session,
+                ChatIntent(
+                    "edit",
+                    message=f"已修改：{'，'.join(parts)}。",
+                    params={"server": server},
+                    note=f"模型修改：{'，'.join(parts)}",
+                ),
+            )
+            return _tool_result_from_intent(result)
+
+        if name == "set_diffexp_reference":
+            reference = str(arguments["reference_condition"]).strip()
+            result = execute_intent(
+                session,
+                ChatIntent(
+                    "edit",
+                    message=f"已启用差异表达，对照组为 {reference}。",
+                    params={
+                        "pipeline": {"diffexp": {"enabled": True}},
+                        "diffexp": {"reference_condition": reference},
+                    },
+                    note=f"模型修改：diffexp reference={reference}",
+                ),
+            )
+            return _tool_result_from_intent(result)
+
+        if name == "rollback_changes":
+            result = execute_intent(session, ChatIntent("rollback", message="已回滚最后一次变更。"))
+            return _tool_result_from_intent(result)
+
+        if name == "generate_plan":
+            result = execute_intent(
+                session, ChatIntent("plan", message="正在生成执行计划。")
+            )
+            return _tool_result_from_intent(result)
+
+        if name == "confirm_contract":
+            result = execute_intent(
+                session, ChatIntent("confirm", message="正在确认并冻结契约。")
+            )
+            return _tool_result_from_intent(result)
+
+        if name == "run_analysis":
+            result = execute_intent(session, ChatIntent("run", message="正在启动分析。"))
+            return _tool_result_from_intent(result)
+
+        return {"ok": False, "error": f"未知工具：{name}"}
+
+    def _tool_result_from_intent(result: dict[str, Any]) -> dict[str, Any]:
+        """Normalise a session-action result into the tool-result shape.
+
+        工具结果会整段回灌给模型（JSON），所以 ``ok`` 必须如实反映成功与否——
+        ``execute_intent`` 用 ``error`` 键表达失败，这里翻译过去。
+        """
+        if result.get("error"):
+            return {
+                "ok": False,
+                "error": str(result["error"]),
+                "state": result.get("state"),
+                "reply": result.get("reply") or str(result["error"]),
+            }
+        return {
+            **result,
+            "ok": True,
+            "reply": result.get("reply") or "操作已完成。",
+        }
 
     def _intent_label(intent: Any) -> str:
         """Human-readable name for the thinking panel."""
@@ -1521,15 +1915,14 @@ def create_app(
         # 既有的 create_remote_transport(config) 契约。
         connection_config = _connection_as_config()
 
-        # Deterministic tool intents take priority over free-form LLM replies.
-        # This prevents the model from inventing shell commands or claiming it
-        # browsed data that was never read through the SSH transport.
+        # 工作台的这个非流式端点保持**确定性**：它没有确认卡片，而写盘/执行类
+        # 工具在拿到人工批准前一律不执行（见 chat_graph.node_guardrail）。
+        # 需要模型自主调工具的对话走 /api/chat/stream（chat.html 有批准入口）。
         intent = route_intent(text)
         if intent is not None and intent.action == "browse_samples":
             return _browse_samples_reply(session, intent, config, connection_config)
 
-        # 落地配置同样不能让模型代劳：它没有工具能力，只能回「我无法执行」。
-        # 这里走确定性写盘，并把真实结果（含门禁）回报给用户。
+        # 落地配置走确定性写盘，并把真实结果（含门禁）回报给用户。
         if intent is not None and intent.action == "configure_project":
             return _configure_project_from_chat(
                 project_id,
@@ -1624,88 +2017,170 @@ def create_app(
 
             via = "rule"
             reply = ""
+            # 答复是否已经逐字推给前端（llm 流式）。True 时收尾不再整段重推。
+            streamed_by_graph = False
 
-            # 3a) 工具动作优先：可执行操作不让模型代劳。
             payload_extra: dict[str, Any] = {}
             # 写盘动作会让状态从 idle 变 drafting，收尾时用这个会话回报真实状态。
             active_session = session
-            if intent is not None and intent.action == "browse_samples":
-                yield step("tool", f"执行操作：{intent_label}", "running")
-                result = _browse_samples_reply(session, intent, config, connection_config)
-                reply = str(result.get("reply") or "")
-                yield step("tool", f"执行操作：{intent_label}", "done")
-                payload_extra = {
-                    k: result[k]
-                    for k in ("action", "samples", "unmatched", "scanned_path")
-                    if k in result
-                }
-            elif intent is not None and intent.action == "configure_project":
-                yield step("tool", "读取对话中的配置", "running")
-                chat_history = _conversation_text(
-                    project_dir,
-                    requested_thread or "main",
-                    text,
-                )
-                draft_summary = _draft_summary(chat_history)
-                yield step("tool", "读取对话中的配置", "done", draft_summary)
-                yield step("tool", "写入项目配置", "running")
-                result = _configure_project_from_chat(project_id, session, chat_history)
-                via = "tool"
-                reply = str(result.get("reply") or "")
-                failed = "gate" not in result and "已写入" not in reply
-                yield step(
-                    "tool",
-                    "写入项目配置",
-                    "failed" if failed else "done",
-                    "" if not failed else reply.splitlines()[0] if reply else "",
-                )
-                payload_extra = {
-                    k: result[k]
-                    for k in ("gate", "action", "samples")
-                    if k in result
-                }
-                # 写盘后状态从 idle 变成 drafting，前端要看到新状态。
-                active_session = _session_for(project_dir)
-            elif intent is not None:
-                yield step("tool", f"执行操作：{intent_label}", "running")
-                result = _execute_chat_intent(session, intent)
-                via = "tool"
-                reply = str(result.get("reply") or "")
-                failed = bool(result.get("error"))
-                yield step(
-                    "tool",
-                    f"执行操作：{intent_label}",
-                    "failed" if failed else "done",
-                    str(result.get("error") or ""),
-                )
-                payload_extra = {
-                    k: result[k]
-                    for k in ("steps", "summary", "gate", "contract_id")
-                    if k in result
-                }
-            # 3b) 提问：能连模型就让模型答，并逐段推给前端。
-            elif llm_config is not None:
+
+            # 3) **模型优先**：思考与生成交给 LLM，它能真正调工具读写项目。
+            #    这是 2026-09-16 用户诉求的核心——此前正则抢在模型前面，
+            #    模型根本没有机会「有自己的执行工具」。
+            #    模型不可用（未配置 / 接口失败 / 图不可用）时，下面退回正则兜底。
+            llm_handled = False
+            if llm_config is not None:
                 model_name = llm_model_name(llm_config) or "未指定"
                 yield step("llm", "调用大模型生成答复", "running", f"模型：{model_name}")
-                chunks: list[str] = []
-                for piece in _llm_stream_chunks(llm_config, text):
-                    if not piece:
-                        continue
-                    chunks.append(piece)
-                    yield sse("delta", {"text": piece})
-                if chunks:
-                    via = "llm"
-                    reply = "".join(chunks)
-                    yield step("llm", "调用大模型生成答复", "done", f"已生成 {len(reply)} 字")
+                outcome: dict[str, Any] = {}
+                graph_thread = requested_thread or "main"
+                graph_failed = False
+                try:
+                    for event, data in _drive_chat_graph(
+                        project_id or project_dir.name,
+                        project_dir,
+                        graph_thread,
+                        text,
+                        llm_config,
+                        outcome,
+                    ):
+                        if event == "step":
+                            yield step(
+                                data["id"], data["label"], data["status"], data["detail"]
+                            )
+                        else:
+                            yield sse(event, data)
+                except Exception as exc:  # noqa: BLE001 - fall back to the rule router
+                    graph_failed = True
+                    yield step(
+                        "llm",
+                        "调用大模型生成答复",
+                        "failed",
+                        f"工具循环不可用（{type(exc).__name__}），改用规则路由",
+                    )
+
+                # 成功判据是「图正常结束且拿到了答复」：模型接口报错时图也会
+                # 把状态置成 llm_error 并返回空串，那种情况要走下面的兜底，
+                # 否则用户只看到一句空回复。
+                graph_ok = (
+                    not graph_failed
+                    and outcome.get("status") == "ok"
+                    and bool(outcome.get("reply"))
+                )
+                if graph_ok:
+                    llm_handled = True
+                    via = str(outcome.get("via") or "llm")
+                    reply = str(outcome.get("reply") or "")
+                    # 挂起等确认时 ``_drive_chat_graph`` 已推过 confirm 步骤与卡片，
+                    # 这里不再补「已生成」——那会让用户以为本轮已经结束了。
+                    if not outcome.get("awaiting_confirmation"):
+                        yield step(
+                            "llm",
+                            "调用大模型生成答复",
+                            "done",
+                            f"已生成 {len(reply)} 字"
+                            + (
+                                f"；用了 {len(outcome.get('tool_log') or [])} 个工具"
+                                if outcome.get("tool_log")
+                                else ""
+                            ),
+                        )
+                    payload_extra.update(
+                        {
+                            k: outcome[k]
+                            for k in ("awaiting_confirmation", "confirmation", "tool_log")
+                            if k in outcome
+                        }
+                    )
+                    # 模型流式输出过就不再整段重推，避免答复出现两遍。
+                    # ``outcome["reply"]`` 已含兜底（终态 reply 为空时用累积的
+                    # token 文本），这里不重复拼接。
+                    streamed_by_graph = bool(via == "llm" and outcome.get("streamed"))
+                    # 写盘类工具会改状态，收尾时用磁盘上的真实状态回报。
+                    if outcome.get("tool_log"):
+                        active_session = _session_for(project_dir)
                 else:
-                    # 模型不可用：退回规则路由，界面不至于空着。
-                    yield step("llm", "调用大模型生成答复", "failed", "模型无响应，改用规则路由")
-            else:
-                reply = _fallback_reply(config)
+                    # 图不可用：退回纯文本模型调用（仍然优于正则）。
+                    chunks: list[str] = []
+                    for piece in _llm_stream_chunks(llm_config, text):
+                        if not piece:
+                            continue
+                        chunks.append(piece)
+                        yield sse("delta", {"text": piece})
+                    if chunks:
+                        llm_handled = True
+                        via = "llm"
+                        reply = "".join(chunks)
+                        streamed_by_graph = True
+                        yield step("llm", "调用大模型生成答复", "done", f"已生成 {len(reply)} 字")
+                    else:
+                        yield step("llm", "调用大模型生成答复", "failed", "模型无响应，改用规则路由")
+
+            # 4) 正则兜底：模型没给出答复时才轮到规则路由。
+            #    保留这条路径有两个作用：模型未配置时不至于瘫掉；模型临时不可用时
+            #    仍能完成「贴配置 → 写盘」这类确定性操作。
+            if not llm_handled:
+                if intent is not None and intent.action == "browse_samples":
+                    yield step("tool", f"执行操作：{intent_label}", "running")
+                    result = _browse_samples_reply(session, intent, config, connection_config)
+                    reply = str(result.get("reply") or "")
+                    yield step("tool", f"执行操作：{intent_label}", "done")
+                    payload_extra = {
+                        k: result[k]
+                        for k in ("action", "samples", "unmatched", "scanned_path")
+                        if k in result
+                    }
+                elif intent is not None and intent.action == "configure_project":
+                    yield step("tool", "读取对话中的配置", "running")
+                    chat_history = _conversation_text(
+                        project_dir,
+                        requested_thread or "main",
+                        text,
+                    )
+                    draft_summary = _draft_summary(chat_history)
+                    yield step("tool", "读取对话中的配置", "done", draft_summary)
+                    yield step("tool", "写入项目配置", "running")
+                    result = _configure_project_from_chat(project_id, session, chat_history)
+                    via = "tool"
+                    reply = str(result.get("reply") or "")
+                    failed = "gate" not in result and "已写入" not in reply
+                    yield step(
+                        "tool",
+                        "写入项目配置",
+                        "failed" if failed else "done",
+                        "" if not failed else reply.splitlines()[0] if reply else "",
+                    )
+                    payload_extra = {
+                        k: result[k]
+                        for k in ("gate", "action", "samples")
+                        if k in result
+                    }
+                    # 写盘后状态从 idle 变成 drafting，前端要看到新状态。
+                    active_session = _session_for(project_dir)
+                elif intent is not None:
+                    yield step("tool", f"执行操作：{intent_label}", "running")
+                    result = _execute_chat_intent(session, intent)
+                    via = "tool"
+                    reply = str(result.get("reply") or "")
+                    failed = bool(result.get("error"))
+                    yield step(
+                        "tool",
+                        f"执行操作：{intent_label}",
+                        "failed" if failed else "done",
+                        str(result.get("error") or ""),
+                    )
+                    payload_extra = {
+                        k: result[k]
+                        for k in ("steps", "summary", "gate", "contract_id")
+                        if k in result
+                    }
 
             if not reply:
                 reply = _fallback_reply(config)
-            if via != "llm":
+            # 等待确认时确认消息已在卡片头部展示，这里再整段推一遍会覆盖卡片
+            # （appendDelta 会重置 bubble 内容），所以跳过。
+            awaiting = bool(payload_extra.get("awaiting_confirmation"))
+            if not awaiting and (via != "llm" or not streamed_by_graph):
                 # 规则/工具答复没有 token 流，整段推一次保持前端逻辑统一。
                 yield sse("delta", {"text": reply})
 
@@ -1740,6 +2215,136 @@ def create_app(
                     result["thread_id"] = thread_id
                     result["message_id"] = saved["message_id"]
                     workspace.set_thread_count(project_id, len(list_threads(project_dir)))
+            except (ThreadError, OSError):  # noqa: BLE001 - 落盘失败不该毁掉这次回答
+                pass
+
+            yield sse("done", result)
+
+        return StreamingResponse(run(), media_type="text/event-stream")
+
+    @app.post("/api/chat/resume")
+    async def api_chat_resume(request: Request):
+        """Resume a chat turn that is suspended on a tool confirmation.
+
+        ``/api/chat/stream`` answers a write/execute tool call with a ``confirm``
+        event and leaves the graph parked at its guardrail node. The UI renders
+        that as an approval card; pressing 批准 / 拒绝 posts here and the graph
+        continues — for an approval, straight into the execute node.
+
+        Body::
+
+            {"project_id": "...", "thread_id": "main",
+             "approved": true, "note": "可选备注"}
+
+        Same SSE framing as ``/api/chat/stream`` (``step`` / ``delta`` /
+        ``confirm`` / ``done``). The user message was already persisted by the
+        original turn, so only the agent answer is appended here.
+        """
+        _guard(request)
+        payload = await request.json()
+        approved = payload.get("approved")
+        if not isinstance(approved, bool):
+            return {"error": "缺少 approved（true / false）。"}
+        note = str(payload.get("note") or "").strip()
+
+        def sse(event: str, data: dict[str, Any]) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+        session = _session_for(_legacy_dir_for(request, payload))
+        config = session.config
+        project_id = _bound_project_id(request, payload)
+        project_dir = session.project_dir
+        thread_id = str(payload.get("thread_id") or "").strip() or "main"
+        llm_config = config if config is not None else _shared_llm_config()
+
+        def run():
+            steps: list[dict[str, Any]] = []
+
+            def step(step_id: str, label: str, status: str, detail: str = "") -> str:
+                record = {"id": step_id, "label": label, "status": status, "detail": detail}
+                steps.append(record)
+                return sse("step", record)
+
+            outcome: dict[str, Any] = {}
+            if llm_config is None:
+                yield step("confirm", "继续执行", "failed", "没有可用的大模型配置，无法恢复这次确认")
+                yield sse(
+                    "done",
+                    {
+                        "state": session.state,
+                        "via": "error",
+                        "reply": "没有可用的大模型配置，无法恢复这次确认，请重新发起请求。",
+                        "thread_id": thread_id,
+                    },
+                )
+                return
+
+            yield step("confirm", "已收到你的决定", "done", "批准执行" if approved else "拒绝执行")
+            try:
+                for event, data in _drive_chat_graph(
+                    project_id or project_dir.name,
+                    project_dir,
+                    thread_id,
+                    "",
+                    llm_config,
+                    outcome,
+                    resume={"approved": approved, "note": note},
+                ):
+                    if event == "step":
+                        yield step(data["id"], data["label"], data["status"], data["detail"])
+                    else:
+                        yield sse(event, data)
+            except Exception as exc:  # noqa: BLE001 - surfaced as a reply
+                yield step("confirm", "继续执行", "failed", f"{type(exc).__name__}")
+                yield sse(
+                    "done",
+                    {
+                        "state": session.state,
+                        "via": "error",
+                        "reply": f"恢复执行失败（{type(exc).__name__}: {exc}）。",
+                        "thread_id": thread_id,
+                    },
+                )
+                return
+
+            via = str(outcome.get("via") or ("tool" if approved else "rejected"))
+            reply = str(outcome.get("reply") or "")
+            # 恢复后又触发新的确认（模型换一种写法继续请求）时，``_drive_chat_graph``
+            # 已经推过 confirm 步骤与卡片，这里不再重复，也不要覆盖卡片。
+            awaiting = bool(outcome.get("awaiting_confirmation"))
+            if not awaiting:
+                if not reply:
+                    reply = "已按你的决定处理。"
+                if not outcome.get("streamed"):
+                    yield sse("delta", {"text": reply})
+
+            state = _session_for(project_dir).state
+            result: dict[str, Any] = {
+                "state": state,
+                "via": via,
+                "reply": reply,
+                "thread_id": thread_id,
+                **{
+                    k: outcome[k]
+                    for k in ("awaiting_confirmation", "confirmation", "tool_log")
+                    if k in outcome
+                },
+            }
+
+            try:
+                if project_id is not None:
+                    try:
+                        get_thread(project_dir, thread_id)
+                    except ThreadError:
+                        create_thread(project_dir, thread_id, title="主分析流程")
+                    saved = append_message(
+                        project_dir,
+                        thread_id,
+                        role="agent",
+                        content=reply,
+                        references={"via": via, "steps": steps},
+                    )
+                    result["message_id"] = saved["message_id"]
             except (ThreadError, OSError):  # noqa: BLE001 - 落盘失败不该毁掉这次回答
                 pass
 

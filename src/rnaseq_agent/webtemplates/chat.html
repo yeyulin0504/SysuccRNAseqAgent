@@ -103,6 +103,27 @@
   .errbox { background: rgba(207,34,46,.08); border: 1px solid rgba(207,34,46,.3);
             color: var(--err); padding: 8px 10px; border-radius: 8px; font-size: 12px;
             margin-top: 8px; white-space: pre-wrap; }
+
+  /* ---- 高风险操作的确认卡片（写盘 / 执行必须人工批准） ---- */
+  .confirm-card { border: 1px solid rgba(210,153,34,.5); border-radius: 10px;
+                  background: rgba(210,153,34,.07); padding: 12px 14px; margin-top: 8px; }
+  .confirm-card .head { font-size: 13px; font-weight: 600; color: var(--warn); margin-bottom: 8px; }
+  .confirm-card .call { border-top: 1px dashed rgba(210,153,34,.35); padding: 8px 0; font-size: 12px; }
+  .confirm-card .call:first-of-type { border-top: none; padding-top: 0; }
+  .confirm-card .call .name { font-weight: 600; color: var(--text); }
+  .confirm-card .call .risk { font-size: 10px; padding: 1px 6px; border-radius: 999px;
+                              margin-left: 6px; background: rgba(207,34,46,.14); color: var(--err); }
+  .confirm-card .call .risk.write { background: rgba(210,153,34,.18); color: var(--warn); }
+  .confirm-card .call .desc { color: var(--muted); margin-top: 4px; white-space: pre-wrap;
+                              font-family: Consolas, monospace; font-size: 11px; }
+  .confirm-card .note { width: 100%; margin-top: 10px; min-height: 40px; max-height: 120px;
+                        font-size: 12px; padding: 7px 9px; }
+  .confirm-card .acts { display: flex; gap: 8px; margin-top: 10px; }
+  .confirm-card .acts button { padding: 7px 16px; font-size: 13px; }
+  .confirm-card .acts button.approve { background: var(--ok); border-color: var(--ok); color: #fff; }
+  .confirm-card .acts button.reject { background: transparent; border: 1px solid var(--err);
+                                      color: var(--err); }
+  .confirm-card .settled { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .step { font-size: 12px; color: var(--muted); padding: 2px 0; }
   .gate { font-size: 12px; color: var(--warn); padding: 2px 0; }
   .muted { color: var(--muted); font-size: 12px; }
@@ -420,9 +441,11 @@ function setComposerBusy(busy) {
   if (ta) ta.disabled = busy;
 }
 
-/* 本轮进行中的思考块：步骤原地更新，正文逐段追加。 */
-function beginLiveTurn(question) {
-  renderMessage("user", question, null, new Date().toISOString());
+/* 本轮进行中的思考块：步骤原地更新，正文逐段追加。
+   ``echoUser`` 为 false 时不渲染用户气泡——resume（批准/拒绝）是接续上一轮，
+   凭空插一句「（批准执行）」会污染会话记录。 */
+function beginLiveTurn(question, echoUser = true) {
+  if (echoUser) renderMessage("user", question, null, new Date().toISOString());
 
   const inner = streamInner();
   const turn = document.createElement("div");
@@ -543,22 +566,7 @@ async function dispatch(q) {
       showStreamError(text || ("HTTP " + resp.status));
       return;
     }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      // SSE 以空行分隔事件；最后一段可能不完整，留在 buffer 里。
-      let sep;
-      while ((sep = buffer.indexOf("\n\n")) >= 0) {
-        const block = buffer.slice(0, sep);
-        buffer = buffer.slice(sep + 2);
-        handleEvent(block, ev => { if (ev.event === "done") settled = ev.data; });
-      }
-    }
-    if (buffer.trim()) handleEvent(buffer, ev => { if (ev.event === "done") settled = ev.data; });
+    await readSSE(resp, ev => { if (ev.event === "done") settled = ev.data; });
   } catch (err) {
     showStreamError("请求失败：" + String(err));
     return;
@@ -594,6 +602,7 @@ function handleEvent(block, onDone) {
 
   if (name === "step") upsertStep(data);
   else if (name === "delta") appendDelta(data.text || "");
+  else if (name === "confirm") renderConfirmCard(data);
   else if (name === "error") showStreamError(data.message || "出错了");
   else if (name === "done") onDone({ event: name, data });
 }
@@ -601,6 +610,114 @@ function handleEvent(block, onDone) {
 function showStreamError(message) {
   const bubble = document.getElementById("liveReply");
   if (bubble) bubble.innerHTML = `<span class="errbox">${escapeHtml(message)}</span>`;
+}
+
+/* 高风险操作的确认卡片：后端 interrupt 挂起后推 confirm 事件，这里渲染成
+   批准 / 拒绝 卡片，用户点击后 POST /api/chat/resume 恢复同一张图的线程。
+   模型不能替用户点这个按钮——写盘与执行的决定权始终在人手上。 */
+function renderConfirmCard(payload) {
+  const bubble = document.getElementById("liveReply");
+  if (!bubble) return;
+  const calls = Array.isArray(payload.calls) ? payload.calls : [];
+  const rows = calls.map(c => `
+    <div class="call">
+      <span class="name">${escapeHtml(c.label || c.name || '')}</span>
+      <span class="risk ${escapeHtml(c.risk || '')}">${escapeHtml(c.risk === 'execute' ? '执行' : '写入')}</span>
+      <div class="desc">${escapeHtml(c.description || '')}</div>
+    </div>`).join("");
+
+  bubble.innerHTML = `
+    <div class="confirm-card" id="liveConfirm">
+      <div class="head">${escapeHtml(payload.message || '以下操作需要你确认后才会执行。')}</div>
+      ${rows}
+      <textarea class="note" id="liveConfirmNote" placeholder="可选：写一句备注（拒绝时模型会看到）"></textarea>
+      <div class="acts">
+        <button class="approve" id="liveConfirmApprove">批准执行</button>
+        <button class="reject" id="liveConfirmReject">拒绝</button>
+      </div>
+    </div>`;
+  const approve = document.getElementById("liveConfirmApprove");
+  const reject = document.getElementById("liveConfirmReject");
+  if (approve) approve.onclick = () => resolveConfirm(true);
+  if (reject) reject.onclick = () => resolveConfirm(false);
+  scrollToBottom();
+}
+
+/* 提交决定：卡片原地变成「已批准 / 已拒绝」，随后走同一套 SSE 处理。 */
+async function resolveConfirm(approved) {
+  const card = document.getElementById("liveConfirm");
+  if (!card || streaming) return;
+  const noteEl = document.getElementById("liveConfirmNote");
+  const note = noteEl ? noteEl.value.trim() : "";
+  const acts = card.querySelector(".acts");
+  if (acts) acts.remove();
+  if (noteEl) noteEl.remove();
+  const settled = document.createElement("div");
+  settled.className = "settled";
+  settled.textContent = approved ? "已批准，正在执行…" : "已拒绝，正在告诉模型…";
+  card.appendChild(settled);
+
+  setComposerBusy(true);
+  // 恢复时沿用同一轮思考块：清掉旧 id 之外的内容，让后续 step/delta 能落位。
+  const live = document.getElementById("liveReply");
+  if (live) live.removeAttribute("id");
+  await dispatchResume(approved, note);
+}
+
+/* 与 /api/chat/resume 打交道：与 dispatch 共用 SSE 解析与收尾逻辑。 */
+async function dispatchResume(approved, note) {
+  beginLiveTurn("", false);
+  const hint = document.getElementById("viaHint");
+  let settled = null;
+  try {
+    const resp = await fetch("/api/chat/resume?project=" + encodeURIComponent(currentProject), {
+      method: "POST",
+      headers: { "x-session-token": TOKEN, "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: currentProject,
+        thread_id: currentThread || undefined,
+        approved: approved,
+        note: note,
+      }),
+    });
+    if (!resp.ok) {
+      showStreamError((await resp.text()) || ("HTTP " + resp.status));
+      return;
+    }
+    await readSSE(resp, ev => { if (ev.event === "done") settled = ev.data; });
+  } catch (err) {
+    showStreamError("恢复执行失败：" + String(err));
+    return;
+  } finally {
+    finishLiveTurn(settled);
+    setComposerBusy(false);
+    if (settled) {
+      if (settled.state) setState(settled.state);
+      if (hint) hint.textContent = "本轮由" + (settled.via === "llm" ? "大模型" : "执行操作") + "完成。";
+      if (settled.thread_id && settled.thread_id !== currentThread) currentThread = settled.thread_id;
+      loadThreads();
+    }
+  }
+}
+
+/* 统一的 SSE 流读取：dispatch 与 dispatchResume 共用，避免两处解析漂移。 */
+async function readSSE(resp, onEvent) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE 以空行分隔事件；最后一段可能不完整，留在 buffer 里。
+    let sep;
+    while ((sep = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      handleEvent(block, onEvent);
+    }
+  }
+  if (buffer.trim()) handleEvent(buffer, onEvent);
 }
 
 /* ---------------- 启动 ---------------- */

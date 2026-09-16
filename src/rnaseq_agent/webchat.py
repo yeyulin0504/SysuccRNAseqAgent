@@ -291,7 +291,7 @@ def _match_reference_condition(text: str) -> str | None:
 # 需要真实项目配置（project.json）才能执行的动作。项目尚未建立时状态恒为
 # ``idle``，StateMachine 会抛「当前状态 idle 不允许该操作」——那是实现细节，
 # 用户需要的是「先去哪一步」。
-_NEEDS_PROJECT = {"plan", "confirm", "edit", "rollback", "deg_status", "summary"}
+_NEEDS_PROJECT = {"plan", "confirm", "edit", "rollback", "deg_status", "summary", "run"}
 
 
 def _missing_project_reply(action: str) -> str:
@@ -308,6 +308,8 @@ def _missing_project_reply(action: str) -> str:
         return "还没有可冻结的执行计划。请先完成输入配置并生成执行计划。"
     if action == "deg_status":
         return "这个项目还没有分析会话。请先在工作台完成输入与样本配置。"
+    if action == "run":
+        return "这个项目还没有分析会话，无法启动分析。请先完成输入配置、生成计划并确认冻结。"
     return (
         "这个项目还没有分析会话（缺 project.json），无法执行该操作。"
         "请先在「分析工作台」完成数据来源与样本配置。"
@@ -346,6 +348,18 @@ def execute_intent(session, intent: ChatIntent) -> dict[str, Any]:
                 "state": session.state,
                 "reply": f"契约已冻结：{contract['contract_id'][:24]}…",
                 "contract_id": contract["contract_id"],
+            }
+
+        if action == "run":
+            # 真正启动分析（LLM 工具路径用）。session.execute 要求契约已冻结，
+            # 未冻结时抛出的 SessionError 会被下面的 except 转成可读提示。
+            outcome = session.execute(wait=False)
+            return {
+                "state": outcome.get("state", session.state),
+                "reply": (
+                    f"分析已启动（状态 {outcome.get('state', session.state)}）。"
+                    f"\n{outcome.get('message') or ''}".rstrip()
+                ),
             }
 
         if action == "edit":

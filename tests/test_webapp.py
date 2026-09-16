@@ -791,19 +791,25 @@ class TestWebApp:
 
 
 class TestSystemPromptForbidsFakeWrites:
-    """大模型不得声称自己「保存了配置」——它没有工具能力。
+    """大模型不得声称自己「保存了配置」——这条通道里它没有工具可调。
 
     用户实测（2026-09-15）：粘贴 FASTQ 路径与参考基因组后，AI 回了一句
     「已识别为配置保存操作……配置已保存 ✓」，但项目里根本没有 project.json，
     紧接着「生成执行计划」就报状态错误。那条「配置已保存」是模型编造的：
     真正写盘的只有确定性代码。因此系统提示词必须明确禁止这类声明。
+
+    2026-09-16 起：**正常**对话路径（``/api/chat/stream``）的模型是真有工具的
+    （见 ``chat_graph.SYSTEM_PROMPT``），写盘由它的 ``write_project_config``
+    加人工确认完成。本提示词只服务这条「对话图不可用」的纯文本兜底通道，
+    所以措辞改成如实描述「这条通道里没有可调用的工具」。
     """
 
     def test_prompt_states_no_tool_capability(self) -> None:
         import rnaseq_agent.webapp as webapp
 
         system = next(m["content"] for m in webapp._llm_messages("测试") if m["role"] == "system")
-        assert "没有执行任何工具的能力" in system
+        # 兜底通道必须如实说明：这里没有工具，写盘只能由确定性代码做。
+        assert "没有可调用的工具" in system
         assert "绝对不要声称" in system
 
     @pytest.mark.parametrize(
