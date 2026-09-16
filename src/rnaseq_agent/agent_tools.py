@@ -135,8 +135,8 @@ REFERENCE_FIELDS = {
 #: counts = 从 counts 直入）。
 CMS_RUN_MODES = ("pipeline", "counts")
 
-#: ``server`` 区块里允许模型改的字段。与 webapp ``POST /api/config`` 的
-#: ``allowed`` 集合保持一致——两条路都写同一份连接配置，字段面不该有差别。
+#: ``server`` 区块里允许模型改的非秘密字段。这个集合有意比设置页窄：认证模式、
+#: shell 和密码只能由用户在设置页管理，不能通过对话工具变更。
 CONNECTION_FIELDS = (
     "host",
     "user",

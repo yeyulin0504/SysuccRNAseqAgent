@@ -478,6 +478,7 @@ def build_chat_graph(
         policy = confirmation_policy(str(valid[0].get("name") or ""))
         if policy == POLICY_NEVER:
             return {
+                "messages": list(state.get("messages") or []),
                 "pending_calls": valid,
                 "deferred_calls": rest,
                 "confirmed": False,
@@ -510,9 +511,17 @@ def build_chat_graph(
             }
         )
 
-        approved = bool(decision) and decision.get("approved") is not False
+        # Fail closed: only an explicit JSON boolean true is approval.  The web
+        # endpoint validates this too, but the graph is a public API and must
+        # remain safe for CLI/tests/future callers that bypass that endpoint.
+        approved = isinstance(decision, dict) and decision.get("approved") is True
         if approved:
             return {
+                # A batch may contain both valid and invalid calls.  The
+                # validation errors were appended before interrupt(); resume
+                # re-runs this node, so persist that rebuilt message list in
+                # the returned state before execute handles the valid calls.
+                "messages": list(state.get("messages") or []),
                 "pending_calls": valid,
                 "deferred_calls": rest,
                 "confirmed": True,
@@ -521,7 +530,7 @@ def build_chat_graph(
 
         # 拒绝：不能悄悄丢掉，要让模型知道并给出替代方案。同一轮里**后面的组也
         # 一并放弃**——用户刚说了「不」，继续弹下一张卡片是在逼他重复表态。
-        note = str((decision or {}).get("note") or "").strip()
+        note = str(decision.get("note") or "").strip() if isinstance(decision, dict) else ""
         messages = list(state.get("messages") or [])
         for call in valid:
             messages.append(
@@ -530,6 +539,20 @@ def build_chat_graph(
                     {
                         "ok": False,
                         "error": "用户拒绝了这个操作，没有执行。",
+                        "user_note": note,
+                    },
+                )
+            )
+        for call in rest:
+            messages.append(
+                _tool_error_message(
+                    str(call.get("call_id") or ""),
+                    {
+                        "ok": False,
+                        "error": (
+                            "因为同一轮前面的操作被用户拒绝，这个动作也一并放弃，"
+                            "没有执行。"
+                        ),
                         "user_note": note,
                     },
                 )

@@ -122,6 +122,22 @@ def _initial(project_dir: Path, text: str) -> dict:
     }
 
 
+def _assert_all_declared_tool_calls_are_answered(messages: list[dict]) -> None:
+    """OpenAI protocol invariant: every declared call must receive one tool reply."""
+    declared = {
+        str(call.get("id") or "")
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    answered = {
+        str(message.get("tool_call_id") or "")
+        for message in messages
+        if message.get("role") == "tool"
+    }
+    assert declared == answered
+
+
 # -- 工具契约 ---------------------------------------------------------------
 
 
@@ -152,6 +168,13 @@ class TestToolContract:
         schema = next(s for s in tool_schemas() if s["function"]["name"] == "write_project_config")
         enum = schema["function"]["parameters"]["properties"]["strandedness"]["enum"]
         assert "unknown" in enum
+
+    def test_connection_tool_never_exposes_credentials_or_auth_controls(self) -> None:
+        schema = next(s for s in tool_schemas() if s["function"]["name"] == "edit_connection")
+        properties = schema["function"]["parameters"]["properties"]
+        assert {"password", "private_key", "api_key", "auth_mode", "shell"}.isdisjoint(
+            properties
+        )
 
 
 class TestConfirmationPolicy:
@@ -508,6 +531,160 @@ class TestChatGraphConfirmation:
         assert "用户拒绝" in tool_messages[0]["content"]
         assert "分组写错了" in tool_messages[0]["content"]
         assert "没有写入" in result["reply"]
+
+    def test_rejection_answers_calls_in_the_discarded_queue(self, monkeypatch, tmp_path) -> None:
+        """拒绝第一组时，顺延组也必须收到取消回复，不能留下悬空 tool_call。"""
+        from langgraph.types import Command
+
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("call_a", "set_run_resources", {"threads": 16}),
+                        _tool_call("call_b", "generate_plan", {}),
+                    ]
+                },
+                {"content": "好的，这一批动作都不执行。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "reject-queue"}}
+        graph.invoke(_initial(tmp_path, "改资源并生成计划"), config=config)
+        graph.invoke(Command(resume={"approved": False, "note": "先别改"}), config=config)
+
+        assert recorded == []
+        final_messages = fake.seen_messages[-1]
+        _assert_all_declared_tool_calls_are_answered(final_messages)
+        tool_messages = {
+            message["tool_call_id"]: message["content"]
+            for message in final_messages
+            if message.get("role") == "tool"
+        }
+        assert "用户拒绝" in tool_messages["call_a"]
+        assert "一并放弃" in tool_messages["call_b"]
+
+    @pytest.mark.parametrize(
+        ("decision", "should_execute"),
+        [
+            ({"approved": True}, True),
+            ({"approved": False, "note": "不要"}, False),
+            ({}, False),
+            ({"note": "我只是随手写了句备注"}, False),
+            ({"approved": "yes"}, False),
+            ({"approved": 0}, False),
+            ("yes", False),
+            (True, False),
+            ([], False),
+            ([1], False),
+        ],
+    )
+    def test_confirmation_is_fail_closed(
+        self, monkeypatch, tmp_path, decision, should_execute
+    ) -> None:
+        """只有字面量 True 才是批准；缺失、字符串和数字都按拒绝处理。"""
+        from langgraph.types import Command
+
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "本轮处理完毕。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": f"fail-closed-{decision!r}"}}
+        graph.invoke(_initial(tmp_path, "线程改成 16"), config=config)
+        graph.invoke(Command(resume=decision), config=config)
+
+        assert bool(recorded) is should_execute
+        _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])
+
+    def test_approved_batch_answers_every_declared_call(self, monkeypatch, tmp_path) -> None:
+        """批准路径同样锁住 tool_call 协议不变量。"""
+        from langgraph.types import Command
+
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "set_run_resources", {"threads": 16}),
+                        _tool_call(
+                            "c2", "configure_pipeline", {"step": "rsem", "enabled": False}
+                        ),
+                    ]
+                },
+                {"content": "两项配置已处理。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "approve-protocol"}}
+        graph.invoke(_initial(tmp_path, "改两项配置"), config=config)
+        graph.invoke(Command(resume={"approved": True}), config=config)
+
+        assert [item["name"] for item in recorded] == [
+            "set_run_resources",
+            "configure_pipeline",
+        ]
+        _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])
+
+    def test_invalid_arguments_answer_every_declared_call(self, monkeypatch, tmp_path) -> None:
+        """参数校验失败也必须回一个 tool 消息给模型。"""
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("bad", "set_run_resources", {"threads": -5})]},
+                {"content": "线程数不合法。"},
+            ],
+        )
+        graph.invoke(
+            _initial(tmp_path, "线程改成 -5"),
+            config={"configurable": {"thread_id": "invalid-protocol"}},
+        )
+
+        assert recorded == []
+        _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])
+
+    def test_partly_invalid_batch_keeps_the_error_across_resume(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """同组部分非法时，确认合法调用后仍要保留非法调用的 tool 回复。"""
+        from langgraph.types import Command
+
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("bad", "set_run_resources", {"threads": -5}),
+                        _tool_call(
+                            "good",
+                            "configure_pipeline",
+                            {"step": "rsem", "enabled": False},
+                        ),
+                    ]
+                },
+                {"content": "合法的配置已处理，非法参数没有执行。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "partial-validation"}}
+        first = graph.invoke(_initial(tmp_path, "线程 -5，关闭 rsem"), config=config)
+        card = first["__interrupt__"][0].value
+        assert [call["call_id"] for call in card["calls"]] == ["good"]
+
+        graph.invoke(Command(resume={"approved": True}), config=config)
+
+        assert [item["name"] for item in recorded] == ["configure_pipeline"]
+        _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])
+        tool_messages = {
+            message["tool_call_id"]: message["content"]
+            for message in fake.seen_messages[-1]
+            if message.get("role") == "tool"
+        }
+        assert "不能小于" in tool_messages["bad"]
+        assert '"ok": true' in tool_messages["good"]
 
     def test_execute_risk_also_requires_confirmation(self, monkeypatch, tmp_path) -> None:
         graph, recorded, _ = _graph(

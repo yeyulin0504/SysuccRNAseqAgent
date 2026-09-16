@@ -560,6 +560,47 @@ class TestConnectionEditIsAlwaysSolo:
         # 线程数的旧值也要写出来。
         assert "8" in description and "32" in description, description
 
+    def test_connection_card_uses_the_effective_global_old_value(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        """共享连接覆盖项目 server 时，卡片必须展示真实生效的旧值。"""
+        from rnaseq_agent.connection_store import save_connection
+
+        token = _token(client)
+        _create_project(client, token, "conn_global")
+        _seed_project(tmp_path, monkeypatch, "conn_global")
+        save_connection(
+            {
+                "host": "global.example",
+                "user": "shared-user",
+                "port": 2222,
+                "threads": 64,
+                "memory_gb": 128,
+            }
+        )
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "c1", "edit_connection", {"host": "new.example", "threads": 32}
+                        )
+                    ]
+                },
+                {"content": "已切换连接。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "换到 new.example，32 线程", project="conn_global")
+        card = _confirm_event(events)
+        assert card is not None, events
+        description = card["calls"][0]["description"]
+        assert "global.example" in description, description
+        assert "old.example" not in description, description
+        assert "64" in description and "32" in description, description
+
     def test_connection_edit_is_not_merged_with_other_writes(self, client, tmp_path, monkeypatch) -> None:
         """一轮里同时改连接和别的配置：连接必须独占一张卡。"""
         token = _token(client)
@@ -741,7 +782,138 @@ class TestEditReference:
         assert project["reference"]["remote_gtf_path"] != "ref/local.gtf"
 
 
+class TestDiffexpAndCmsTools:
+    """高风险配置工具必须走 web 端点、确认卡片和真实 session.edit 链路。"""
+
+    def test_set_diffexp_reference_enables_diffexp_and_persists_reference(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "diffexp_tool")
+        _seed_project(tmp_path, monkeypatch, "diffexp_tool")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "c1", "set_diffexp_reference", {"reference_condition": "control"}
+                        )
+                    ]
+                },
+                {"content": "已把 control 设为差异表达对照组。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "以 control 为对照做差异表达", project="diffexp_tool")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "batch", card
+        assert "control" in card["calls"][0]["description"], card
+
+        _resume(client, token, project="diffexp_tool", approved=True)
+        project = _project_json(tmp_path, "diffexp_tool")
+        assert project["pipeline"]["diffexp"]["enabled"] is True
+        assert project["diffexp"]["reference_condition"] == "control"
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["ok"] is True
+
+    def test_set_cms_options_persists_values_and_returns_gate_warnings(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "cms_tool")
+        _seed_project(tmp_path, monkeypatch, "cms_tool")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "c1",
+                            "set_cms_options",
+                            {
+                                "enabled": True,
+                                "n_perm": 2000,
+                                "fdr": 0.1,
+                                "run_mode": "counts",
+                            },
+                        )
+                    ]
+                },
+                {"content": "CMS 已配置，但当前设计还不满足门禁。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "启用 CMS，2000 次置换，FDR 0.1", project="cms_tool")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "batch", card
+        description = card["calls"][0]["description"]
+        assert "2000" in description and "0.1" in description, description
+
+        _resume(client, token, project="cms_tool", approved=True)
+        project = _project_json(tmp_path, "cms_tool")
+        assert project["pipeline"]["cms"]["enabled"] is True
+        assert project["cms"]["n_perm"] == 2000
+        assert project["cms"]["fdr"] == 0.1
+        assert project["cms"]["run_mode"] == "counts"
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["ok"] is True
+        assert any("CRC" in reason for reason in tool_result["gate_warnings"])
+        assert any("30" in reason for reason in tool_result["gate_warnings"])
+
+
 class TestReadOnlyStatusTools:
+    def test_browse_remote_samples_runs_without_a_card_and_returns_pairs(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent import webapp as webapp_module
+
+        token = _token(client)
+        _create_project(client, token, "browse_tool")
+        _seed_project(tmp_path, monkeypatch, "browse_tool")
+        _configure_llm(client, token)
+
+        seen: list[tuple[dict, str]] = []
+
+        def fake_scan(config, remote_dir):
+            seen.append((config, remote_dir))
+            return {
+                "ok": True,
+                "scanned_path": remote_dir,
+                "samples": [
+                    {
+                        "sample_id": "S1",
+                        "fastq_1": "/remote/S1_R1.fastq.gz",
+                        "fastq_2": "/remote/S1_R2.fastq.gz",
+                    }
+                ],
+                "warnings": [],
+            }
+
+        monkeypatch.setattr(webapp_module, "_scan_remote_samples", fake_scan)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "browse_remote_samples", {"path": "/remote/fastq"})
+                    ]
+                },
+                {"content": "识别到一个双端样本。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "扫描 /remote/fastq", project="browse_tool")
+        assert _confirm_event(events) is None, events
+        assert seen and seen[0][1] == "/remote/fastq"
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["ok"] is True
+        assert tool_result["samples"][0]["sample_id"] == "S1"
+
     def test_refresh_status_runs_without_a_card(self, client, tmp_path, monkeypatch) -> None:
         token = _token(client)
         _create_project(client, token, "ro_a")
@@ -776,6 +948,74 @@ class TestReadOnlyStatusTools:
         assert _confirm_event(events) is None, events
         tool_content = fake.seen_messages[-1][-1]["content"]
         assert "report" in tool_content.lower(), tool_content
+
+
+class TestRollbackAndQcDecisionTools:
+    def test_rollback_restores_the_previous_config_after_confirmation(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.session import ProjectSession
+
+        token = _token(client)
+        _create_project(client, token, "rollback_tool")
+        _seed_project(tmp_path, monkeypatch, "rollback_tool")
+        session = ProjectSession(tmp_path / "rollback_tool")
+        session.load_session()
+        session.edit({"server": {"threads": 16}}, note="prepare rollback test")
+        assert _project_json(tmp_path, "rollback_tool")["server"]["threads"] == 16
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "rollback_changes", {})]},
+                {"content": "已撤销上一项配置变更。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "撤销刚才的修改", project="rollback_tool")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "batch", card
+        _resume(client, token, project="rollback_tool", approved=True)
+
+        assert _project_json(tmp_path, "rollback_tool")["server"]["threads"] == 8
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["ok"] is True
+
+    def test_record_qc_decision_writes_the_shared_project_status(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "qc_tool")
+        _seed_project(tmp_path, monkeypatch, "qc_tool")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "c1",
+                            "record_qc_decision",
+                            {"approved": False, "note": "reads retention too low"},
+                        )
+                    ]
+                },
+                {"content": "已记录 QC 不通过，分析停在这里。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "QC 不通过，先停下", project="qc_tool")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "solo", card
+        _resume(client, token, project="qc_tool", approved=True)
+
+        project = _project_json(tmp_path, "qc_tool")
+        assert project["status"]["qc"]["approved"] is False
+        assert project["status"]["qc"]["note"] == "reads retention too low"
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["ok"] is True
 
 
 class TestStageAwareRunAnalysis:
@@ -817,4 +1057,3 @@ class TestStageAwareRunAnalysis:
         assert _confirm_event(events) is None, events
         tool_content = fake.seen_messages[-1][-1]["content"]
         assert "qc" in tool_content, tool_content
-

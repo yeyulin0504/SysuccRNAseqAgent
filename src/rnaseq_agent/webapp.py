@@ -1643,16 +1643,18 @@ def create_app(
         """Read a project's config for confirmation-card rendering. **只读**。
 
         它跑在对话图的守卫节点里（``interrupt`` 之前），所以绝不能触发写盘、
-        也不能抛异常——读不到就返回空 dict，卡片上如实写「（未设置）」。
+        也不能抛异常——读不到就返回空 dict，卡片上如实写「（未设置）」。连接
+        配置是用户级共享值，卡片必须像真实会话一样先合并共享连接，才能展示真正
+        生效的「旧值 → 新值」；合并函数只做 deepcopy，不写盘、不恢复凭据。
         """
         try:
             config_path = Path(project_dir) / "project.json"
             if not config_path.is_file():
                 return {}
-            from .storage import load_json
-
             payload = load_json(config_path)
-            return payload if isinstance(payload, dict) else {}
+            if not isinstance(payload, dict):
+                return {}
+            return apply_connection_to_config(payload, load_connection())
         except Exception:  # noqa: BLE001 - card rendering must never break a turn
             return {}
 
