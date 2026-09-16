@@ -61,7 +61,7 @@ from .threads import (
     messages,
     rename_thread,
 )
-from .webchat import execute_intent, route_intent
+from .webchat import ChatIntent, execute_intent, route_intent
 from .remote_transport import create_remote_transport, test_server_connection
 from .project_intake import (
     append_history,
@@ -99,6 +99,11 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "webtemplates"
 
 def _default_workspace_dir() -> Path:
     return Path("runs/workspace")
+
+
+#: 项目报告回灌给模型时的截断长度。整份报告可能上千行，全塞进对话会把模型的
+#: 上下文挤爆，反而让它答不好。截断处如实标注，模型知道自己看到的是节选。
+_REPORT_EXCERPT_LIMIT = 4000
 
 
 def _session_for(project_dir: Path) -> ProjectSession:
@@ -1528,6 +1533,9 @@ def create_app(
                 executor=_run_tool,
                 llm_config=llm_config,
                 checkpointer=checkpointer,
+                # 确认卡片要写「旧值 → 新值」，所以守卫节点需要读项目配置。
+                # 这个回调只读、不写，符合 guardrail「无副作用」的约束。
+                config_reader=_read_project_config,
             )
             if resume is not None:
                 from langgraph.types import Command
@@ -1580,9 +1588,12 @@ def create_app(
                         continue
                     if values.get("tool_log"):
                         tool_log = list(values["tool_log"])
-                    if node == "agent" and values.get("pending_calls"):
+                    # 模型请求的工具现在先落在 deferred_calls（由守卫按确认策略
+                    # 一组组取出），所以思考面板要读这个字段，不再读 pending_calls。
+                    requested = values.get("deferred_calls")
+                    if node == "agent" and requested:
                         names = "、".join(
-                            str(call.get("name")) for call in values["pending_calls"]
+                            str(call.get("name")) for call in requested
                         )
                         yield "step", {
                             "id": "tool",
@@ -1628,6 +1639,23 @@ def create_app(
                 }
             )
 
+    def _read_project_config(project_dir: Path) -> dict[str, Any]:
+        """Read a project's config for confirmation-card rendering. **只读**。
+
+        它跑在对话图的守卫节点里（``interrupt`` 之前），所以绝不能触发写盘、
+        也不能抛异常——读不到就返回空 dict，卡片上如实写「（未设置）」。
+        """
+        try:
+            config_path = Path(project_dir) / "project.json"
+            if not config_path.is_file():
+                return {}
+            from .storage import load_json
+
+            payload = load_json(config_path)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:  # noqa: BLE001 - card rendering must never break a turn
+            return {}
+
     def _run_tool(
         name: str,
         arguments: dict[str, Any],
@@ -1641,16 +1669,25 @@ def create_app(
 
         - ``read_project_state``  → 只读 ``ProjectSession``；
         - ``browse_remote_samples`` → 复用 ``_scan_remote_samples``（只读 SSH）；
+        - ``refresh_project_status`` / ``get_project_report`` → 复用
+          ``session.refresh_status`` / ``session.report``（只读）；
         - ``write_project_config``  → 复用 ``_write_project_session``（与按钮同一条链路）；
-        - ``configure_pipeline`` / ``set_run_resources`` / ``set_diffexp_reference``
-          / ``rollback_changes`` → 复用 ``session.edit`` / ``rollback``；
+        - ``edit_samples`` / ``edit_reference`` / ``edit_connection``
+          / ``configure_pipeline`` / ``set_run_resources`` / ``set_diffexp_reference``
+          / ``set_cms_options`` / ``rollback_changes`` → 复用 ``session.edit`` / ``rollback``；
         - ``generate_plan`` / ``confirm_contract`` → 复用 ``session.plan`` / ``confirm``；
-        - ``run_analysis`` → 复用 ``session.execute``。
+        - ``run_analysis`` → 复用 ``session.execute``（带 stage 时走 ``execute_stage``）；
+        - ``record_qc_decision`` → 复用 ``session.record_qc_decision``。
 
         ``approved`` 由图上的人工确认关卡给出。写盘/执行类工具在没有批准时一律
         拒绝——这是纵深防御：即使图的守卫被绕过，这里仍然拦得住。
         """
-        from .agent_tools import RISK_READ, normalize_write_arguments, risk_of
+        from .agent_tools import (
+            REFERENCE_FIELDS,
+            RISK_READ,
+            normalize_write_arguments,
+            risk_of,
+        )
 
         session = _session_for(project_dir)
         # Workspace 里项目目录就是 root / project_id，所以目录名即 project_id。
@@ -1719,6 +1756,41 @@ def create_app(
                 "ok": True,
                 "scanned_path": remote_dir,
                 "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。",
+            }
+
+        if name == "refresh_project_status":
+            if session.config is None:
+                return {
+                    "ok": False,
+                    "error": "这个项目还没有分析会话，没有可刷新的运行状态。",
+                }
+            status = session.refresh_status()
+            state = str(status.get("state") or session.state)
+            message = str(status.get("message") or "").strip()
+            return {
+                "ok": True,
+                "state": session.state,
+                "run_state": state,
+                "status": status,
+                "reply": f"最新运行状态：{state}。" + (f"\n{message}" if message else ""),
+            }
+
+        if name == "get_project_report":
+            if session.config is None:
+                return {"ok": False, "error": "这个项目还没有分析会话，没有结果可汇总。"}
+            path = session.report()
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+            except OSError as exc:
+                return {"ok": False, "error": f"报告已生成但读取失败：{exc}"}
+            # 报告可能很长：截断后回灌，避免把模型的上下文挤爆。
+            excerpt = text if len(text) <= _REPORT_EXCERPT_LIMIT else text[:_REPORT_EXCERPT_LIMIT] + "\n…（已截断）"
+            return {
+                "ok": True,
+                "state": session.state,
+                "report_path": str(path),
+                "report": excerpt,
+                "reply": f"已生成项目报告：{path}\n{excerpt}",
             }
 
         if name == "write_project_config":
@@ -1794,6 +1866,58 @@ def create_app(
             )
             return _tool_result_from_intent(result)
 
+        if name == "edit_samples":
+            return _edit_samples_tool(session, arguments)
+
+        if name == "edit_reference":
+            if session.config is None:
+                return {
+                    "ok": False,
+                    "error": "这个项目还没有分析会话，请先用 write_project_config 建会话。",
+                }
+            reference = {
+                config_key: str(arguments[key]).strip()
+                for key, config_key in REFERENCE_FIELDS.items()
+                if arguments.get(key)
+            }
+            if not reference:
+                return {"ok": False, "error": "没有给出要修改的参考基因组字段。"}
+            parts = "，".join(f"{k}={v}" for k, v in reference.items())
+            result = execute_intent(
+                session,
+                ChatIntent(
+                    "edit",
+                    message=f"已修改参考基因组：{parts}。",
+                    params={"reference": reference},
+                    note=f"模型修改：reference {parts}",
+                ),
+            )
+            return _tool_result_from_intent(result)
+
+        if name == "edit_connection":
+            return _edit_connection_tool(project_id, session, arguments)
+
+        if name == "set_cms_options":
+            return _set_cms_options_tool(session, arguments)
+
+        if name == "record_qc_decision":
+            if session.config is None:
+                return {"ok": False, "error": "这个项目还没有分析会话。"}
+            try:
+                decision = session.record_qc_decision(
+                    approved=bool(arguments.get("approved")),
+                    note=str(arguments.get("note") or ""),
+                )
+            except SessionError as exc:
+                return {"ok": False, "error": str(exc), "state": session.state}
+            verdict = "通过，继续下游" if decision["approved"] else "不通过，停在这里"
+            return {
+                "ok": True,
+                "state": session.state,
+                "qc": decision,
+                "reply": f"已记录 QC 检查点决定：{verdict}。",
+            }
+
         if name == "rollback_changes":
             result = execute_intent(session, ChatIntent("rollback", message="已回滚最后一次变更。"))
             return _tool_result_from_intent(result)
@@ -1811,10 +1935,216 @@ def create_app(
             return _tool_result_from_intent(result)
 
         if name == "run_analysis":
+            stage = str(arguments.get("stage") or "").strip()
+            if stage:
+                # 分阶段执行：必须已冻结契约（execute_stage 自己会校验状态）。
+                if session.config is None:
+                    return {"ok": False, "error": "这个项目还没有分析会话。"}
+                try:
+                    outcome = session.execute_stage(stage, wait=False)
+                except SessionError as exc:
+                    return {"ok": False, "error": str(exc), "state": session.state}
+                return {
+                    "ok": True,
+                    "state": session.state,
+                    "stage": stage,
+                    "result": outcome,
+                    "reply": (
+                        f"{stage} 阶段已启动（状态 {outcome.get('state', session.state)}）。"
+                        f"\n{outcome.get('message') or ''}".rstrip()
+                    ),
+                }
             result = execute_intent(session, ChatIntent("run", message="正在启动分析。"))
             return _tool_result_from_intent(result)
 
         return {"ok": False, "error": f"未知工具：{name}"}
+
+    def _edit_samples_tool(
+        session: ProjectSession,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge/remove samples on an **existing** session.
+
+        这是 ``write_project_config`` 的补位：那个会因为「已有会话」被拒，模型就
+        再也改不了单个样本。这里按 ``sample_id`` 合并，未提到的样本原样保留——
+        用户说「把 S3 分到 treat 组」时不该把 S1/S2 的分组冲掉。
+        """
+        if session.config is None:
+            return {
+                "ok": False,
+                "error": (
+                    "这个项目还没有分析会话，请先用 write_project_config 把样本表和"
+                    "FASTQ 目录写进去。"
+                ),
+            }
+
+        current_items = [
+            sample
+            for sample in (session.config.get("samples", {}).get("items") or [])
+            if isinstance(sample, dict)
+        ]
+        by_id = {str(sample.get("sample_id") or ""): dict(sample) for sample in current_items}
+        order = [str(sample.get("sample_id") or "") for sample in current_items]
+
+        patches = arguments.get("samples") or []
+        remove = [str(item) for item in (arguments.get("remove") or [])]
+
+        for patch in patches:
+            if not isinstance(patch, dict):
+                continue
+            sample_id = str(patch.get("sample_id") or "")
+            if not sample_id:
+                continue
+            existing = by_id.get(sample_id, {})
+            merged = dict(existing)
+            for key in ("condition", "fastq_1", "fastq_2"):
+                if patch.get(key) not in (None, ""):
+                    merged[key] = patch[key]
+            merged["sample_id"] = sample_id
+            if sample_id not in by_id:
+                order.append(sample_id)
+            by_id[sample_id] = merged
+
+        for sample_id in remove:
+            if sample_id in by_id:
+                del by_id[sample_id]
+                order = [item for item in order if item != sample_id]
+
+        if not order:
+            return {"ok": False, "error": "改动后样本表会变成空的，已拒绝。"}
+
+        updated = [by_id[sample_id] for sample_id in order]
+        removed_actual = [sample_id for sample_id in remove if sample_id not in by_id]
+        summary = f"样本表已更新：现有 {len(updated)} 个样本。"
+        if removed_actual:
+            summary += f"已删除 {', '.join(removed_actual)}。"
+
+        result = execute_intent(
+            session,
+            ChatIntent(
+                "edit",
+                message=summary,
+                params={"samples.items": updated},
+                note=f"模型修改：样本表（{len(updated)} 个样本）",
+            ),
+        )
+        return _tool_result_from_intent(result)
+
+    def _edit_connection_tool(
+        project_id: str,
+        session: ProjectSession,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Edit the connection block, reusing the same normalisation as ``/api/config``.
+
+        连接信息是用户级共享的：项目里改完要同步进全局配置，否则下一个项目还是
+        旧主机。密码绝不在这里落盘——模型看不到也不该设置凭据。
+        """
+        from .agent_tools import CONNECTION_FIELDS
+
+        server_patch: dict[str, Any] = {}
+        for key in CONNECTION_FIELDS:
+            value = arguments.get(key)
+            if value is None:
+                continue
+            if key in {"port", "threads", "memory_gb"}:
+                server_patch[key] = int(value)
+            else:
+                server_patch[key] = str(value).strip()
+
+        if not server_patch:
+            return {"ok": False, "error": "没有给出要修改的连接字段。"}
+
+        if "scheduler" in server_patch:
+            from .agent_tools import SCHEDULERS
+
+            if server_patch["scheduler"] not in SCHEDULERS:
+                return {
+                    "ok": False,
+                    "error": f"scheduler 必须是 {SCHEDULERS} 之一。",
+                }
+
+        if session.config is None:
+            # 还没有项目：连接配置写在全局共享层，新建项目时自动继承。
+            save_connection(server_patch)
+            return {
+                "ok": True,
+                "state": session.state,
+                "reply": (
+                    "已保存服务器连接配置（当前项目还没有分析会话，"
+                    "配置已存为全局默认，新建项目会自动继承）。"
+                ),
+            }
+
+        parts = "，".join(f"{k}={v}" for k, v in server_patch.items())
+        result = execute_intent(
+            session,
+            ChatIntent(
+                "edit",
+                message=f"已修改服务器连接：{parts}。",
+                params={"server": server_patch},
+                note=f"模型修改：server {parts}",
+            ),
+        )
+        normalized = _tool_result_from_intent(result)
+        if normalized.get("ok"):
+            # 与 /api/config 一致：连接是用户级共享的，改完同步到全局，
+            # 下一个项目才继承得到。凭据不在这里碰（模型不设置密码）。
+            save_connection({k: v for k, v in server_patch.items() if k != "auth_mode"})
+        return normalized
+
+    def _set_cms_options_tool(
+        session: ProjectSession,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Enable/disable CMS and set its permutation/FDR knobs."""
+        from .agent_tools import CMS_RUN_MODES
+
+        if session.config is None:
+            return {
+                "ok": False,
+                "error": "这个项目还没有分析会话，请先建会话再配置 CMS。",
+            }
+
+        enabled = bool(arguments.get("enabled"))
+        patch: dict[str, Any] = {"pipeline": {"cms": {"enabled": enabled}}}
+        cms_patch: dict[str, Any] = {}
+        if arguments.get("n_perm") is not None:
+            cms_patch["n_perm"] = int(arguments["n_perm"])
+        if arguments.get("fdr") is not None:
+            cms_patch["fdr"] = float(arguments["fdr"])
+        run_mode = str(arguments.get("run_mode") or "").strip()
+        if run_mode:
+            if run_mode not in CMS_RUN_MODES:
+                return {"ok": False, "error": f"run_mode 必须是 {CMS_RUN_MODES} 之一。"}
+            cms_patch["run_mode"] = run_mode
+        if cms_patch:
+            patch["cms"] = cms_patch
+
+        verb = "启用" if enabled else "关闭"
+        result = execute_intent(
+            session,
+            ChatIntent(
+                "edit",
+                message=f"已{verb} CMS 分型。" + (f"（{cms_patch}）" if cms_patch else ""),
+                params=patch,
+                note=f"模型修改：CMS enabled={enabled}",
+            ),
+        )
+        normalized = _tool_result_from_intent(result)
+        if normalized.get("ok") and enabled:
+            # 门禁不满足时如实告知，别让用户以为一开就能跑。
+            from .cms import cms_design_checks
+
+            reasons = cms_design_checks(session.config or {})
+            if reasons:
+                normalized["gate_warnings"] = reasons
+                normalized["reply"] = (
+                    str(normalized.get("reply") or "")
+                    + "\n注意，CMS 门禁目前不满足：\n"
+                    + "\n".join(f"  - {reason}" for reason in reasons)
+                )
+        return normalized
 
     def _tool_result_from_intent(result: dict[str, Any]) -> dict[str, Any]:
         """Normalise a session-action result into the tool-result shape.

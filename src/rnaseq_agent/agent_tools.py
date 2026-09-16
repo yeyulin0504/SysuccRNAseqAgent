@@ -28,11 +28,43 @@
 - ``read``    —— 只读（读状态、扫目录）。自动执行，不打断用户。
 - ``write``   —— 写项目配置（样本表 / 参数 / 回滚）。**必须人工确认**。
 - ``execute`` —— 冻结契约、真正跑分析。**必须人工确认**。
+
+确认**粒度**由 :func:`confirmation_policy` 给出（用户 2026-09-16 定的边界）：
+
+- 配置类（write）**合并成一张卡片**，一次批准全部执行；
+- 执行类（execute）**各自单独一张卡片**，不许被批量批准夹带过去；
+- 例外：连接配置（``edit_connection``）虽然是写盘，但改的是远端执行目标，
+  语义上比改样本表更重，用 ``ToolSpec.policy`` 钉成单独确认。
+
+工具面覆盖「配置 + 分析执行」的**全量**能力（用户 2026-09-16 要求放开）：
+
+======================  ======  ================================================
+工具                    策略    落到哪段既有实现
+======================  ======  ================================================
+read_project_state      never   ``ProjectSession.config`` 只读投影
+browse_remote_samples   never   ``webapp._scan_remote_samples``（只读 SSH）
+refresh_project_status  never   ``session.refresh_status``
+get_project_report      never   ``session.report``
+write_project_config    batch   ``webapp._write_project_session``（首次建会话）
+edit_samples            batch   ``session.edit``（``samples.items`` 整体覆盖）
+edit_reference          batch   ``session.edit``（``reference`` 浅合并）
+edit_connection         solo    ``session.edit``（``server`` 浅合并）
+configure_pipeline      batch   ``session.edit``
+set_run_resources       batch   ``session.edit``
+set_diffexp_reference   batch   ``session.edit``
+set_cms_options         batch   ``session.edit``
+rollback_changes        batch   ``session.rollback``
+generate_plan           solo    ``session.plan``
+confirm_contract        solo    ``session.confirm``
+run_analysis            solo    ``session.execute`` / ``session.execute_stage``
+record_qc_decision      solo    ``session.record_qc_decision``
+======================  ======  ================================================
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -45,9 +77,24 @@ RISK_READ = "read"
 RISK_WRITE = "write"
 RISK_EXECUTE = "execute"
 
-#: 需要人工确认才允许执行的风险级别。
-#: 用户诉求：「风险度高的要给人确认」——写盘与执行都属于这一类，只读不打扰。
-_CONFIRM_RISKS = frozenset({RISK_WRITE, RISK_EXECUTE})
+# -- 确认粒度 ---------------------------------------------------------------
+
+#: 不需要确认，直接执行。
+POLICY_NEVER = "never"
+#: 配置类：同轮的多个调用**合并成一张卡片**，用户一次批准全部落地。
+POLICY_BATCH = "batch"
+#: 执行类：**每个调用各占一张卡片**，不被批量批准夹带过去。
+POLICY_SOLO = "solo"
+
+#: 风险级别 → 确认粒度。这是唯一真源，任何执行路径都不许自己判断。
+_CONFIRM_POLICIES = {
+    RISK_READ: POLICY_NEVER,
+    RISK_WRITE: POLICY_BATCH,
+    RISK_EXECUTE: POLICY_SOLO,
+}
+
+#: 确认卡片上按此顺序排列，让「先落配置、再动执行」的次序在 UI 上也读得出来。
+_POLICY_ORDER = {POLICY_NEVER: 0, POLICY_BATCH: 1, POLICY_SOLO: 2}
 
 #: 合法的链特异性取值。``unknown`` 是**合法值**而非缺失（用户要求「允许特异性未知
 #: 的选项先写着」），必须与 webapp._normalize_strandedness 保持一致。
@@ -64,6 +111,41 @@ PIPELINE_STEPS = (
     "rsem",
     "diffexp",
     "cms",
+)
+
+#: 可单独执行的分析阶段。**必须与 pipeline.ALL_STAGES 一致**（bootstrap 测试锁）。
+#: 这里不 import pipeline 是为了让本模块保持「纯声明、无重依赖」，
+#: 漂移由 test_chat_graph 的断言兜住。
+RUN_STAGES = ("qc", "quant", "de", "cms", "counts")
+
+#: 调度器合法取值（pipeline.render_scheduler_script 只认这三个）。
+SCHEDULERS = ("local", "slurm", "pbs")
+
+#: ``reference`` 区块的可编辑字段：工具参数名 → config 里的键名。
+#: 参数名刻意用短名（gtf 而不是 remote_gtf_path），因为模型更不容易写错，
+#: 落盘时由这里翻译成长名，模型不需要知道 config 的内部命名。
+REFERENCE_FIELDS = {
+    "gtf": "remote_gtf_path",
+    "genome_fasta": "remote_genome_fasta_path",
+    "star_index": "star_index_dir",
+    "rsem_prefix": "rsem_index_prefix",
+}
+
+#: CMS 分型的运行模式（与 cms.py 的解释一致：pipeline = 跑在流水线里，
+#: counts = 从 counts 直入）。
+CMS_RUN_MODES = ("pipeline", "counts")
+
+#: ``server`` 区块里允许模型改的字段。与 webapp ``POST /api/config`` 的
+#: ``allowed`` 集合保持一致——两条路都写同一份连接配置，字段面不该有差别。
+CONNECTION_FIELDS = (
+    "host",
+    "user",
+    "port",
+    "scheduler",
+    "threads",
+    "memory_gb",
+    "remote_base_dir",
+    "remote_workdir",
 )
 
 
@@ -83,7 +165,10 @@ class ToolSpec:
     description: str
     parameters: dict[str, Any]
     risk: str
-
+    #: 覆盖按风险推导的确认粒度（见 :func:`confirmation_policy`）。留空表示用默认值。
+    #: 存在的理由是「连接配置」：它属于写盘，但改的是远端目标，语义上比改样本表更重，
+    #: 必须每次单独确认，不能被合并卡片夹带。
+    policy: str = ""
     def as_openai_schema(self) -> dict[str, Any]:
         """Shape the spec the way ``/chat/completions`` expects it."""
         return {
@@ -107,7 +192,19 @@ _SAMPLE_SCHEMA: dict[str, Any] = {
         "fastq_1": {"type": "string", "description": "R1 文件名（只写文件名，不要带目录）"},
         "fastq_2": {"type": "string", "description": "R2 文件名（双端测序必填）"},
     },
-    "required": ["sample_id", "condition", "fastq_1"],
+    # condition 刻意**不**列入 required：模型可以只给分组名的一部分，
+    # 由 normalize_write_arguments 按循环序列补齐（用户明确要的行为）。
+    "required": ["sample_id", "fastq_1"],
+    "additionalProperties": False,
+}
+
+#: ``edit_samples`` 用的样本补丁：只要求 sample_id，其余字段按「给了才改」处理。
+#: 与 ``_SAMPLE_SCHEMA`` 分开是因为语义不同——那边是「建会话，必须有文件名」，
+#: 这边是「改已有会话的一条」，改分组时不该逼模型重抄文件名。
+_SAMPLE_PATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": dict(_SAMPLE_SCHEMA["properties"]),
+    "required": ["sample_id"],
     "additionalProperties": False,
 }
 
@@ -273,9 +370,183 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         label="启动分析",
         description=(
             "真正启动分析流水线（在服务器上执行）。消耗计算资源且耗时较长，"
-            "只在用户明确要求开始跑分析时调用。"
+            "只在用户明确要求开始跑分析时调用。\n"
+            "默认跑整条流水线；用户只想跑某一段时用 stage 指定"
+            f"（{'/'.join(RUN_STAGES)}）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "stage": {
+                    "type": "string",
+                    "enum": list(RUN_STAGES),
+                    "description": (
+                        "只跑某个阶段：qc=fastp 质控，quant=比对定量，de=差异表达，"
+                        "cms=分子分型，counts=counts 直入。省略则跑整条流水线。"
+                    ),
+                }
+            },
+            "additionalProperties": False,
+        },
+        risk=RISK_EXECUTE,
+    ),
+    "refresh_project_status": ToolSpec(
+        name="refresh_project_status",
+        label="刷新运行状态",
+        description=(
+            "读取项目当前的真实运行进度（提交了哪些作业、跑到哪一步、有没有失败）。"
+            "启动分析之后想知道「跑到哪了」就调用它，不要凭上次的答复猜测。"
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        risk=RISK_READ,
+    ),
+    "get_project_report": ToolSpec(
+        name="get_project_report",
+        label="生成项目报告",
+        description=(
+            "汇总项目的分析结果摘要（各阶段产物、差异表达结果、QC 结论）。"
+            "用户问「结果怎么样 / 报告给我看看」时调用。只读，不修改任何东西。"
+        ),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        risk=RISK_READ,
+    ),
+    "edit_samples": ToolSpec(
+        name="edit_samples",
+        label="修改样本表",
+        description=(
+            "在**已有会话**里修改样本表：改名、改分组、改 FASTQ 文件名、增删样本。"
+            "与 write_project_config 的区别：那个是首次建会话（已有会话会被拒绝），"
+            "这个是改已建好的会话。用户说「把 S3 分到 treat 组」「去掉 S4」时用这个。\n"
+            "只传要改的样本；要删除的样本在 remove 里给 sample_id。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "samples": {
+                    "type": "array",
+                    "items": _SAMPLE_PATCH_SCHEMA,
+                    "description": (
+                        "要新增或覆盖的样本。按 sample_id 匹配已有样本，"
+                        "匹配到就覆盖，没匹配到就追加。"
+                    ),
+                },
+                "remove": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "要删除的 sample_id 列表。",
+                },
+            },
+            "additionalProperties": False,
+        },
+        risk=RISK_WRITE,
+    ),
+    "edit_reference": ToolSpec(
+        name="edit_reference",
+        label="修改参考基因组",
+        description=(
+            "修改参考基因组相关路径：GTF 注释、基因组 FASTA、STAR 索引目录、"
+            "RSEM 索引前缀。用户说「GTF 换成 xxx」时调用。只传要改的那几个。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "gtf": {"type": "string", "description": "GTF 注释文件的绝对路径"},
+                "genome_fasta": {"type": "string", "description": "基因组 FASTA 的绝对路径"},
+                "star_index": {"type": "string", "description": "STAR 索引目录的绝对路径"},
+                "rsem_prefix": {"type": "string", "description": "RSEM 索引前缀"},
+            },
+            "additionalProperties": False,
+        },
+        risk=RISK_WRITE,
+    ),
+    "edit_connection": ToolSpec(
+        name="edit_connection",
+        label="修改服务器连接",
+        description=(
+            "修改服务器连接与运行资源：主机、用户名、端口、调度器、线程数、内存、"
+            "远端工作目录。用户说「换到另一台服务器 / 目录改到 xxx」时调用。\n"
+            "这是改动远端执行目标的操作，会单独请你确认，不会与其他配置合并。"
+            "密码/密钥不在这里设置（出于安全考虑，密码只能由用户在设置页填写）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "服务器主机名或 IP"},
+                "user": {"type": "string", "description": "登录用户名"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "scheduler": {"type": "string", "enum": list(SCHEDULERS)},
+                "threads": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 128,
+                    "description": "并行线程数",
+                },
+                "memory_gb": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 2048,
+                    "description": "内存上限（GB）",
+                },
+                "remote_base_dir": {"type": "string", "description": "远端根目录（绝对路径）"},
+                "remote_workdir": {"type": "string", "description": "远端工作目录（绝对路径）"},
+            },
+            "additionalProperties": False,
+        },
+        risk=RISK_WRITE,
+        # 用户明确要求：连接配置「含，但每次必确认」——不许被合并卡片夹带。
+        policy=POLICY_SOLO,
+    ),
+    "set_cms_options": ToolSpec(
+        name="set_cms_options",
+        label="配置 CMS 分型",
+        description=(
+            "启用或关闭 CMScaller 结直肠癌分子分型，并可设置置换次数与 FDR 阈值。"
+            "注意：CMS 只适用于结直肠癌（study.cancer_type 需声明为 CRC 类），"
+            "且需要至少 30 个样本，门槛不满足时会被门禁拒绝。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "是否启用 CMS 分型"},
+                "n_perm": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 100000,
+                    "description": "置换检验次数，默认 1000",
+                },
+                "fdr": {
+                    "type": "number",
+                    "minimum": 0.001,
+                    "maximum": 1.0,
+                    "description": "显著性阈值，默认 0.05",
+                },
+                "run_mode": {
+                    "type": "string",
+                    "enum": list(CMS_RUN_MODES),
+                    "description": "pipeline = 跑在流水线里；counts = 从 counts 直入",
+                },
+            },
+            "required": ["enabled"],
+            "additionalProperties": False,
+        },
+        risk=RISK_WRITE,
+    ),
+    "record_qc_decision": ToolSpec(
+        name="record_qc_decision",
+        label="记录 QC 检查点决定",
+        description=(
+            "在比对后的 QC 检查点记录「继续 / 不继续」的决定。"
+            "只有项目已经跑到该检查点、用户看过 QC 结果并明确表态后才调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "approved": {"type": "boolean", "description": "True = 通过，继续下游"},
+                "note": {"type": "string", "description": "用户的理由或备注"},
+            },
+            "required": ["approved"],
+            "additionalProperties": False,
+        },
         risk=RISK_EXECUTE,
     ),
 }
@@ -297,13 +568,85 @@ def requires_confirmation(name: str) -> bool:
 
     这是**唯一真源**：执行路径不许自己判断风险，否则两处判断必然漂移。
     未知工具（模型幻觉出来的名字）按最高风险处理——宁可多问一次。
+
+    实现委托给 :func:`confirmation_policy`，避免「要不要确认」与「怎么分组确认」
+    出现两套判断。
     """
-    return name not in TOOL_SPECS or risk_of(name) in _CONFIRM_RISKS
+    return confirmation_policy(name) != POLICY_NEVER
+
+
+def confirmation_policy(name: str) -> str:
+    """How this tool's confirmation must be grouped. **唯一真源**。
+
+    ``never`` —— 只读，直接执行。
+    ``batch`` —— 配置类，同一轮的多个调用合成一张卡片，一次批准全部落地。
+    ``solo``  —— 执行类（及未知工具），每个调用单独一张卡片。
+
+    未知工具按 ``solo`` 处理：宁可多问几次，也不能让模型编出来的名字跟着别的
+    调用一起被顺手批准。
+    """
+    spec = TOOL_SPECS.get(name)
+    if spec is None:
+        return POLICY_SOLO
+    if spec.policy:
+        return spec.policy
+    return _CONFIRM_POLICIES.get(spec.risk, POLICY_SOLO)
 
 
 def tool_labels() -> dict[str, str]:
     """Short human labels for the thinking panel."""
     return {name: spec.label for name, spec in TOOL_SPECS.items()}
+
+
+# -- 本轮处理组拆分 ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CallBatch:
+    """一组可以合成一张确认卡片、一起执行的调用。
+
+    ``policy`` 为 ``never`` 时表示无需确认的只读组（可能为空列表，此时不进卡片）。
+    """
+
+    policy: str
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.calls)
+
+
+def split_calls_for_round(calls: Sequence[dict[str, Any]]) -> list[CallBatch]:
+    """Group one model turn's tool calls by confirmation policy.
+
+    模型一轮里可能同时请求「改样本表 + 改资源 + 启动分析」。按用户定的边界：
+
+    - 所有 ``batch``（配置类）合并成**一个** :class:`CallBatch`，用户一次批准；
+    - 每个 ``solo``（执行类）各成一个 :class:`CallBatch`，逐个确认；
+    - ``never``（只读）合成一个无卡片的组。
+
+    返回顺序为 ``never → batch → solo``，且 ``solo`` 组内保持模型给出的原始顺序：
+    卡片会按这个顺序依次弹出，「先落配置、再动执行」对用户是可读的。
+    """
+    buckets: dict[str, list[dict[str, Any]]] = {
+        POLICY_NEVER: [],
+        POLICY_BATCH: [],
+        POLICY_SOLO: [],
+    }
+    for call in calls:
+        policy = confirmation_policy(str(call.get("name") or ""))
+        buckets.setdefault(policy, []).append(call)
+
+    batches: list[CallBatch] = []
+    for policy in sorted(buckets, key=lambda item: _POLICY_ORDER.get(item, 99)):
+        bucket = buckets[policy]
+        if not bucket:
+            continue
+        if policy == POLICY_SOLO:
+            # 执行类逐个成组：一个组 = 一张卡片 = 一次签字。
+            batches.extend(CallBatch(policy=policy, calls=[call]) for call in bucket)
+        else:
+            batches.append(CallBatch(policy=policy, calls=list(bucket)))
+    return batches
 
 
 # -- 参数校验 ---------------------------------------------------------------
@@ -328,21 +671,20 @@ def validate_call(name: str, arguments: dict[str, Any]) -> list[str]:
 
     模型可能幻觉出不存在的字段、把目录当文件名、或者编造路径。这里在**执行之前**
     挡下来，并把原因如实回报给模型，让它自己纠正后重试——这是工具循环的纠错回路。
+
+    校验分两层：
+
+    1. **schema 驱动**（:func:`_schema_problems`）：类型、``enum``、``minimum``／
+       ``maximum``、``minItems``／``maxItems``。写在 schema 里的约束**必须真的被读**，
+       否则它只是给模型看的装饰——``threads: -5`` 会一路走到 sbatch 脚本里。
+    2. **语义检查**（本函数下半段）：schema 表达不了的东西，例如「路径必须是
+       绝对 POSIX 路径」「对照组必须真的在样本表里」。
     """
     if name not in TOOL_SPECS:
         return [f"不存在名为 {name} 的工具。"]
 
-    problems: list[str] = []
     spec = TOOL_SPECS[name]
-    properties = spec.parameters.get("properties", {})
-
-    # 结构：只接受 schema 里声明过的键，避免模型塞入会被下游误读的字段。
-    for key in arguments:
-        if key not in properties:
-            problems.append(f"工具 {name} 不接受参数 {key}。")
-    for key in spec.parameters.get("required", []):
-        if arguments.get(key) in (None, "", []):
-            problems.append(f"工具 {name} 缺少必需参数 {key}。")
+    problems = _schema_problems(name, arguments, spec.parameters, path=name)
     if problems:
         return problems
 
@@ -354,17 +696,197 @@ def validate_call(name: str, arguments: dict[str, Any]) -> list[str]:
     if name == "write_project_config":
         problems.extend(_validate_write_config(arguments))
 
-    if name == "configure_pipeline":
-        step = str(arguments.get("step", ""))
-        if step not in PIPELINE_STEPS:
-            problems.append(f"未知的分析步骤 {step}，可选：{', '.join(PIPELINE_STEPS)}。")
-        if not isinstance(arguments.get("enabled"), bool):
-            problems.append("enabled 必须是布尔值。")
+    if name == "edit_samples":
+        problems.extend(_validate_edit_samples(arguments))
+
+    if name in {"edit_reference", "set_run_resources", "edit_connection"}:
+        problems.extend(_validate_path_fields(name, arguments))
+
+    if name == "set_diffexp_reference":
+        reference = str(arguments.get("reference_condition") or "").strip()
+        if not reference:
+            problems.append("reference_condition 不能为空。")
+        elif not _looks_like_condition(reference):
+            problems.append(
+                f"对照组名 {reference!r} 含空白或特殊字符，请用样本表里的分组名。"
+            )
 
     if name == "set_run_resources":
         if "threads" not in arguments and "memory_gb" not in arguments:
             problems.append("至少要给出 threads 或 memory_gb 之一。")
 
+    if name == "edit_connection":
+        if not any(key in arguments for key in CONNECTION_FIELDS):
+            problems.append("至少要给出一个要修改的连接字段。")
+
+    return problems
+
+
+#: JSON Schema 类型名 → Python 判定。``integer`` 单独处理（``bool`` 是 ``int``
+#: 的子类，必须显式排除，否则 ``True`` 会被当成合法的线程数）。
+def _schema_problems(
+    name: str,
+    values: Any,
+    schema: dict[str, Any],
+    *,
+    path: str,
+) -> list[str]:
+    """Recursively check ``values`` against ``schema``.
+
+    写 schema 时标了 ``minimum``／``maximum``／``enum`` 却不是空架子——这就是本
+    函数存在的全部理由。校验失败返回人类可读的原因（会原样回灌给模型）。
+    """
+    problems: list[str] = []
+    if not isinstance(schema, dict) or not isinstance(values, dict):
+        return problems
+
+    declared = schema.get("properties") or {}
+
+    # 只接受 schema 里声明过的键：模型塞进来的额外字段会被下游误读。
+    for key in values:
+        if key not in declared:
+            problems.append(f"{path} 不接受参数 {key}。")
+
+    # 必需参数：None / 空串 / 空列表都算缺失。
+    for key in schema.get("required", []):
+        if values.get(key) in (None, "", []):
+            problems.append(f"{path} 缺少必需参数 {key}。")
+
+    for key, value in values.items():
+        field_schema = declared.get(key)
+        if not isinstance(field_schema, dict) or value is None:
+            continue
+        problems.extend(
+            _field_problems(f"{path}.{key}", value, field_schema)
+        )
+    return problems
+
+
+def _field_problems(path: str, value: Any, schema: dict[str, Any]) -> list[str]:
+    """Type / enum / range / item-count checks for a single field."""
+    problems: list[str] = []
+    expected = str(schema.get("type") or "")
+
+    if expected == "string":
+        if not isinstance(value, str):
+            return [f"{path} 必须是字符串。"]
+    elif expected == "boolean":
+        if not isinstance(value, bool):
+            return [f"{path} 必须是布尔值（true/false）。"]
+    elif expected == "integer":
+        # bool 是 int 的子类，必须先排除，否则 True 会被当成 1 放行。
+        if isinstance(value, bool) or not isinstance(value, int):
+            return [f"{path} 必须是整数。"]
+    elif expected == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return [f"{path} 必须是数字。"]
+    elif expected == "array":
+        if not isinstance(value, list):
+            return [f"{path} 必须是数组。"]
+        minimum_items = schema.get("minItems")
+        maximum_items = schema.get("maxItems")
+        if isinstance(minimum_items, int) and len(value) < minimum_items:
+            problems.append(f"{path} 至少需要 {minimum_items} 项，当前 {len(value)} 项。")
+        if isinstance(maximum_items, int) and len(value) > maximum_items:
+            problems.append(f"{path} 最多允许 {maximum_items} 项，当前 {len(value)} 项。")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                problems.extend(
+                    _schema_problems(
+                        "", item, item_schema, path=f"{path}[{index + 1}]"
+                    )
+                )
+        return problems
+
+    choices = schema.get("enum")
+    if isinstance(choices, list) and choices and value not in choices:
+        return [f"{path} 必须是 {choices} 之一，收到的是 {value!r}。"]
+
+    # 数值范围：这是本轮修掉的真实漏洞（``threads: -5`` 以前会被放行）。
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            problems.append(f"{path} 不能小于 {minimum}，收到的是 {value}。")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            problems.append(f"{path} 不能大于 {maximum}，收到的是 {value}。")
+
+    return problems
+
+
+def _validate_path_fields(name: str, arguments: dict[str, Any]) -> list[str]:
+    """Absolute-POSIX-path checks for the tools that carry server-side paths.
+
+    这些字段最终会拼进服务器上的命令行，所以必须与 ``browse_remote_samples``
+    用同一套判定：绝对路径、无换行、无 ``..``。
+    """
+    field_map = {
+        "edit_reference": ("gtf", "genome_fasta", "star_index", "rsem_prefix"),
+        "edit_connection": ("remote_base_dir", "remote_workdir"),
+        "set_run_resources": (),
+    }
+    problems: list[str] = []
+    for argument_name in field_map.get(name, ()):
+        if arguments.get(argument_name) in (None, ""):
+            continue
+        error = _absolute_posix_path_error(arguments.get(argument_name), argument_name)
+        if error:
+            problems.append(error)
+    return problems
+
+
+def _looks_like_condition(value: str) -> bool:
+    """Reject obviously-not-a-group-name input (spaces, quotes, path separators)."""
+    if any(ch.isspace() for ch in value):
+        return False
+    return not any(ch in value for ch in ('"', "'", "/", "\\", "\n", "\r", "\x00"))
+
+
+def _validate_edit_samples(arguments: dict[str, Any]) -> list[str]:
+    """Field-level checks for ``edit_samples`` (mirrors the write-config checks)."""
+    problems: list[str] = []
+    samples = arguments.get("samples")
+    remove = arguments.get("remove")
+
+    if samples is None and remove is None:
+        return ["至少要给出 samples（要改的样本）或 remove（要删的 sample_id）之一。"]
+    if samples is not None and not isinstance(samples, list):
+        problems.append("samples 必须是数组。")
+        samples = None
+
+    for index, sample in enumerate(samples or [], start=1):
+        if not isinstance(sample, dict):
+            problems.append(f"samples[{index}] 必须是对象。")
+            continue
+        error = identifier_error(sample.get("sample_id"), f"samples[{index}].sample_id")
+        if error:
+            problems.append(error)
+        for key in ("fastq_1", "fastq_2"):
+            value = sample.get(key)
+            if value in (None, ""):
+                continue
+            error = relative_filename_error(value, f"samples[{index}].{key}")
+            if error:
+                problems.append(f"{error}（{key} 只写文件名，目录请放进 fastq_dir）")
+
+    if remove is not None:
+        if not isinstance(remove, list):
+            problems.append("remove 必须是 sample_id 数组。")
+        else:
+            for index, sample_id in enumerate(remove, start=1):
+                error = identifier_error(sample_id, f"remove[{index}]")
+                if error:
+                    problems.append(error)
+
+    # 同一个 sample_id 不能既改又删——模型自相矛盾时问清楚，别猜。
+    overlap = {
+        str(sample.get("sample_id") or "")
+        for sample in samples or []
+        if isinstance(sample, dict)
+    } & {str(item or "") for item in remove or []}
+    if overlap:
+        problems.append(f"样本 {sorted(overlap)} 同时出现在 samples 和 remove 里，请二选一。")
     return problems
 
 
@@ -465,12 +987,195 @@ def normalize_write_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 # -- 确认卡片 ---------------------------------------------------------------
 
+#: 连接配置字段 → 中文标签（卡片上「旧值 → 新值」用的措辞）。
+_CONNECTION_LABELS = {
+    "host": "主机",
+    "user": "登录用户",
+    "port": "端口",
+    "scheduler": "调度器",
+    "threads": "线程数",
+    "memory_gb": "内存（GB）",
+    "remote_base_dir": "远端根目录",
+    "remote_workdir": "远端工作目录",
+}
 
-def describe_call(name: str, arguments: dict[str, Any]) -> str:
+_REFERENCE_LABELS = {
+    "gtf": "GTF 注释",
+    "genome_fasta": "基因组 FASTA",
+    "star_index": "STAR 索引",
+    "rsem_prefix": "RSEM 索引前缀",
+}
+
+
+def _current_value(current: dict[str, Any], section: str, key: str) -> str:
+    """Read one config value for the card's "old value" column."""
+    block = current.get(section)
+    if not isinstance(block, dict):
+        return "（未设置）"
+    value = block.get(key)
+    return "（未设置）" if value in (None, "") else str(value)
+
+
+def field_changes(
+    name: str,
+    arguments: dict[str, Any],
+    current: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Render a call as label / old / new triples for the confirmation card.
+
+    用户 2026-09-16 明确要求：**连接配置的卡片必须明写旧值 → 新值**。改远端目标
+    是最不能「看着像没事」的一类变更，只写「已修改服务器配置」等于没写。
+
+    ``current`` 为空（例如项目还没有配置）时不编造旧值，如实写「（未设置）」。
+    """
+    current = current or {}
+    changes: list[dict[str, str]] = []
+
+    if name == "edit_connection":
+        for key in CONNECTION_FIELDS:
+            if arguments.get(key) is None:
+                continue
+            changes.append(
+                {
+                    "label": _CONNECTION_LABELS.get(key, key),
+                    "old": _current_value(current, "server", key),
+                    "new": str(arguments[key]),
+                }
+            )
+        return changes
+
+    if name == "edit_reference":
+        for key, config_key in REFERENCE_FIELDS.items():
+            if not arguments.get(key):
+                continue
+            changes.append(
+                {
+                    "label": _REFERENCE_LABELS.get(key, key),
+                    "old": _current_value(current, "reference", config_key),
+                    "new": str(arguments[key]),
+                }
+            )
+        return changes
+
+    if name == "set_run_resources":
+        for key, label, unit in (
+            ("threads", "线程数", ""),
+            ("memory_gb", "内存（GB）", ""),
+        ):
+            if arguments.get(key) is None:
+                continue
+            changes.append(
+                {
+                    "label": label,
+                    "old": _current_value(current, "server", key),
+                    "new": f"{arguments[key]}{unit}",
+                }
+            )
+        return changes
+
+    if name == "configure_pipeline":
+        step = str(arguments.get("step") or "")
+        enabled = bool(arguments.get("enabled"))
+        old = "未设置"
+        pipeline = current.get("pipeline")
+        if isinstance(pipeline, dict) and isinstance(pipeline.get(step), dict):
+            old = "已启用" if pipeline[step].get("enabled") else "已关闭"
+        changes.append(
+            {"label": step, "old": old, "new": "启用" if enabled else "关闭"}
+        )
+        return changes
+
+    if name == "set_diffexp_reference":
+        reference = str(arguments.get("reference_condition") or "")
+        old = str(current.get("diffexp", {}).get("reference_condition") or "") if isinstance(
+            current.get("diffexp"), dict
+        ) else ""
+        changes.append(
+            {
+                "label": "差异表达对照组",
+                "old": old or "（未设置）",
+                "new": f"{reference}（并启用差异表达）",
+            }
+        )
+        return changes
+
+    if name == "set_cms_options":
+        enabled = bool(arguments.get("enabled"))
+        changes.append(
+            {
+                "label": "CMS 分型",
+                "old": (
+                    "已启用"
+                    if isinstance(current.get("pipeline"), dict)
+                    and current["pipeline"].get("cms", {}).get("enabled")
+                    else "已关闭"
+                ),
+                "new": "启用" if enabled else "关闭",
+            }
+        )
+        for key, label in (("n_perm", "置换次数"), ("fdr", "FDR 阈值")):
+            if arguments.get(key) is None:
+                continue
+            old = ""
+            if isinstance(current.get("cms"), dict):
+                old = str(current["cms"].get(key) or "")
+            changes.append(
+                {"label": label, "old": old or "（默认）", "new": str(arguments[key])}
+            )
+        return changes
+
+    if name == "edit_samples":
+        samples = arguments.get("samples") or []
+        remove = arguments.get("remove") or []
+        existing = {
+            str(sample.get("sample_id") or ""): sample
+            for sample in (current.get("samples", {}).get("items") or [])
+            if isinstance(sample, dict)
+        }
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            sample_id = str(sample.get("sample_id") or "")
+            if sample_id in existing:
+                old_condition = str(existing[sample_id].get("condition") or "未分组")
+                new_condition = str(sample.get("condition") or old_condition)
+            else:
+                old_condition = "（新增）"
+                new_condition = str(sample.get("condition") or "未分组")
+            changes.append(
+                {
+                    "label": f"样本 {sample_id}",
+                    "old": old_condition,
+                    "new": new_condition,
+                }
+            )
+        for sample_id in remove:
+            changes.append(
+                {"label": f"样本 {sample_id}", "old": "存在", "new": "删除"}
+            )
+        return changes
+
+    return changes
+
+
+def _render_changes(changes: list[dict[str, str]]) -> list[str]:
+    return [
+        f"  {item['label']}：{item['old']} → {item['new']}" for item in changes
+    ]
+
+
+def describe_call(
+    name: str,
+    arguments: dict[str, Any],
+    current: dict[str, Any] | None = None,
+) -> str:
     """Render one tool call as something a human can approve or reject.
 
     这是「写盘前要人确认」看到的那段文字。必须**如实**描述将要发生什么，
     不能只写工具名——用户是在为一个具体动作签字，不是在为一个函数名签字。
+
+    ``current`` 是项目当前配置；给了就在卡片上写「旧值 → 新值」，让用户能直接
+    看出这次批准改了哪几个字段（用户明确要求连接配置必须如此）。
     """
     spec = TOOL_SPECS.get(name)
     title = spec.label if spec is not None else name
@@ -502,23 +1207,44 @@ def describe_call(name: str, arguments: dict[str, Any]) -> str:
                 lines.append(f"  {label}：{arguments[key]}")
         return "\n".join(lines)
 
-    if name == "configure_pipeline":
-        verb = "启用" if arguments.get("enabled") else "关闭"
-        return f"{title}：{verb} {arguments.get('step')}"
+    if name in {
+        "edit_connection",
+        "edit_reference",
+        "set_run_resources",
+        "configure_pipeline",
+        "set_diffexp_reference",
+        "set_cms_options",
+        "edit_samples",
+    }:
+        changes = field_changes(name, arguments, current)
+        lines = [f"{title}："]
+        if changes:
+            lines.extend(_render_changes(changes))
+        else:
+            lines.append("  （无实际变化）")
+        if name == "edit_connection":
+            lines.append("  注意：这会影响后续作业提交到哪台机器、哪个目录。")
+        return "\n".join(lines)
 
-    if name == "set_run_resources":
-        parts = []
-        if arguments.get("threads") is not None:
-            parts.append(f"线程数 → {arguments['threads']}")
-        if arguments.get("memory_gb") is not None:
-            parts.append(f"内存 → {arguments['memory_gb']} GB")
-        return f"{title}：{'，'.join(parts) or '（无变化）'}"
+    if name == "run_analysis":
+        stage = arguments.get("stage")
+        if stage:
+            return f"{title}：只跑 {stage} 阶段（在服务器上执行）"
+        return f"{title}：跑完整流水线（在服务器上执行）"
 
-    if name == "set_diffexp_reference":
-        return f"{title}：以 {arguments.get('reference_condition')} 为对照，并启用差异表达"
+    if name == "record_qc_decision":
+        verdict = "通过，继续下游" if arguments.get("approved") else "不通过，停在这里"
+        note = str(arguments.get("note") or "").strip()
+        return f"{title}：{verdict}" + (f"（备注：{note}）" if note else "")
 
     if name == "browse_remote_samples":
         return f"{title}：只读扫描 {arguments.get('path')}"
+
+    if name == "refresh_project_status":
+        return f"{title}：读取服务器上的最新进度（只读）"
+
+    if name == "get_project_report":
+        return f"{title}：汇总当前分析结果（只读）"
 
     return title
 

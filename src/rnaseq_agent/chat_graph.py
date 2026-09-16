@@ -24,11 +24,19 @@
               ↑                    │                          │
               │                    └──(只读,免确认)──┐        │ resume
               │                                      ↓        ↓
-              └──────────── execute ←────────────────┴────────┘
+              └──── execute ←────────────────────────┴────────┘
+                       │
+                       └──(还有顺延的组)──→ guardrail
 
 **关键约束：节点副作用**。``interrupt()`` 恢复时 LangGraph 会**从头重跑当前节点**，
 所以 ``guardrail`` 必须无副作用（只读 state），真实写盘只能发生在 ``execute``。
 把写盘放在 interrupt 之前的同一个节点里，用户每确认一次就会多写一次。
+
+**确认粒度**（用户 2026-09-16 定的边界「配置合并、执行单独」）由
+``agent_tools.split_calls_for_round`` 决定：``guardrail`` **每轮只处理一组**——
+``batch``（配置类）合并成一张卡片，``solo``（执行类）各占一张卡片。其余组存进
+``deferred_calls`` 顺延，``execute`` 之后不回到 ``agent`` 而是直接回到
+``guardrail``，于是卡片按「先配置、后执行」依次弹出，用户逐个签字。
 
 langgraph 缺失时本模块不可用（``build_chat_graph`` 抛错），调用方应退回规则路由，
 与项目既有的「可选依赖」策略一致。
@@ -60,12 +68,15 @@ except ImportError:  # pragma: no cover - exercised only without langgraph
 
 
 from .agent_tools import (
+    POLICY_NEVER,
+    POLICY_SOLO,
     ToolCall,
     ToolCallAccumulator,
+    confirmation_policy,
     describe_call,
     parse_message_tool_calls,
-    requires_confirmation,
     risk_of,
+    split_calls_for_round,
     tool_labels,
     tool_schemas,
     validate_call,
@@ -82,6 +93,10 @@ MAX_TOOL_ITERATIONS = 8
 #: 也不自己构造 ``ProjectSession``——真实写盘链路只有一条，必须复用。
 ToolExecutor = Callable[[str, dict[str, Any], Path, bool], dict[str, Any]]
 
+#: ``ConfigReader`` 契约：``(项目目录) -> 当前配置``（读不到就返回 ``{}``）。
+#: 只用来在确认卡片上渲染「旧值 → 新值」，**必须只读**——它会跑在侧效应敏感的位置。
+ConfigReader = Callable[[Path], dict[str, Any]]
+
 
 class ChatState(TypedDict, total=False):
     """Everything the conversation graph persists between nodes."""
@@ -91,6 +106,9 @@ class ChatState(TypedDict, total=False):
     thread_id: str
     messages: list[dict[str, Any]]  # OpenAI 消息数组，跨轮保留工具结果
     pending_calls: list[dict[str, Any]]  # 等待执行/确认的工具调用
+    #: 本轮**尚未处理**的调用组（已按确认策略分组）。``guardrail`` 每轮只取
+    #: 第一组；``execute`` 之后再回到 ``guardrail`` 处理下一组。
+    deferred_calls: list[dict[str, Any]]
     reply: str  # 最终给用户看的答复
     via: str  # llm / tool / rejected / error
     tool_log: list[dict[str, Any]]  # 本轮已执行工具（含风险级别，供审计）
@@ -101,24 +119,33 @@ class ChatState(TypedDict, total=False):
     streamed: bool
     #: 当前 pending_calls 是否已获人工批准（写盘/执行前必须为 True）。
     confirmed: bool
+    #: 当前这组是否已被用户拒绝。**必须记进 state**：``guardrail`` 在 resume 时
+    #: 会被重跑，局部变量会丢，只有 state 里的值能带到 ``execute``。
+    rejected: bool
 
 
 SYSTEM_PROMPT = (
-    "你是 SYSU 多组学分析 Agent 的助手，用户正在配置一个 bulk RNA-seq 分析项目。\n"
+    "你是 SYSU 多组学分析 Agent 的助手，用户正在配置并运行一个 bulk RNA-seq 分析项目。\n"
     "\n"
-    "你**有工具**可以真正读写项目配置。请直接调用工具，不要只说「我无法执行」——\n"
-    "那是旧版本的措辞，现在你能做。\n"
+    "你**有工具**可以真正读写项目配置、并真正启动分析。请直接调用工具，不要只说\n"
+    "「我无法执行」——那是旧版本的措辞，现在你能做。\n"
     "\n"
     "工作方式：\n"
-    "1. 用户给了数据路径、样本、参考基因组时，调用 write_project_config 真正写盘，\n"
-    "   参数按用户原意填。写盘前系统会自动请用户确认，你不需要替他确认。\n"
-    "2. 不确定项目里已有什么时，先调用 read_project_state 读，不要凭记忆猜。\n"
-    "3. 分组：如果用户给了 N 个样本但只给了 M 个分组名（M < N），这是一个**循环\n"
+    "1. 不确定项目里已有什么时，先调用 read_project_state 读，不要凭记忆猜。\n"
+    "2. 首次建会话（项目还没有样本表）用 write_project_config，参数按用户原意填。\n"
+    "   写盘前系统会自动请用户确认，你不需要替他确认。\n"
+    "3. 已有会话要改样本表用 edit_samples（不是 write_project_config，那个会因\n"
+    "   「已有会话」被拒绝）；改参考基因组用 edit_reference；改服务器/资源用\n"
+    "   edit_connection。只传真正要改的字段。\n"
+    "4. 分组：如果用户给了 N 个样本但只给了 M 个分组名（M < N），这是一个**循环\n"
     "   序列**——按用户给出的顺序循环分配（例如 2 个名字覆盖 4 个样本就是\n"
     "   A,B,A,B）。不要反问用户，也不要添加他没提到的分组名。\n"
-    "4. 链特异性：用户说「未知 / 不知道 / 不确定」时填 unknown，不要填 auto。\n"
+    "5. 链特异性：用户说「未知 / 不知道 / 不确定」时填 unknown，不要填 auto。\n"
     "   用户明确说反链/正链/无链特异时按原意填。\n"
-    "5. 写盘完成后，如果用户要求继续，再调用 generate_plan。\n"
+    "6. 执行有先后：先 generate_plan 生成计划，再 confirm_contract 冻结契约，\n"
+    "   最后 run_analysis 启动。用户只要求跑某一段时，给 run_analysis 传 stage。\n"
+    "7. 启动分析是异步的：用户问「跑到哪了」时调用 refresh_project_status 读真实\n"
+    "   进度，不要凭上次的答复猜。问结果时用 get_project_report。\n"
     "\n"
     "涉及概念解释（例如「差异表达的原理」）时直接用文字回答，不要调用工具。\n"
     "回答用中文，简洁，不要罗列工具名，说人话。"
@@ -254,13 +281,25 @@ def build_chat_graph(
     checkpointer: Any = None,
     max_iterations: int = MAX_TOOL_ITERATIONS,
     timeout: float = 60.0,
+    config_reader: ConfigReader | None = None,
 ):
     """Compile the conversation graph.
 
     ``executor`` 是唯一能产生副作用的入口，由调用方注入真实的写盘链路。
+    ``config_reader`` 只用于确认卡片上的「旧值 → 新值」；它跑在 ``guardrail``
+    （不会产生副作用的位置）里，因此**必须只是读**。没给就退化成「（未设置）」。
     """
     if not LANGGRAPH_AVAILABLE:  # pragma: no cover - optional dependency
         raise RuntimeError("langgraph 不可用，无法构建对话图。")
+
+    def _current_config(state: ChatState) -> dict[str, Any]:
+        """Read the project config for card rendering; never raises."""
+        if config_reader is None:
+            return {}
+        try:
+            return config_reader(Path(state.get("project_dir") or "")) or {}
+        except Exception:  # noqa: BLE001 - card rendering must never break the turn
+            return {}
 
     def _append(state: ChatState, *new_messages: dict[str, Any]) -> list[dict[str, Any]]:
         return list(state.get("messages") or []) + list(new_messages)
@@ -290,6 +329,7 @@ def build_chat_graph(
                 "status": "max_iterations",
                 "via": "llm",
                 "pending_calls": [],
+                "deferred_calls": [],
                 "reply": (
                     "我在这一轮里来回调用工具太多次了，先停在这里。\n"
                     f"当前进度：{state.get('reply') or '还没有可回报的结果'}。\n"
@@ -319,6 +359,7 @@ def build_chat_graph(
                     "via": "error",
                     "error": str(payload),
                     "pending_calls": [],
+                    "deferred_calls": [],
                     "reply": "",
                 }
 
@@ -336,6 +377,7 @@ def build_chat_graph(
                     state, {"role": "assistant", "content": content}
                 ),
                 "pending_calls": [],
+                "deferred_calls": [],
                 # 最终答复已通过 writer 逐字推出；没推过（例如模型只回了空串）
                 # 时由上层整段输出，避免重复。
                 "streamed": streamed,
@@ -343,65 +385,106 @@ def build_chat_graph(
 
         assistant_message: dict[str, Any] = {"role": "assistant", "content": content or None}
         assistant_message["tool_calls"] = [_raw_call(call) for call in calls]
+        # 本轮所有调用进 deferred 队列（保持模型给出的顺序），由 guardrail 按确认
+        # 策略**一组一组**取出来处理。分组在这里不做：guardrail 是唯一判断风险的
+        # 地方，让它自己分组，避免两处逻辑漂移。
         return {
             "status": "ok",
             "messages": _append(state, assistant_message),
-            "pending_calls": [_pending_call(call) for call in calls],
+            "pending_calls": [],
+            "deferred_calls": [_pending_call(call) for call in calls],
             "iterations": iterations + 1,
         }
 
     def route_after_agent(state: ChatState) -> str:
-        if state.get("pending_calls"):
+        if state.get("deferred_calls"):
             return "guardrail"
         return "end"
+
+    def _tool_error_message(call_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": json.dumps(payload, ensure_ascii=False),
+        }
+
+    def _split_head(
+        state: ChatState,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Peel the first confirmation group off the deferred queue.
+
+        Returns ``(head_calls, rest_calls, rejected_calls)`` where ``rejected_calls``
+        are the head's calls that failed parameter validation. ``head_calls`` is what
+        this round will confirm+execute; ``rest_calls`` stays queued.
+        """
+        queue = list(state.get("deferred_calls") or [])
+        batches = split_calls_for_round(queue)
+        if not batches:
+            return [], [], []
+
+        head = batches[0]
+        rest: list[dict[str, Any]] = []
+        for batch in batches[1:]:
+            rest.extend(batch.calls)
+
+        valid: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        for call in head.calls:
+            name = str(call.get("name") or "")
+            problems = validate_call(name, call.get("arguments") or {})
+            if problems:
+                rejected.append({**call, "_reason": "；".join(problems)})
+            else:
+                valid.append(call)
+        return valid, rest, rejected
 
     def node_guardrail(state: ChatState) -> ChatState:
         """Risk gate. MUST stay side-effect free — LangGraph re-runs it on resume.
 
-        需要确认就把决定权交还给人（``interrupt``）；参数本身不合法的调用在这里挡下，
-        写成工具结果回灌给模型，让它自己纠正后重试——这是工具循环的纠错回路。
+        每轮只处理**一组**：``batch``（配置类）合成一张卡片，``solo``（执行类）
+        各占一张卡片。参数不合法的调用在这里挡下并回灌错误，让模型自己纠正。
         """
-        pending = list(state.get("pending_calls") or [])
-        if not pending:
+        if not state.get("deferred_calls"):
             return {"pending_calls": []}
 
         # 参数校验先于确认：不合法的调用没有让人签字的必要。
-        rejected: list[dict[str, str]] = []
-        valid: list[dict[str, Any]] = []
-        for call in pending:
-            name = str(call.get("name") or "")
-            problems = validate_call(name, call.get("arguments") or {})
-            if problems:
-                rejected.append(
-                    {
-                        "call_id": str(call.get("call_id") or ""),
-                        "name": name,
-                        "reason": "；".join(problems),
-                    }
-                )
-            else:
-                valid.append(call)
+        valid, rest, rejected = _split_head(state)
 
-        if not valid:
+        if rejected:
             messages = list(state.get("messages") or [])
             for item in rejected:
                 messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": item["call_id"],
-                        "content": json.dumps(
-                            {"ok": False, "error": item["reason"]},
-                            ensure_ascii=False,
-                        ),
-                    }
+                    _tool_error_message(
+                        str(item.get("call_id") or ""),
+                        {"ok": False, "error": str(item.get("_reason") or "")},
+                    )
                 )
-            return {"messages": messages, "pending_calls": []}
+            if not valid:
+                # 这组全废：发完错误就交给下一组，没有下一组则回模型。
+                return {
+                    "messages": messages,
+                    "pending_calls": [],
+                    "deferred_calls": rest,
+                    "confirmed": False,
+                    "rejected": False,
+                }
+            # 部分有效：把错误留在对话里，有效的那部分继续走确认。
+            state = {**state, "messages": messages}
+
+        if not valid:
+            return {"pending_calls": [], "deferred_calls": rest, "confirmed": False}
 
         # 只读工具直接放行；写盘/执行必须人工确认（唯一真源在 agent_tools）。
-        needs_confirmation = [call for call in valid if requires_confirmation(str(call.get("name")))]
-        if not needs_confirmation:
-            return {"pending_calls": valid, "confirmed": False}
+        policy = confirmation_policy(str(valid[0].get("name") or ""))
+        if policy == POLICY_NEVER:
+            return {
+                "pending_calls": valid,
+                "deferred_calls": rest,
+                "confirmed": False,
+                "rejected": False,
+            }
 
+        current = _current_config(state)
         cards = [
             {
                 "call_id": str(call.get("call_id") or ""),
@@ -409,50 +492,73 @@ def build_chat_graph(
                 "risk": risk_of(str(call.get("name") or "")),
                 "label": tool_labels().get(str(call.get("name") or ""), str(call.get("name"))),
                 "description": describe_call(
-                    str(call.get("name") or ""), call.get("arguments") or {}
+                    str(call.get("name") or ""), call.get("arguments") or {}, current
                 ),
             }
-            for call in needs_confirmation
+            for call in valid
         ]
         decision = interrupt(
             {
                 "type": "tool_confirmation",
-                "message": "以下操作会修改项目或启动分析，需要你确认后才会执行。",
+                "policy": policy,
+                "message": (
+                    "以下配置改动会一起写入项目，需要你确认后才会执行。"
+                    if policy != POLICY_SOLO
+                    else "以下操作会真正执行，需要你单独确认。"
+                ),
                 "calls": cards,
             }
         )
 
         approved = bool(decision) and decision.get("approved") is not False
         if approved:
-            return {"pending_calls": valid, "confirmed": True}
+            return {
+                "pending_calls": valid,
+                "deferred_calls": rest,
+                "confirmed": True,
+                "rejected": False,
+            }
 
-        # 拒绝：不能悄悄丢掉，要让模型知道并给出替代方案。
+        # 拒绝：不能悄悄丢掉，要让模型知道并给出替代方案。同一轮里**后面的组也
+        # 一并放弃**——用户刚说了「不」，继续弹下一张卡片是在逼他重复表态。
         note = str((decision or {}).get("note") or "").strip()
         messages = list(state.get("messages") or [])
         for call in valid:
             messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": str(call.get("call_id") or ""),
-                    "content": json.dumps(
-                        {
-                            "ok": False,
-                            "error": "用户拒绝了这个操作，没有执行。",
-                            "user_note": note,
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
+                _tool_error_message(
+                    str(call.get("call_id") or ""),
+                    {
+                        "ok": False,
+                        "error": "用户拒绝了这个操作，没有执行。",
+                        "user_note": note,
+                    },
+                )
             )
-        return {"messages": messages, "pending_calls": [], "via": "rejected"}
+        return {
+            "messages": messages,
+            "pending_calls": [],
+            "deferred_calls": [],
+            "confirmed": False,
+            "rejected": True,
+            "via": "rejected",
+        }
 
     def route_after_guardrail(state: ChatState) -> str:
         if state.get("pending_calls"):
             return "execute"
+        if state.get("deferred_calls"):
+            # 这组被参数校验整组挡下或被拒绝：继续处理队列里的下一组。
+            return "guardrail"
         return "agent"
 
     def node_execute(state: ChatState) -> ChatState:
-        """Run the approved calls. The only node that may write."""
+        """Run the approved calls. The only node that may write.
+
+        执行器抛异常**不能**掀掉整轮对话：真实工具会碰网络（SSH 扫目录、查远端
+        状态），连不上是很正常的事，用户应该看到「这一步失败了，原因是 X」而不是
+        「恢复执行失败」。所以这里把异常翻译成工具结果回灌给模型，让它自己决定
+        是重试、换做法还是如实回答。
+        """
         calls = list(state.get("pending_calls") or [])
         project_dir = Path(state.get("project_dir") or "runs/mvp_demo")
         approved = bool(state.get("confirmed"))
@@ -463,7 +569,15 @@ def build_chat_graph(
         for call in calls:
             name = str(call.get("name") or "")
             arguments = call.get("arguments") or {}
-            result = executor(name, arguments, project_dir, approved)
+            try:
+                result = executor(name, arguments, project_dir, approved)
+            except Exception as exc:  # noqa: BLE001 - the loop must survive
+                result = {
+                    "ok": False,
+                    "error": f"工具执行失败（{type(exc).__name__}）：{exc}",
+                }
+            if not isinstance(result, dict):
+                result = {"ok": False, "error": "工具返回了非预期的结果。"}
             log.append(
                 {
                     "name": name,
@@ -485,10 +599,17 @@ def build_chat_graph(
         return {
             "messages": messages,
             "pending_calls": [],
+            # deferred_calls 保持在 state 里，由 route_after_execute 决定是否继续。
             "tool_log": log,
             "confirmed": False,
             "reply": latest_reply or state.get("reply") or "",
         }
+
+    def route_after_execute(state: ChatState) -> str:
+        """还有顺延的组就继续确认，否则回模型收尾。"""
+        if state.get("deferred_calls"):
+            return "guardrail"
+        return "agent"
 
     builder = StateGraph(ChatState)
     builder.add_node("agent", node_agent)
@@ -499,7 +620,11 @@ def build_chat_graph(
         "agent", route_after_agent, {"guardrail": "guardrail", "end": END}
     )
     builder.add_conditional_edges(
-        "guardrail", route_after_guardrail, {"execute": "execute", "agent": "agent"}
+        "guardrail",
+        route_after_guardrail,
+        {"execute": "execute", "guardrail": "guardrail", "agent": "agent"},
     )
-    builder.add_edge("execute", "agent")
+    builder.add_conditional_edges(
+        "execute", route_after_execute, {"guardrail": "guardrail", "agent": "agent"}
+    )
     return builder.compile(checkpointer=checkpointer)

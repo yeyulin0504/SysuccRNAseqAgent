@@ -19,15 +19,22 @@ import pytest
 
 from rnaseq_agent import chat_graph as cg
 from rnaseq_agent.agent_tools import (
+    POLICY_BATCH,
+    POLICY_NEVER,
+    POLICY_SOLO,
     RISK_EXECUTE,
     RISK_READ,
     RISK_WRITE,
+    TOOL_SPECS,
     ToolCallAccumulator,
+    ToolSpec,
+    confirmation_policy,
     describe_call,
     normalize_write_arguments,
     parse_message_tool_calls,
     requires_confirmation,
     risk_of,
+    split_calls_for_round,
     tool_schemas,
     validate_call,
 )
@@ -121,8 +128,6 @@ def _initial(project_dir: Path, text: str) -> dict:
 class TestToolContract:
     def test_every_tool_requiring_confirmation_is_write_or_execute(self) -> None:
         """守卫的唯一真源：写盘与执行必须确认，只读必须放行。"""
-        from rnaseq_agent.agent_tools import TOOL_SPECS
-
         for name, spec in TOOL_SPECS.items():
             if spec.risk == RISK_READ:
                 assert not requires_confirmation(name), name
@@ -147,6 +152,76 @@ class TestToolContract:
         schema = next(s for s in tool_schemas() if s["function"]["name"] == "write_project_config")
         enum = schema["function"]["parameters"]["properties"]["strandedness"]["enum"]
         assert "unknown" in enum
+
+
+class TestConfirmationPolicy:
+    """用户 2026-09-16 定的确认边界：配置合并、执行单独。"""
+
+    def test_read_is_auto_and_write_execute_need_a_card(self) -> None:
+        for name, spec in TOOL_SPECS.items():
+            if spec.risk == RISK_READ:
+                assert confirmation_policy(name) == POLICY_NEVER, name
+            elif spec.risk == RISK_WRITE:
+                # 允许 spec 用 policy 字段钉成更严的 solo（见 edit_connection：
+                # 用户要求连接配置「每次必确认」，不许被合并卡片夹带）。
+                assert confirmation_policy(name) == (spec.policy or POLICY_BATCH), name
+            else:
+                assert confirmation_policy(name) == POLICY_SOLO, name
+
+    def test_a_spec_may_override_the_default_policy(self) -> None:
+        """连接改动比改样本表更重，允许用 policy 字段钉成 solo。"""
+        spec = ToolSpec(
+            name="t", label="t", description="t", parameters={}, risk=RISK_WRITE, policy=POLICY_SOLO
+        )
+        TOOL_SPECS[spec.name] = spec
+        try:
+            assert confirmation_policy("t") == POLICY_SOLO
+        finally:
+            del TOOL_SPECS[spec.name]
+
+    def test_unknown_tool_defaults_to_solo(self) -> None:
+        """幻觉工具名不能跟着别的调用被顺手批准。"""
+        assert confirmation_policy("invent_a_tool") == POLICY_SOLO
+
+    def test_lone_read_call_is_grouped_without_a_card(self) -> None:
+        batches = split_calls_for_round([{"call_id": "1", "name": "read_project_state"}])
+        assert len(batches) == 1
+        assert batches[0].policy == POLICY_NEVER
+        assert [c["call_id"] for c in batches[0].calls] == ["1"]
+
+    def test_writes_merge_into_one_card(self) -> None:
+        calls = [
+            {"call_id": "1", "name": "write_project_config"},
+            {"call_id": "2", "name": "set_run_resources"},
+            {"call_id": "3", "name": "configure_pipeline"},
+        ]
+        batches = split_calls_for_round(calls)
+        assert [b.policy for b in batches] == [POLICY_BATCH]
+        assert len(batches[0].calls) == 3
+
+    def test_each_execute_call_gets_its_own_card(self) -> None:
+        calls = [
+            {"call_id": "1", "name": "generate_plan"},
+            {"call_id": "2", "name": "run_analysis"},
+        ]
+        batches = split_calls_for_round(calls)
+        assert [b.policy for b in batches] == [POLICY_SOLO, POLICY_SOLO]
+        assert [c["call_id"] for c in batches[0].calls] == ["1"]
+        assert [c["call_id"] for c in batches[1].calls] == ["2"]
+
+    def test_a_mixed_turn_is_ordered_read_then_write_then_execute(self) -> None:
+        """一轮里三种都出现时，卡片顺序要读得出「先落配置、再动执行」。"""
+        calls = [
+            {"call_id": "exec", "name": "run_analysis"},
+            {"call_id": "write", "name": "write_project_config"},
+            {"call_id": "read", "name": "read_project_state"},
+        ]
+        batches = split_calls_for_round(calls)
+        assert [b.policy for b in batches] == [POLICY_NEVER, POLICY_BATCH, POLICY_SOLO]
+        assert [c["call_id"] for b in batches for c in b.calls] == ["read", "write", "exec"]
+
+    def test_empty_round_yields_no_batches(self) -> None:
+        assert split_calls_for_round([]) == []
 
 
 class TestValidateCall:
@@ -189,8 +264,9 @@ class TestValidateCall:
         assert any("不接受参数" in item for item in problems), problems
 
     def test_rejects_unknown_pipeline_step(self) -> None:
+        """enum 由 schema 驱动校验，措辞里带上合法取值方便模型自纠。"""
         problems = validate_call("configure_pipeline", {"step": "bwa", "enabled": True})
-        assert any("未知的分析步骤" in item for item in problems), problems
+        assert any("fastp" in item and "bwa" in item for item in problems), problems
 
     def test_rejects_unknown_tool_name(self) -> None:
         problems = validate_call("rm_rf", {})

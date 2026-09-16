@@ -416,3 +416,405 @@ class TestResumeEndpointValidation:
         events = _parse_sse(resp.text)
         done = events[-1]["data"]
         assert done["via"] == "error", done
+
+
+def _seed_project(tmp_path: Path, monkeypatch, project_id: str) -> None:
+    """Write a real session so the *edit* tools have something to modify."""
+    from rnaseq_agent.session import ProjectSession
+    from rnaseq_agent.webapp import _default_config
+
+    project_dir = tmp_path / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    config = _default_config(project_dir, {"project_id": project_id, "samples": SAMPLE_WRITE_ARGS["samples"]})
+    config["samples"]["items"] = [dict(sample) for sample in SAMPLE_WRITE_ARGS["samples"]]
+    config["samples"]["source"] = "remote_path"
+    config["samples"]["remote_data_dir"] = "/hwdata/reads"
+    config["server"].update({"threads": 8, "memory_gb": 32, "host": "old.example", "user": "old"})
+    session = ProjectSession(project_dir)
+    session.new_project(config)
+
+
+class TestConfirmationGrouping:
+    """用户定的边界：配置合并成一张卡、执行各自单独一张卡。"""
+
+    def test_write_calls_merge_into_one_card(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "grp_a")
+        _seed_project(tmp_path, monkeypatch, "grp_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "set_run_resources", {"threads": 16}),
+                        _tool_call("c2", "configure_pipeline", {"step": "rsem", "enabled": False}),
+                    ]
+                },
+                {"content": "两处配置都改好了。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "线程改16，关掉 rsem", project="grp_a")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "batch", card
+        assert [c["name"] for c in card["calls"]] == ["set_run_resources", "configure_pipeline"]
+
+        # 一次批准，两条配置一起落地。
+        _resume(client, token, project="grp_a", approved=True)
+        project = _project_json(tmp_path, "grp_a")
+        assert project["server"]["threads"] == 16
+        assert project["pipeline"]["rsem"]["enabled"] is False
+
+    def test_execute_calls_each_get_their_own_card(self, client, tmp_path, monkeypatch) -> None:
+        """执行类不许被批量批准夹带：一张卡只签一个动作。"""
+        token = _token(client)
+        _create_project(client, token, "grp_b")
+        _seed_project(tmp_path, monkeypatch, "grp_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "generate_plan", {}),
+                        _tool_call("c2", "confirm_contract", {}),
+                    ]
+                },
+                {"content": "计划已生成、契约已冻结。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "生成计划并冻结", project="grp_b")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "solo", card
+        assert [c["name"] for c in card["calls"]] == ["generate_plan"], card
+
+        # 批准后还有第二张卡（confirm_contract 顺延到下一组）。
+        events2 = _resume(client, token, project="grp_b", approved=True)
+        card2 = _confirm_event(events2)
+        assert card2 is not None, events2
+        assert [c["name"] for c in card2["calls"]] == ["confirm_contract"], card2
+
+    def test_rejection_drops_the_whole_remaining_queue(self, client, tmp_path, monkeypatch) -> None:
+        """用户说「不」之后不再弹下一张卡：不逼他对同一批动作重复表态。"""
+        token = _token(client)
+        _create_project(client, token, "grp_c")
+        _seed_project(tmp_path, monkeypatch, "grp_c")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "generate_plan", {}),
+                        _tool_call("c2", "confirm_contract", {}),
+                    ]
+                },
+                {"content": "好的，先不执行。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "生成计划并冻结", project="grp_c")
+        assert _confirm_event(events) is not None
+
+        events2 = _resume(client, token, project="grp_c", approved=False, note="先看看")
+        assert _confirm_event(events2) is None, events2
+        # 两项都没有执行：契约没被冻结。
+        project = _project_json(tmp_path, "grp_c")
+        assert not (tmp_path / "grp_c" / "contract.json").is_file(), "拒绝后仍然冻结了契约"
+        assert project is not None
+
+
+class TestConnectionEditIsAlwaysSolo:
+    """用户要求：连接配置「含，但每次必确认」。"""
+
+    def test_connection_card_shows_old_to_new(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "conn_a")
+        _seed_project(tmp_path, monkeypatch, "conn_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "edit_connection", {"host": "new.example", "threads": 32}),
+                    ]
+                },
+                {"content": "已切到新服务器。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "换到 new.example，32 线程", project="conn_a")
+        card = _confirm_event(events)
+        assert card is not None, events
+        # 连接配置永远是 solo：不许和别的配置合并。
+        assert card["policy"] == "solo", card
+        description = card["calls"][0]["description"]
+        assert "old.example" in description, description
+        assert "new.example" in description, description
+        assert "→" in description, description
+        # 线程数的旧值也要写出来。
+        assert "8" in description and "32" in description, description
+
+    def test_connection_edit_is_not_merged_with_other_writes(self, client, tmp_path, monkeypatch) -> None:
+        """一轮里同时改连接和别的配置：连接必须独占一张卡。"""
+        token = _token(client)
+        _create_project(client, token, "conn_b")
+        _seed_project(tmp_path, monkeypatch, "conn_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "edit_connection", {"host": "new.example"}),
+                        _tool_call("c2", "configure_pipeline", {"step": "arriba", "enabled": False}),
+                    ]
+                },
+                {"content": "都改好了。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "换服务器并关掉 arriba", project="conn_b")
+        cards = [e["data"] for e in events if e["event"] == "confirm"]
+        assert len(cards) == 1, cards
+        # 顺序上 batch 组先弹（先落配置），连接（solo）随后单独弹。
+        assert cards[0]["policy"] == "batch", cards[0]
+        assert [c["name"] for c in cards[0]["calls"]] == ["configure_pipeline"], cards[0]
+
+        events2 = _resume(client, token, project="conn_b", approved=True)
+        card2 = _confirm_event(events2)
+        assert card2 is not None, events2
+        assert card2["policy"] == "solo", card2
+        assert [c["name"] for c in card2["calls"]] == ["edit_connection"], card2
+
+
+class TestRangeValidationBlocksBadValues:
+    """schema 里写的 minimum/maximum 必须真的被读（此前的真实漏洞）。"""
+
+    def test_out_of_range_threads_never_reaches_the_card(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "range_a")
+        _seed_project(tmp_path, monkeypatch, "range_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": -5})]},
+                {"content": "线程数不能是负数，我改成 16。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "线程改成 -5", project="range_a")
+        assert _confirm_event(events) is None, events
+        project = _project_json(tmp_path, "range_a")
+        assert project["server"]["threads"] == 8, project["server"]
+        # 错误如实回灌给模型。
+        tool_content = fake.seen_messages[-1][-1]["content"]
+        assert "不能小于" in tool_content, tool_content
+
+    def test_out_of_range_memory_gb_is_rejected(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "range_b")
+        _seed_project(tmp_path, monkeypatch, "range_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"memory_gb": 999999})]},
+                {"content": "内存上限超了，我调小一点。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "内存给我 999999", project="range_b")
+        assert _confirm_event(events) is None, events
+        project = _project_json(tmp_path, "range_b")
+        assert project["server"]["memory_gb"] == 32, project["server"]
+
+
+class TestEditSamplesOnExistingSession:
+    """已有会话里改样本表——此前模型完全没有这条路。"""
+
+    def test_retarget_one_sample_keeps_the_others(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "edit_a")
+        _seed_project(tmp_path, monkeypatch, "edit_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "edit_samples", {"samples": [{"sample_id": "S1", "condition": "treat"}]})
+                    ]
+                },
+                {"content": "S1 已经改到 treat 组。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "把 S1 分到 treat", project="edit_a")
+        card = _confirm_event(events)
+        assert card is not None, events
+        # 卡片上要看得见这一条是从哪个组改到哪个组。
+        assert "control" in card["calls"][0]["description"], card
+        assert "treat" in card["calls"][0]["description"], card
+
+        _resume(client, token, project="edit_a", approved=True)
+        project = _project_json(tmp_path, "edit_a")
+        conditions = {s["sample_id"]: s["condition"] for s in project["samples"]["items"]}
+        assert conditions["S1"] == "treat", conditions
+        # 未提到的样本原样保留（没被冲掉）。
+        assert conditions["S2"] == "treat", conditions
+        assert conditions["S3"] == "control", conditions
+        assert conditions["S4"] == "treat", conditions
+        assert len(conditions) == 4, conditions
+
+    def test_removing_a_sample_shrinks_the_table(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "edit_b")
+        _seed_project(tmp_path, monkeypatch, "edit_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "edit_samples", {"remove": ["S4"]})]},
+                {"content": "S4 已删除。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "去掉 S4", project="edit_b")
+        assert _confirm_event(events) is not None, events
+        _resume(client, token, project="edit_b", approved=True)
+        project = _project_json(tmp_path, "edit_b")
+        ids = [s["sample_id"] for s in project["samples"]["items"]]
+        assert ids == ["S1", "S2", "S3"], ids
+
+
+class TestEditReference:
+    def test_gtf_change_lands_in_the_reference_block(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "ref_a")
+        _seed_project(tmp_path, monkeypatch, "ref_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("c1", "edit_reference", {"gtf": "/ref/gencode.v99.gtf"})
+                    ]
+                },
+                {"content": "GTF 已换成 v99。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "GTF 换成 /ref/gencode.v99.gtf", project="ref_a")
+        card = _confirm_event(events)
+        assert card is not None, events
+        # 模型用的短参数名 gtf，卡片上要显示成 config 里那一位的旧值 → 新值。
+        assert "/ref/gencode.v99.gtf" in card["calls"][0]["description"], card
+
+        _resume(client, token, project="ref_a", approved=True)
+        project = _project_json(tmp_path, "ref_a")
+        assert project["reference"]["remote_gtf_path"] == "/ref/gencode.v99.gtf", project["reference"]
+
+    def test_relative_path_is_rejected_before_the_card(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "ref_b")
+        _seed_project(tmp_path, monkeypatch, "ref_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "edit_reference", {"gtf": "ref/local.gtf"})]},
+                {"content": "路径要写绝对路径，我改一下。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "GTF 换成 ref/local.gtf", project="ref_b")
+        assert _confirm_event(events) is None, events
+        project = _project_json(tmp_path, "ref_b")
+        assert project["reference"]["remote_gtf_path"] != "ref/local.gtf"
+
+
+class TestReadOnlyStatusTools:
+    def test_refresh_status_runs_without_a_card(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "ro_a")
+        _seed_project(tmp_path, monkeypatch, "ro_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "refresh_project_status", {})]},
+                {"content": "当前还没有开始跑。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "跑到哪了", project="ro_a")
+        assert _confirm_event(events) is None, events
+        assert fake.seen_messages[-1][-1]["role"] == "tool", fake.seen_messages[-1]
+
+    def test_get_project_report_runs_without_a_card(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "ro_b")
+        _seed_project(tmp_path, monkeypatch, "ro_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "get_project_report", {})]},
+                {"content": "报告已经生成好了。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "给我看看报告", project="ro_b")
+        assert _confirm_event(events) is None, events
+        tool_content = fake.seen_messages[-1][-1]["content"]
+        assert "report" in tool_content.lower(), tool_content
+
+
+class TestStageAwareRunAnalysis:
+    def test_stage_shows_up_on_the_card(self, client, tmp_path, monkeypatch) -> None:
+        """分阶段执行的卡片必须写明只跑哪一段，不能只说「启动分析」。"""
+        token = _token(client)
+        _create_project(client, token, "stage_a")
+        _seed_project(tmp_path, monkeypatch, "stage_a")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "run_analysis", {"stage": "de"})]},
+                {"content": "好的，先只跑差异表达。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "只跑差异表达", project="stage_a")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["policy"] == "solo", card
+        description = card["calls"][0]["description"]
+        assert "de" in description, description
+
+    def test_unknown_stage_is_rejected_without_a_card(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "stage_b")
+        _seed_project(tmp_path, monkeypatch, "stage_b")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "run_analysis", {"stage": "nope"})]},
+                {"content": "没有这个阶段，可选的是 qc/quant/de/cms/counts。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "跑 nope 阶段", project="stage_b")
+        assert _confirm_event(events) is None, events
+        tool_content = fake.seen_messages[-1][-1]["content"]
+        assert "qc" in tool_content, tool_content
+
