@@ -489,3 +489,236 @@ class TestComposerSendsOnEnter:
         page = client.get(path).text
         handler = page.split('document.addEventListener("keydown"')[1].split("});")[0]
         assert submit in handler, f"{path} 的 Enter 未调用 {submit}"
+
+
+class TestChatWritesConfiguration:
+    """对话落地配置：用户说「你帮我执行」必须真的写盘。
+
+    用户实测（2026-09-16）：把 FASTQ 目录 / 文件名 / 参考基因组贴进对话，再说
+    「你帮我执行，链特异性未知，1是control2是treat」，得到的是
+    「我无法直接执行，只能帮你核对配置」；再点「生成执行计划」，又回到
+    「这个项目还没有分析会话」。用户在「AI 说做不到 ↔ 不知道该点哪」之间死循环。
+
+    根因：写盘能力本身存在（``POST /api/projects/{id}/fastq/session``），只是
+    对话够不着——``route_intent`` 没有任何能写配置的动作。这里补上。
+    """
+
+    CONFIG_MESSAGE = (
+        "你帮我填这些信息：原始 FASTQ 数据\n"
+        "/hwdata/home/yeyulin/SysuccRNAseqAgent-master/runs/fastq_pair_test/fastq\n"
+        "包含 8 个文件（4 个样本的双端测序）：\n"
+        "SRR28119110_1.fastq.gz, SRR28119110_2.fastq.gz\n"
+        "SRR28119111_1.fastq.gz, SRR28119111_2.fastq.gz\n"
+        "SRR28119112_1.fastq.gz, SRR28119112_2.fastq.gz\n"
+        "SRR28119113_1.fastq.gz, SRR28119113_2.fastq.gz\n"
+        "参考基因组和注释文件\n"
+        "GTF 注释：\n"
+        "/hwdata/home/yeyulin/project/GSE259357_mm10_analysis/references/"
+        "gencode_m25_grcm38p6/gencode.vM25.annotation.gtf\n"
+        "基因组 FASTA：\n"
+        "/hwdata/home/yeyulin/project/GSE259357_mm10_analysis/references/"
+        "gencode_m25_grcm38p6/GRCm38.primary_assembly.genome.fa\n"
+        "STAR 索引目录：\n"
+        "/hwdata/home/yeyulin/project/GSE259357_mm10_analysis/references/"
+        "gencode_m25_grcm38p6/star_index\n"
+    )
+
+    EXECUTE_MESSAGE = "你帮我执行，链特异性未知，1是control2是treat"
+
+    def _send_config_then_execute(self, client, token: str, project: str) -> list[dict]:
+        """两条消息模拟真实对话：先贴配置，再说「你帮我执行」。"""
+        _stream(client, token, self.CONFIG_MESSAGE, project=project)
+        return _stream(client, token, self.EXECUTE_MESSAGE, project=project)
+
+    def test_execute_creates_a_real_session(self, client, tmp_path) -> None:
+        token = _token(client)
+        _create_project(client, token, "cfg_a")
+        self._send_config_then_execute(client, token, "cfg_a")
+
+        project_dir = tmp_path / "cfg_a"
+        assert (project_dir / "project.json").is_file(), "对话没有真正写盘"
+
+    def test_execute_populates_all_four_samples(self, client, tmp_path) -> None:
+        token = _token(client)
+        _create_project(client, token, "cfg_b")
+        self._send_config_then_execute(client, token, "cfg_b")
+
+        project_json = json.loads(
+            (tmp_path / "cfg_b" / "project.json").read_text(encoding="utf-8")
+        )
+        items = project_json["samples"]["items"]
+        assert [item["sample_id"] for item in items] == [
+            "SRR28119110", "SRR28119111", "SRR28119112", "SRR28119113",
+        ]
+
+    def test_two_group_names_cycle_over_four_samples(self, client, tmp_path) -> None:
+        """用户原话：4 个样本、2 个分组名，按 ctrl/treat 顺序排列，不要反问。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_c")
+        self._send_config_then_execute(client, token, "cfg_c")
+
+        project_json = json.loads(
+            (tmp_path / "cfg_c" / "project.json").read_text(encoding="utf-8")
+        )
+        assert [item["condition"] for item in project_json["samples"]["items"]] == [
+            "control", "treat", "control", "treat",
+        ]
+
+    def test_unknown_strandedness_is_persisted(self, client, tmp_path) -> None:
+        """「要允许特异性未知的选项先写着」——不能静默被 auto 覆盖。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_d")
+        self._send_config_then_execute(client, token, "cfg_d")
+
+        project_json = json.loads(
+            (tmp_path / "cfg_d" / "project.json").read_text(encoding="utf-8")
+        )
+        assert project_json["sequencing"]["strandedness"] == "unknown"
+
+    def test_reply_reports_the_real_write(self, client, tmp_path) -> None:
+        token = _token(client)
+        _create_project(client, token, "cfg_e")
+        events = self._send_config_then_execute(client, token, "cfg_e")
+
+        reply = _deltas(events)
+        assert "已写入" in reply, reply
+        assert "SRR28119110" in reply, reply
+        # 不能再出现「我无法直接执行」这类把活推回给用户的措辞。
+        assert "无法直接执行" not in reply, reply
+
+    def test_reply_does_not_claim_a_write_that_did_not_happen(self, client, tmp_path) -> None:
+        """信息不足时必须如实说缺什么，不得谎称已保存。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_f")
+        events = _stream(client, token, "你帮我执行", project="cfg_f")
+
+        reply = _deltas(events)
+        assert "已写入" not in reply, reply
+        assert not (tmp_path / "cfg_f" / "project.json").is_file()
+
+    def test_existing_session_is_not_overwritten(self, client, tmp_path) -> None:
+        """已有会话时不得把用户确认过的样本设计冲掉。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_g")
+        _with_session(client, token, "cfg_g")
+        before = (tmp_path / "cfg_g" / "project.json").read_text(encoding="utf-8")
+
+        events = self._send_config_then_execute(client, token, "cfg_g")
+
+        after = (tmp_path / "cfg_g" / "project.json").read_text(encoding="utf-8")
+        assert after == before, "对话写入覆盖了已有会话"
+        assert "已经有分析会话" in _deltas(events)
+
+    def test_plan_after_chat_write_succeeds(self, client, tmp_path) -> None:
+        """死循环的收尾：写盘之后「生成执行计划」不能再回「还没有分析会话」。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_h")
+        self._send_config_then_execute(client, token, "cfg_h")
+
+        events = _stream(client, token, "生成执行计划", project="cfg_h")
+        reply = _deltas(events)
+
+        assert "还没有分析会话" not in reply, reply
+        assert any(e["event"] == "done" and e["data"].get("steps") for e in events), events
+
+    def test_stream_reports_the_write_as_a_tool_step(self, client) -> None:
+        """思考过程里要能看到「读取对话中的配置 → 写入项目配置」。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_i")
+        events = self._send_config_then_execute(client, token, "cfg_i")
+
+        labels = [e["data"]["label"] for e in events if e["event"] == "step"]
+        assert any("写入项目配置" in label for label in labels), labels
+        write_steps = [
+            e["data"]
+            for e in events
+            if e["event"] == "step" and "写入项目配置" in e["data"]["label"]
+        ]
+        assert write_steps[-1]["status"] == "done", write_steps
+
+    def test_done_event_carries_the_new_state(self, client) -> None:
+        """写盘后状态要从 idle 变成 drafting，前端才跟得上。"""
+        token = _token(client)
+        _create_project(client, token, "cfg_j")
+        events = self._send_config_then_execute(client, token, "cfg_j")
+
+        done = events[-1]["data"]
+        assert done["state"] == "drafting", done
+        assert done["via"] == "tool", done
+
+    def test_non_streaming_endpoint_writes_too(self, client, tmp_path) -> None:
+        """``/api/chat``（工作台走的非流式端点）同样能落地配置。
+
+        该端点不落盘会话消息，跨轮上下文拿不到，因此这里发**一条自包含**的
+        消息（配置 + 执行指令一起给），验证它同样走确定性写盘。
+        """
+        token = _token(client)
+        _create_project(client, token, "cfg_k")
+        body = client.post(
+            "/api/chat?project=cfg_k",
+            json={"message": self.CONFIG_MESSAGE + "\n" + self.EXECUTE_MESSAGE},
+            headers=_headers(token),
+        ).json()
+
+        assert "已写入" in body.get("reply", ""), body
+        project_json = json.loads(
+            (tmp_path / "cfg_k" / "project.json").read_text(encoding="utf-8")
+        )
+        assert [item["condition"] for item in project_json["samples"]["items"]] == [
+            "control", "treat", "control", "treat",
+        ]
+        assert project_json["sequencing"]["strandedness"] == "unknown"
+
+    def test_remote_reads_are_not_reported_as_missing(self, client, tmp_path) -> None:
+        """写盘回复不得夹带虚假「缺少输入文件」。
+
+        用户贴的是服务器目录，reads 本来就不在本地。早期实现拿本地
+        ``local_data_dir`` 去拼样本文件名，于是每个样本都被报成缺少文件，
+        把「已写入」这条好消息淹没了（2026-09-16 实测）。
+        """
+        token = _token(client)
+        _create_project(client, token, "cfg_m")
+        events = self._send_config_then_execute(client, token, "cfg_m")
+
+        reply = _deltas(events)
+        assert "缺少输入文件" not in reply, reply
+        assert "mvp_demo_data" not in reply, reply
+
+        done = events[-1]["data"]
+        assert done["state"] == "drafting", done
+        # 门禁应给出「通过」，而不是一屏 NOT_EVALUABLE 的「不适用」。
+        gate = done.get("gate") or []
+        assert gate, done
+        assert "通过" in " ".join(gate), gate
+        assert "不适用" not in " ".join(gate), gate
+
+
+class TestConfigureIntentDoesNotStealOtherActions:
+    """「落地配置」的识别必须精确，不能把别的动作抢走。"""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("帮我执行差异表达", "edit"),
+            ("帮我跑差异表达，以control为对照", "edit"),
+            ("把线程改成 16", "edit"),
+            ("生成执行计划", "plan"),
+            ("解释一下差异表达的原理", None),
+            ("帮我做单细胞聚类", None),
+        ],
+    )
+    def test_other_intents_are_untouched(self, text: str, expected) -> None:
+        from rnaseq_agent.webchat import route_intent
+
+        intent = route_intent(text)
+        assert (intent.action if intent else None) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        ["你帮我执行", "帮我执行", "帮我填这些信息", "帮我把这些路径保存下来", "把这些信息写入项目"],
+    )
+    def test_execution_phrases_route_to_configure(self, text: str) -> None:
+        from rnaseq_agent.webchat import route_intent
+
+        intent = route_intent(text)
+        assert intent is not None and intent.action == "configure_project"

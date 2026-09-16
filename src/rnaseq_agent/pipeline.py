@@ -221,6 +221,8 @@ mkdir -p rsem
     featurecounts_block = ""
     if pipeline["featurecounts"]["enabled"] and bam_exprs:
         featurecounts_lines = [
+            # 注释必须在命令之前：插进 `\` 续行中间会把下一行变成独立命令。
+            _strand_comment(sequencing.get("strandedness", "auto")),
             f"{featurecounts_command} \\",
             f"  -T {threads} \\",
             f"  -a {shell_quote(reference['remote_gtf_path'])} \\",
@@ -595,6 +597,8 @@ def render_stage_script(config: dict[str, Any], stage: str) -> str:
 
         if pipeline.get("featurecounts", {}).get("enabled") and bam_exprs:
             featurecounts_lines = [
+                # 注释必须在命令之前：插进 `\` 续行中间会把下一行变成独立命令。
+                _strand_comment(sequencing.get("strandedness", "auto")),
                 f"{featurecounts_command} \\",
                 f"  -T {threads} \\",
                 f"  -a {shell_quote(reference['remote_gtf_path'])} \\",
@@ -737,8 +741,26 @@ bash scripts/{run_script}
 def _featurecounts_strand(strandedness: str) -> int:
     mapping = {
         "auto": 0,
+        "unknown": 0,
         "unstranded": 0,
         "forward": 1,
         "reverse": 2,
     }
     return mapping.get(strandedness, 0)
+
+
+def _strand_comment(strandedness: str) -> str:
+    """Explain where ``-s N`` came from, so ``-s 0`` is never silently assumed.
+
+    featureCounts 只接受 ``-s 0/1/2``。用户在对话里说「链特异性未知」时会落到
+    ``-s 0``（无链特异性）——这是**安全默认**而非确认过的结论：建库若有链
+    特异性，计数会显著偏低。渲染脚本时把这件事写进注释，审计时能看出
+    ``-s 0`` 是「未确定」而不是「已确认无链」。
+    """
+    value = _featurecounts_strand(strandedness)
+    if strandedness in {"", "auto", "unknown"}:
+        return (
+            f"# featureCounts -s {value}：链特异性为 {strandedness or 'auto'}"
+            "（未知/未确定），按无链特异性处理；确认为反链后应改为 -s 2。"
+        )
+    return f"# featureCounts -s {value}：链特异性={strandedness}（已确认）。"

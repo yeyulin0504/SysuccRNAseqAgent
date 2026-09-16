@@ -22,7 +22,7 @@ from .analysis_contract import (
     project_contract_path,
     sha256_file,
 )
-from .configuration import normalize_config
+from .configuration import is_remote_prestaged_config, normalize_config
 from .emailer import send_completion_email
 from .execution import CommandResult
 from .pipeline import (
@@ -971,11 +971,12 @@ def _fastqs_prestaged(config: dict[str, Any]) -> bool:
     The web form's ``remote_path`` data source records the remote FASTQ
     directory the user owns; this flag makes the QC/quant pipeline read
     ``$INPUTDIR`` on the server instead of uploading local files.
+
+    判定已收敛到 ``configuration.is_remote_prestaged_config``：validation 也要
+    问同一个问题（否则本地校验会把服务器 reads 报成「缺少输入文件」），
+    两处各写一遍必然漂移，这里只做转发。
     """
-    samples = config.get("samples", {})
-    return bool(samples.get("remote_prestaged")) or (
-        str(samples.get("source", "")).strip() == "remote_path"
-    )
+    return is_remote_prestaged_config(config)
 
 
 def _write_run_manifest(

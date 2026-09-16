@@ -823,6 +823,19 @@ class TestSystemPromptForbidsFakeWrites:
         assert "生成执行计划" in system
         assert "确认并冻结契约" in system
 
+    def test_prompt_points_at_the_execute_phrase_that_now_writes(self) -> None:
+        """写入能力已经接通对话，提示词不能再让用户去「点界面按钮」。
+
+        用户实测（2026-09-16）：AI 回「我无法直接执行，只能帮你核对配置」，
+        用户于是不知道该点哪，再问一次还是同一句。既然「你帮我执行」现在会
+        真正写盘，模型应当把用户引到这句话上。
+        """
+        import rnaseq_agent.webapp as webapp
+
+        system = next(m["content"] for m in webapp._llm_messages("测试") if m["role"] == "system")
+        assert "你帮我执行" in system, system
+        assert "需要点击界面按钮" not in system, "写入已可由对话触发，不必再让用户找按钮"
+
 
 class TestSharedLlmConfig:
     """大模型接入也是「配一次、所有项目共用、永久保存」。

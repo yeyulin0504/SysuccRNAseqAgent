@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from .configuration import is_counts_entry_config
+from .configuration import is_counts_entry_config, is_remote_prestaged_config
 from .container import container_errors
 from .safety import identifier_error, relative_filename_error
 
@@ -40,6 +40,20 @@ def validate_local_fastqs(
             errors=errors,
         )
     errors = _sample_errors(config)
+
+    # remote_path 项目：reads 已经在服务器上（样本里存的是服务器文件名），
+    # 本地既没有这些文件、也不该有。只校验样本表元数据与 pipeline/container，
+    # 不拿 local_data_dir 去拼路径——否则每个样本都会被误报成「缺少输入文件」。
+    if is_remote_prestaged_config(config):
+        if check_pipeline:
+            errors.extend(_pipeline_errors(config))
+            errors.extend(container_errors(config))
+        return ValidationResult(
+            ok=not errors,
+            checked_files=0,
+            missing_files=missing,
+            errors=errors,
+        )
 
     existing_samples: list[tuple[str, Path, Path | None]] = []
     declared_paths: dict[Path, str] = {}

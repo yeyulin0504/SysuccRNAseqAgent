@@ -84,3 +84,25 @@ def is_counts_entry_config(config: dict[str, Any]) -> bool:
     if str(config.get("cms", {}).get("run_mode", "")).strip().lower() == "counts":
         return True
     return bool(config.get("study", {}).get("input", {}).get("counts_matrix"))
+
+
+def is_remote_prestaged_config(config: dict[str, Any]) -> bool:
+    """Whether reads already live on the server (no local upload needed).
+
+    Truth sources (any one suffices):
+
+    - ``samples.remote_prestaged``      —— web ``remote_path`` 表单写的标记;
+    - ``samples.source == "remote_path"`` —— 同一表单写的来源字段。
+
+    ``remote_path`` 项目里 ``samples.items[].fastq_1`` 只是**服务器上的文件名**，
+    真正的目录在 ``samples.remote_data_dir``。本地校验若拿 ``local_data_dir``
+    去拼这些文件名，必然把每一个样本都报成「缺少输入文件」——用户明明把
+    服务器路径给对了，却收到一屏虚假失败（2026-09-16 实测，UI 按钮和对话
+    写盘两条路径都中招）。所以校验必须先问这个函数，再决定要不要碰本地文件。
+
+    与 ``run_agent._fastqs_prestaged`` 是同一个语义，收敛在这里做单一真源。
+    """
+    samples = config.get("samples", {})
+    if samples.get("remote_prestaged"):
+        return True
+    return str(samples.get("source", "")).strip() == "remote_path"

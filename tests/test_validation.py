@@ -139,5 +139,95 @@ class FastqValidationTests(unittest.TestCase):
             self.assertIn("Missing container.image_path for Apptainer execution.", result.errors)
 
 
+class RemotePrestagedValidationTests(unittest.TestCase):
+    """``remote_path`` 项目：reads 在服务器上，本地不该去找它们。
+
+    缺陷复现（2026-09-16）：用户把服务器目录
+
+        /hwdata/home/yeyulin/.../runs/fastq_pair_test/fastq
+
+    连同 4 个样本贴进对话、说「你帮我执行」，配置确实写盘了，但回复里紧跟
+    8 条 ``不适用：缺少输入文件：F:\\...\\outputs\\mvp_demo_data\\SRR...``。
+    根因是 ``validate_local_fastqs`` 不区分数据来源，一律拿 ``local_data_dir``
+    去拼样本里的文件名（那些文件名其实只在服务器上存在）。UI 的
+    「应用样本表」按钮走同一条链路，同样中招，所以这个测试锁的是两条路径
+    共同的底层校验。
+    """
+
+    def _remote_config(self, root: Path, **overrides: object) -> dict:
+        config = _config(root)
+        config["samples"] = {
+            "source": "remote_path",
+            "local_data_dir": str(root / "not_used_locally"),
+            "remote_data_dir": "/hwdata/home/yeyulin/demo_fastq",
+            "remote_prestaged": True,
+            "items": [
+                {"sample_id": "SRR1", "condition": "control", "fastq_1": "SRR1_1.fastq.gz", "fastq_2": "SRR1_2.fastq.gz"},
+                {"sample_id": "SRR2", "condition": "treat", "fastq_1": "SRR2_1.fastq.gz", "fastq_2": "SRR2_2.fastq.gz"},
+            ],
+        }
+        config.update(overrides)
+        return config
+
+    def test_remote_reads_are_not_reported_as_missing_locally(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)  # 本地一个 FASTQ 都没有，理应通过。
+
+            result = validate_local_fastqs(self._remote_config(root))
+
+            self.assertTrue(result.ok, result.errors)
+            self.assertEqual(result.missing_files, [])
+            self.assertEqual(result.checked_files, 0)
+
+    def test_source_field_alone_is_enough(self) -> None:
+        """``source == "remote_path"`` 单独出现也必须生效（早期配置没有标记位）。"""
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            config = self._remote_config(root)
+            del config["samples"]["remote_prestaged"]
+
+            result = validate_local_fastqs(config)
+
+            self.assertTrue(result.ok, result.errors)
+            self.assertEqual(result.missing_files, [])
+
+    def test_sample_metadata_is_still_validated(self) -> None:
+        """跳过本地文件不等于不校验样本表：缺 fastq_1 仍要报错。"""
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            config = self._remote_config(root)
+            config["samples"]["items"][0]["fastq_1"] = ""
+
+            result = validate_local_fastqs(config)
+
+            self.assertFalse(result.ok)
+            self.assertTrue(
+                any("fastq_1" in error for error in result.errors), result.errors
+            )
+
+    def test_pipeline_errors_are_still_surfaced(self) -> None:
+        """跳过本地文件后，pipeline/container 级错误不能跟着一起被跳过。"""
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            config = self._remote_config(root)
+            for step in config["pipeline"].values():
+                step["enabled"] = False
+
+            result = validate_local_fastqs(config)
+
+            self.assertFalse(result.ok)
+            self.assertIn("At least one pipeline step must be enabled.", result.errors)
+
+    def test_local_upload_still_reports_missing_files(self) -> None:
+        """反向守卫：本地项目缺文件必须照旧报出来，不能顺手放过。"""
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+
+            result = validate_local_fastqs(_config(root))
+
+            self.assertFalse(result.ok)
+            self.assertEqual(len(result.missing_files), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

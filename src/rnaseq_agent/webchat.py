@@ -60,6 +60,27 @@ _EXECUTION_MARKERS = (
     "生成计划", "制定计划", "确认冻结", "回滚", "撤销",
 )
 
+# 把对话里的配置真正写到项目上（用户诉求 2026-09-16）。
+#
+# 背景：用户把 FASTQ 目录 / 文件名 / 参考基因组贴进对话，然后说「你帮我执行」，
+# 此前这句被路由成 ``None`` 交给大模型，而大模型没有工具能力，只能回
+# 「我无法直接执行」；用户再点「生成执行计划」，系统又回「还没有分析会话」——
+# 形成「AI 说做不到 ↔ 不知道该点哪」的死循环。这里把它识别成**可执行的落地动作**。
+_CONFIGURE_MARKERS = (
+    "你帮我执行", "帮我执行", "帮我填", "帮我保存", "保存下来", "保存这些",
+    "写入配置", "写入项目", "应用到项目", "应用配置", "帮我配置", "帮我落地",
+    "把这些信息", "把这些路径", "帮我建项目", "帮我创建会话", "开始配置",
+    "按这个配置", "就按这个", "照这个执行",
+)
+
+# 这些意图的语义比「落地配置」更具体，命中时不能被抢走。
+# 例如「帮我执行差异表达」是要开一个 pipeline 步骤，不是要写样本表。
+_CONFIGURE_EXCLUDE = (
+    "差异表达", "差异分析", "deseq", "diffexp", "de 分析",
+    "线程", "thread", "内存", "memory", "cpu",
+    "回滚", "撤销", "计划", "plan", "确认", "冻结",
+)
+
 
 def _is_knowledge_question(text: str) -> bool:
     """True when the message asks about concepts rather than ordering work.
@@ -87,6 +108,15 @@ def route_intent(text: str) -> ChatIntent | None:
     # 概念性提问优先交回调用方（大模型）回答，而不是被规则意图抢走。
     if _is_knowledge_question(lowered):
         return None
+
+    # 落地配置：把对话里贴出的路径 / 样本 / 参考真正写进项目。
+    # 必须排在其它分支之前——它是「照我说的做」这类最明确的执行指令，
+    # 交给下面的 plan / edit 分支会被解释成别的东西。
+    if _has(lowered, list(_CONFIGURE_MARKERS)) and not _has(lowered, list(_CONFIGURE_EXCLUDE)):
+        return ChatIntent(
+            "configure_project",
+            message="正在把对话里的配置写入项目。",
+        )
 
     # Read-only remote sample discovery.  The executor owns SSH and command
     # construction; the router only extracts an optional absolute path.
@@ -139,7 +169,12 @@ def route_intent(text: str) -> ChatIntent | None:
     if _has(lowered, ["帮助", "help", "能做什么", "怎么用", "支持什么"]):
         return ChatIntent(
             "help",
-            message="我可以帮你：新建项目、生成执行计划、确认冻结契约、修改参数（如线程数）、回滚变更、查看状态。",
+            message=(
+                "我可以帮你：新建项目、生成执行计划、确认冻结契约、修改参数（如线程数）、"
+                "回滚变更、查看状态。\n"
+                "把 FASTQ 目录与文件名、样本分组、参考基因组贴给我，"
+                "最后说一句「你帮我执行」，我就会真正写入项目并把结果回报给你。"
+            ),
         )
 
     return None

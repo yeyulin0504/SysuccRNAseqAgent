@@ -279,8 +279,8 @@ def _llm_messages(text: str) -> list[dict[str, str]]:
                 "或「完成了分析」——这些只有系统的确定性代码才能做。"
                 "当用户给你路径、样本或参考基因组信息时，"
                 "只做归纳与确认（例如列出识别到的样本和参考文件），"
-                "然后明确提示用户：真正的写入需要点击界面按钮，"
-                "或让我代为执行（可执行动作会由系统真实执行并回报结果）。\n"
+                "然后明确提示用户：说一句「你帮我执行」即可，"
+                "系统会真实写入并把结果（含门禁）回报给他。\n"
                 "\n"
                 "涉及可执行操作时，简短回复并提示可继续点「生成执行计划 / "
                 "确认并冻结契约 / 启用差异表达」。"
@@ -1278,6 +1278,112 @@ def create_app(
             return {"ok": False, "message": "请先保存服务器配置并填写远程 FASTQ 目录"}
         return _scan_remote_samples(scan_config, remote_dir)
 
+    def _configure_project_from_chat(
+        project_id: str | None,
+        session: ProjectSession,
+        history_text: list[str],
+    ) -> dict[str, Any]:
+        """把对话里的配置**真正写入项目**（用户诉求 2026-09-16）。
+
+        与 ``POST /api/projects/{id}/fastq/session`` 完全共用同一条落盘链路
+        （``save_intake`` + ``_default_config`` + ``session.new_project``），
+        所以对话写盘和界面按钮写盘产生的结果没有任何差别，审计记录一致。
+
+        ``history_text`` 是**当前对话的全部用户消息**（最新的在前或后都可以，
+        按时间顺序拼接）。只取单条消息是不够的：用户经常第一条消息贴 FASTQ
+        路径、第二条消息补参考基因组、第三条才说「你帮我执行」——配置信息
+        必须从整个对话里汇总。
+        """
+        from .config_intake import extract_config_draft
+
+        if project_id is None:
+            return {
+                "reply": (
+                    "还没有绑定项目，所以无法写入配置。\n"
+                    "请先在左侧选择一个项目（或新建项目），再把路径和样本发我，我来写入。"
+                ),
+                "state": session.state,
+            }
+
+        draft = extract_config_draft("\n".join(history_text))
+        if not draft.ready:
+            lines = ["我还没法写入配置，缺这些信息："]
+            lines.extend(f"  - {item}" for item in draft.blockers)
+            if draft.warnings:
+                lines.append("同时提醒：")
+                lines.extend(f"  - {item}" for item in draft.warnings)
+            return {"reply": "\n".join(lines), "state": session.state}
+
+        # 已有会话：不覆盖。与 fastq/session 的 SESSION_EXISTS 语义一致，
+        # 避免对话反复把用户已经确认过的样本设计冲掉。
+        if (session.project_dir / "session.json").is_file():
+            return {
+                "reply": (
+                    "这个项目已经有分析会话了，我没有重复写入（避免覆盖你已确认的样本设计）。\n"
+                    "如果确实要用新配置，请先在工作台删除/回滚该项目，或换一个项目。"
+                ),
+                "state": session.state,
+            }
+
+        payload = {**draft.to_payload(), "project_id": project_id}
+        try:
+            save_intake(
+                session.project_dir,
+                {
+                    "route": "bulk_rna",
+                    "input_type": (
+                        "remote_fastq" if draft.data_source == "remote_path" else "local_fastq"
+                    ),
+                    "state": "input_ready",
+                    "fastq": {
+                        "data_source": draft.data_source,
+                        "remote_fastq_dir": draft.fastq_dir if draft.data_source == "remote_path" else "",
+                        "fastq_dir": draft.fastq_dir if draft.data_source != "remote_path" else "",
+                    },
+                    "samples": draft.samples,
+                },
+            )
+            config = _default_config(session.project_dir, payload)
+            # 新项目继承用户级共享连接（与 /api/new 一致）。
+            config = apply_connection_to_config(config, load_connection())
+            created = ProjectSession(session.project_dir)
+            gate = created.new_project(config)
+            workspace.touch(project_id, created.state)
+            append_history(
+                session.project_dir,
+                {
+                    "type": "sample_design",
+                    "name": "样本分组（来自对话）",
+                    "state": created.state,
+                    "details": {"count": len(draft.samples), "layout": payload.get("layout")},
+                },
+            )
+        except (SessionError, OSError, ValueError) as exc:
+            return {"reply": f"写入配置时出错：{exc}", "state": session.state}
+
+        lines = [
+            f"已写入项目 {project_id}（{len(draft.samples)} 个样本，"
+            f"{payload.get('layout')} 布局）。"
+        ]
+        lines.append("样本与分组：")
+        lines.extend(
+            f"  {index}. {sample['sample_id']} → {sample.get('condition') or '未分组'}"
+            for index, sample in enumerate(draft.samples, start=1)
+        )
+        lines.append(f"链特异性：{draft.strandedness}")
+        if draft.warnings:
+            lines.append("需要你知道：")
+            lines.extend(f"  - {item}" for item in draft.warnings)
+        lines.extend(gate.formatted())
+        lines.append("下一步：对我说「生成执行计划」。")
+        return {
+            "reply": "\n".join(lines),
+            "state": created.state,
+            "gate": gate.formatted(),
+            "action": "configure_project",
+            "samples": draft.samples,
+        }
+
     def _fallback_reply(config: dict[str, Any] | None) -> str:
         """Rule-router hint when the message is neither an action nor answerable."""
         capabilities = ", ".join(
@@ -1289,9 +1395,10 @@ def create_app(
         return (
             "我还没理解成可执行操作。可以试试："
             + (
-                "生成计划 / 确认 / 把线程改成 16 / 关闭 arriba / 回滚 / 状态。"
+                "生成计划 / 确认 / 把线程改成 16 / 关闭 arriba / 回滚 / 状态；"
+                "或者把 FASTQ 路径与样本贴出来再说「你帮我执行」，我会写入项目。"
                 if config is not None
-                else "先在左侧创建项目，然后对我说：生成计划、确认、把线程改成 16。"
+                else "先选一个项目，把 FASTQ 路径与样本贴出来再说「你帮我执行」。"
             )
             + f"\n当前能力：{capabilities}"
         )
@@ -1351,6 +1458,40 @@ def create_app(
         action = getattr(intent, "action", "")
         return labels.get(action, action or "会话动作")
 
+    def _draft_summary(history_text: list[str]) -> str:
+        """One-line「我读到了什么」for the thinking panel, before any write."""
+        from .config_intake import extract_config_draft
+
+        draft = extract_config_draft("\n".join(history_text))
+        if not draft.ready:
+            return "；".join(draft.blockers) or "没读到可用配置"
+        conditions = "、".join(
+            f"{sample['sample_id']}→{sample.get('condition') or '未分组'}"
+            for sample in draft.samples
+        )
+        return (
+            f"{len(draft.samples)} 个样本（{conditions}）；"
+            f"目录 {draft.fastq_dir}；链特异性 {draft.strandedness}"
+        )
+
+    def _conversation_text(project_dir: Path, thread_id: str, current: str) -> list[str]:
+        """User turns of a thread (chronological) plus the message being sent now.
+
+        配置信息常常分散在多轮消息里（先贴 FASTQ、再补参考基因组、最后说
+        「你帮我执行」），所以抽取要基于**整个对话**而不是最后一句。
+        只取 ``role == "user"``：Agent 自己归纳过的那段文字里也有路径，若不
+        排除会把同一份信息读两遍，且会把 Agent 的措辞当成用户输入。
+        """
+        history: list[str] = []
+        try:
+            for message in messages(project_dir, thread_id):
+                if message.get("role") == "user":
+                    history.append(str(message.get("content") or ""))
+        except (ThreadError, OSError):
+            history = []
+        history.append(current)
+        return history
+
     @app.post("/api/chat")
     async def api_chat(request: Request):
         """Chat panel endpoint: route intent -> audited session action.
@@ -1371,6 +1512,9 @@ def create_app(
 
         session = _session_for(_legacy_dir_for(request, payload))
         config = session.config
+        project_id = _bound_project_id(request, payload)
+        project_dir = session.project_dir
+        thread_id = str(payload.get("thread_id") or "").strip()
         # 连接信息是用户级共享的：项目尚未创建（无 project.json）时，仍可用
         # 全局连接做只读的服务器操作，不再要求用户先建项目再保存配置。
         # load_connection() 是扁平的连接字段，包成 {"server": {...}} 以复用
@@ -1383,6 +1527,15 @@ def create_app(
         intent = route_intent(text)
         if intent is not None and intent.action == "browse_samples":
             return _browse_samples_reply(session, intent, config, connection_config)
+
+        # 落地配置同样不能让模型代劳：它没有工具能力，只能回「我无法执行」。
+        # 这里走确定性写盘，并把真实结果（含门禁）回报给用户。
+        if intent is not None and intent.action == "configure_project":
+            return _configure_project_from_chat(
+                project_id,
+                session,
+                _conversation_text(project_dir, thread_id or "main", text),
+            )
 
         # 1) LLM path (when enabled and reachable).
         # 大模型配置是用户级共享的：项目里没有 project.json 时回退到全局
@@ -1474,6 +1627,8 @@ def create_app(
 
             # 3a) 工具动作优先：可执行操作不让模型代劳。
             payload_extra: dict[str, Any] = {}
+            # 写盘动作会让状态从 idle 变 drafting，收尾时用这个会话回报真实状态。
+            active_session = session
             if intent is not None and intent.action == "browse_samples":
                 yield step("tool", f"执行操作：{intent_label}", "running")
                 result = _browse_samples_reply(session, intent, config, connection_config)
@@ -1484,6 +1639,33 @@ def create_app(
                     for k in ("action", "samples", "unmatched", "scanned_path")
                     if k in result
                 }
+            elif intent is not None and intent.action == "configure_project":
+                yield step("tool", "读取对话中的配置", "running")
+                chat_history = _conversation_text(
+                    project_dir,
+                    requested_thread or "main",
+                    text,
+                )
+                draft_summary = _draft_summary(chat_history)
+                yield step("tool", "读取对话中的配置", "done", draft_summary)
+                yield step("tool", "写入项目配置", "running")
+                result = _configure_project_from_chat(project_id, session, chat_history)
+                via = "tool"
+                reply = str(result.get("reply") or "")
+                failed = "gate" not in result and "已写入" not in reply
+                yield step(
+                    "tool",
+                    "写入项目配置",
+                    "failed" if failed else "done",
+                    "" if not failed else reply.splitlines()[0] if reply else "",
+                )
+                payload_extra = {
+                    k: result[k]
+                    for k in ("gate", "action", "samples")
+                    if k in result
+                }
+                # 写盘后状态从 idle 变成 drafting，前端要看到新状态。
+                active_session = _session_for(project_dir)
             elif intent is not None:
                 yield step("tool", f"执行操作：{intent_label}", "running")
                 result = _execute_chat_intent(session, intent)
@@ -1527,7 +1709,8 @@ def create_app(
                 # 规则/工具答复没有 token 流，整段推一次保持前端逻辑统一。
                 yield sse("delta", {"text": reply})
 
-            state = session.state
+            # 写盘动作会刷新会话，用它的真实状态收尾。
+            state = active_session.state
             result: dict[str, Any] = {
                 "state": state,
                 "via": via,
@@ -2265,6 +2448,19 @@ def create_app(
     return app
 
 
+def _normalize_strandedness(value: Any) -> str:
+    """Keep ``unknown`` as a first-class value instead of collapsing to ``auto``.
+
+    featureCounts 只接受 ``-s 0/1/2``，但「还没确定」和「已确认无链特异性」是
+    两件不同的事：计划里的注释要靠这个区分（见 ``pipeline._strand_comment``）。
+    因此这里保留 ``unknown`` 原样落盘，只把未提供的值默认成 ``auto``。
+    """
+    text = str(value or "").strip().lower()
+    if text in {"auto", "unknown", "unstranded", "forward", "reverse"}:
+        return text
+    return "auto"
+
+
 def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Build a config from the web form payload (2026-09-08 form).
 
@@ -2335,7 +2531,10 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
         "sequencing": {
             "layout": str(payload.get("layout") or "paired"),
             "reads_per_sample_million": 40,
-            "strandedness": "auto",
+            # 链特异性：允许 unknown 落盘（用户明确要求「允许未知的选项先写着」）。
+            # 早期硬编码 "auto"，会把对话里说清楚的「未知」覆盖掉，计划里也就
+            # 看不出 -s 0 是「未确定」而非「已确认无链特异性」。
+            "strandedness": _normalize_strandedness(payload.get("strandedness")),
         },
         "samples": samples_block,
         "pipeline": {
