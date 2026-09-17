@@ -29,6 +29,8 @@ def _normalized_host(value: Any) -> tuple[str | None, str | None]:
     host = value
     if not host:
         return None, "SSH 主机不能为空。"
+    if "%" in host:
+        return None, "SSH 主机格式无效。"
 
     if host.startswith("[") or host.endswith("]"):
         if not (host.startswith("[") and host.endswith("]")):
@@ -57,7 +59,16 @@ def _normalized_host(value: Any) -> tuple[str | None, str | None]:
     labels = host.split(".")
     if any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels):
         return None, "SSH 主机格式无效。"
-    return host, None
+    return host.lower(), None
+
+
+def normalize_ssh_host(value: Any) -> str:
+    """Return the canonical host used by transports and credential keys."""
+    host, error = _normalized_host(value)
+    if error:
+        raise SSHIdentityError(error)
+    assert host is not None
+    return host
 
 
 def _user_error(value: Any) -> str | None:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import unittest
 import socket
+import sys
+import time
+import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -65,6 +68,17 @@ VALID_IDENTITIES = [
     {"host": "192.0.2.10", "user": "alice_1", "port": "2222"},
     {"host": "[2001:db8::1]", "user": "alice.dev", "port": None},
     {"host": "2001:db8::1", "user": "alice-dev", "port": ""},
+]
+
+INVALID_SCOPED_IPV6_HOSTS = [
+    "fe80::1%eth0",
+    "fe80::1%bad zone",
+    "fe80::1%bad\tzone",
+    "fe80::1%bad\nzone",
+    "fe80::1%bad;id",
+    "fe80::1%x] -oProxyCommand=calc",
+    "[fe80::1%eth0]",
+    "[fe80::1%x] -oProxyCommand=calc]",
 ]
 
 
@@ -183,6 +197,37 @@ def test_normalize_ssh_identity_returns_canonical_bare_ipv6(host: str) -> None:
     identity = normalize_ssh_identity({"host": host, "user": "alice", "port": 22})
 
     assert identity.host == "2001:db8::1"
+
+
+@pytest.mark.parametrize("host", INVALID_SCOPED_IPV6_HOSTS)
+def test_normalize_ssh_identity_rejects_scoped_ipv6(host: str) -> None:
+    with pytest.raises(ValueError):
+        normalize_ssh_identity({"host": host, "user": "alice", "port": 22})
+
+
+def test_bracketed_ipv6_password_credential_selects_paramiko_transport() -> None:
+    bracketed_host = "[2001:db8::1]"
+    canonical_host = "2001:db8::1"
+    clear_ssh_credential(canonical_host, "alice")
+    try:
+        set_ssh_credential(
+            bracketed_host,
+            "alice",
+            mode="password",
+            password="temporary-secret",
+        )
+
+        transport = create_remote_transport(
+            {"server": {"host": bracketed_host, "user": "alice", "port": 22}}
+        )
+
+        assert isinstance(transport, ParamikoTransport)
+        assert transport.password == "temporary-secret"
+        clear_ssh_credential(canonical_host, "alice")
+        assert get_ssh_credential(bracketed_host, "alice") == SSHCredential()
+    finally:
+        clear_ssh_credential(bracketed_host, "alice")
+        clear_ssh_credential(canonical_host, "alice")
 
 
 class SystemSSHTransportTests(unittest.TestCase):
@@ -399,7 +444,7 @@ def test_paramiko_uses_combined_output_limit(monkeypatch) -> None:
     client = _FakeClient(
         _FakeChannel(stdout_chunks=[b"o" * 6], stderr_chunks=[b"e" * 6])
     )
-    monkeypatch.setattr(transport, "_connect", lambda: client)
+    monkeypatch.setattr(transport, "_connect", lambda *args, **kwargs: client)
 
     with pytest.raises(CommandOutputLimitError):
         transport.execute("printf ok")
@@ -416,7 +461,7 @@ def test_paramiko_drains_stderr_before_stdout_backpressure_can_block(monkeypatch
         release_stdout_after_stderr=True,
     )
     client = _FakeClient(channel)
-    monkeypatch.setattr(transport, "_connect", lambda: client)
+    monkeypatch.setattr(transport, "_connect", lambda *args, **kwargs: client)
 
     result = transport.execute("printf ok")
 
@@ -428,7 +473,7 @@ def test_paramiko_drains_stderr_before_stdout_backpressure_can_block(monkeypatch
 def test_paramiko_enforces_total_deadline_during_trickle_output(monkeypatch) -> None:
     transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
     client = _FakeClient(_FakeChannel(trickle=True))
-    monkeypatch.setattr(transport, "_connect", lambda: client)
+    monkeypatch.setattr(transport, "_connect", lambda *args, **kwargs: client)
     monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
     started = __import__("time").monotonic()
 
@@ -447,13 +492,97 @@ def test_paramiko_maps_channel_timeout_to_typed_error(monkeypatch) -> None:
 
     transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
     client = _FakeClient(TimeoutChannel(stdout_chunks=[b"unread"]))
-    monkeypatch.setattr(transport, "_connect", lambda: client)
+    monkeypatch.setattr(transport, "_connect", lambda *args, **kwargs: client)
 
     with pytest.raises(CommandTimeoutError):
         transport.execute("printf ok")
 
     assert client.channel.closed is True
     assert client.closed is True
+
+
+def test_paramiko_connection_time_counts_toward_total_deadline(monkeypatch) -> None:
+    transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
+    client = _FakeClient(_FakeChannel())
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.03)
+
+    def delayed_connect(*args, **kwargs):
+        time.sleep(0.05)
+        return client
+
+    monkeypatch.setattr(transport, "_connect", delayed_connect)
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    assert client.closed is True
+
+
+def test_paramiko_maps_connection_socket_timeout_to_typed_error(monkeypatch) -> None:
+    class TimeoutSSHClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def load_system_host_keys(self) -> None:
+            pass
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            pass
+
+        def connect(self, **kwargs) -> None:
+            raise socket.timeout("connect timed out")
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = TimeoutSSHClient()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    assert client.closed is True
+
+
+def test_paramiko_connect_receives_remaining_total_budget(monkeypatch) -> None:
+    class FakeSSHClient:
+        def __init__(self) -> None:
+            self.connect_kwargs = None
+            self.closed = False
+
+        def load_system_host_keys(self) -> None:
+            pass
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            pass
+
+        def connect(self, **kwargs) -> None:
+            self.connect_kwargs = kwargs
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = FakeSSHClient()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
+    timeout_seconds = 0.25
+
+    connected = transport._connect(time.monotonic() + timeout_seconds)
+
+    assert connected is client
+    assert client.connect_kwargs is not None
+    assert 0 < client.connect_kwargs["timeout"] <= timeout_seconds
+    assert client.connect_kwargs["auth_timeout"] == client.connect_kwargs["timeout"]
+    assert client.connect_kwargs["banner_timeout"] == client.connect_kwargs["timeout"]
 
 
 if __name__ == "__main__":

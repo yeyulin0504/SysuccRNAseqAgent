@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -159,3 +161,32 @@ def test_bounded_command_kills_grandchild_process_tree_on_output_overflow() -> N
         )
 
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object boundary")
+def test_bounded_command_fails_closed_before_child_runs_when_job_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "child-started.txt"
+    grandchild = "import time; time.sleep(0.75)"
+    parent = (
+        "import pathlib, subprocess, sys; "
+        f"pathlib.Path({str(marker)!r}).write_text('started'); "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])"
+    )
+    monkeypatch.setattr(
+        "rnaseq_agent.execution._create_windows_kill_job",
+        lambda process: None,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="Job Object"):
+        run_command_bounded(
+            [sys.executable, "-c", parent],
+            timeout_seconds=0.1,
+            max_capture_bytes=4096,
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert not marker.exists()

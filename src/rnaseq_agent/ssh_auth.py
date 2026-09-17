@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 
+from .ssh_identity import normalize_ssh_host
+
 
 AUTH_MODES = {"key", "password", "system"}
 AUTH_MODE_ALIASES = {"pass": "password"}
@@ -39,6 +41,12 @@ _credentials: dict[tuple[str, str], SSHCredential] = {}
 _lock = Lock()
 
 
+def _credential_key(host: str, user: str) -> tuple[str, str]:
+    host_text = host.strip()
+    canonical_host = normalize_ssh_host(host_text) if host_text else ""
+    return canonical_host, user.strip()
+
+
 def set_ssh_credential(
     host: str,
     user: str,
@@ -54,17 +62,17 @@ def set_ssh_credential(
         key_path=str(Path(key_path).expanduser()) if key_path else "",
     )
     with _lock:
-        _credentials[(host.strip(), user.strip())] = credential
+        _credentials[_credential_key(host, user)] = credential
 
 
 def get_ssh_credential(host: str, user: str) -> SSHCredential:
     with _lock:
         return _credentials.get(
-            (host.strip(), user.strip()),
+            _credential_key(host, user),
             SSHCredential(),
         )
 
 
 def clear_ssh_credential(host: str, user: str) -> None:
     with _lock:
-        _credentials.pop((host.strip(), user.strip()), None)
+        _credentials.pop(_credential_key(host, user), None)

@@ -21,6 +21,16 @@ REMOTE_COMMAND_TIMEOUT_SECONDS = 120
 MAX_REMOTE_CAPTURE_BYTES = 4 * 1024 * 1024
 
 
+def _remaining_remote_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CommandTimeoutError(
+            f"Remote command exceeded the "
+            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+        )
+    return remaining
+
+
 class RemoteTransport(Protocol):
     def execute(self, remote_command: str) -> CommandResult: ...
 
@@ -145,7 +155,7 @@ class ParamikoTransport:
         self.port = identity.port
         self.target = f"{self.user}@{self.host}"
 
-    def _connect(self):
+    def _connect(self, deadline: float | None = None):
         try:
             import paramiko
         except ImportError as exc:
@@ -156,17 +166,28 @@ class ParamikoTransport:
         client.load_system_host_keys()
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
         try:
+            if deadline is None:
+                connect_timeout = 15.0
+                banner_timeout = 20.0
+                auth_timeout = 20.0
+            else:
+                remaining = _remaining_remote_time(deadline)
+                connect_timeout = min(15.0, remaining)
+                banner_timeout = min(20.0, remaining)
+                auth_timeout = min(20.0, remaining)
             client.connect(
                 hostname=self.host,
                 port=self.port,
                 username=self.user,
                 password=self.password,
-                timeout=15,
-                auth_timeout=20,
-                banner_timeout=20,
+                timeout=connect_timeout,
+                auth_timeout=auth_timeout,
+                banner_timeout=banner_timeout,
                 allow_agent=False,
                 look_for_keys=False,
             )
+            if deadline is not None:
+                _remaining_remote_time(deadline)
         except Exception as exc:
             client.close()
             if "known_hosts" in str(exc):
@@ -178,15 +199,17 @@ class ParamikoTransport:
         return client
 
     def execute(self, remote_command: str) -> CommandResult:
-        client = self._connect()
+        deadline = time.monotonic() + REMOTE_COMMAND_TIMEOUT_SECONDS
+        client = None
         channel = None
         try:
-            deadline = time.monotonic() + REMOTE_COMMAND_TIMEOUT_SECONDS
+            client = self._connect(deadline)
             _, stdout, _ = client.exec_command(
                 remote_command,
-                timeout=max(0.001, deadline - time.monotonic()),
+                timeout=_remaining_remote_time(deadline),
             )
             channel = stdout.channel
+            channel.settimeout(_remaining_remote_time(deadline))
             stdout_capture = bytearray()
             stderr_capture = bytearray()
             captured_bytes = 0
@@ -202,27 +225,15 @@ class ParamikoTransport:
                 captured_bytes += len(chunk)
 
             while True:
-                if time.monotonic() >= deadline:
-                    raise CommandTimeoutError(
-                        f"Remote command exceeded the "
-                        f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
-                    )
+                _remaining_remote_time(deadline)
 
                 progressed = False
                 if channel.recv_ready():
-                    if time.monotonic() >= deadline:
-                        raise CommandTimeoutError(
-                            f"Remote command exceeded the "
-                            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
-                        )
+                    _remaining_remote_time(deadline)
                     capture(stdout_capture, channel.recv(64 * 1024))
                     progressed = True
                 if channel.recv_stderr_ready():
-                    if time.monotonic() >= deadline:
-                        raise CommandTimeoutError(
-                            f"Remote command exceeded the "
-                            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
-                        )
+                    _remaining_remote_time(deadline)
                     capture(stderr_capture, channel.recv_stderr(64 * 1024))
                     progressed = True
 
@@ -234,7 +245,7 @@ class ParamikoTransport:
                     returncode = channel.recv_exit_status()
                     break
                 if not progressed:
-                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                    time.sleep(min(0.01, _remaining_remote_time(deadline)))
 
             stdout_text = bytes(stdout_capture).decode("utf-8", errors="replace")
             stderr_text = bytes(stderr_capture).decode("utf-8", errors="replace")
@@ -253,7 +264,8 @@ class ParamikoTransport:
                 f"Remote command exceeded the {REMOTE_COMMAND_TIMEOUT_SECONDS}-second time limit."
             ) from exc
         finally:
-            client.close()
+            if client is not None:
+                client.close()
         result = CommandResult(
             command=["ssh", self.target, remote_command],
             returncode=returncode,

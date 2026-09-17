@@ -19,6 +19,7 @@ class CommandOutputLimitError(RuntimeError):
 
 
 _CLEANUP_GRACE_SECONDS = 1.0
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
 
 
 def _create_windows_kill_job(process: subprocess.Popen[bytes]) -> int | None:
@@ -108,23 +109,43 @@ def _close_windows_job(job: int | None) -> None:
         pass
 
 
+def _resume_windows_process(process: subprocess.Popen[bytes]) -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
+        return ntdll.NtResumeProcess(wintypes.HANDLE(int(process._handle))) == 0
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _abort_unstarted_windows_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.kill()
+    except OSError:
+        pass
+    _wait_for_process(process)
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
 def _terminate_process_tree(
     process: subprocess.Popen[bytes], windows_job: int | None
 ) -> None:
     if os.name == "nt":
-        if windows_job is not None:
-            _close_windows_job(windows_job)
-            return
-        try:
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=_CLEANUP_GRACE_SECONDS,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        if windows_job is None:
+            raise RuntimeError("Windows bounded execution lost its Job Object handle.")
+        _close_windows_job(windows_job)
+        return
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -205,7 +226,9 @@ def run_command_bounded(
 
     popen_options: dict[str, object] = {}
     if os.name == "nt":
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_options["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | _WINDOWS_CREATE_SUSPENDED
+        )
     else:
         popen_options["start_new_session"] = True
     process = subprocess.Popen(
@@ -216,6 +239,21 @@ def run_command_bounded(
         **popen_options,
     )
     windows_job = _create_windows_kill_job(process)
+    if os.name == "nt" and windows_job is None:
+        _abort_unstarted_windows_process(process)
+        raise RuntimeError(
+            "Windows bounded execution requires a kill-on-close Job Object."
+        )
+    if os.name == "nt" and not _resume_windows_process(process):
+        _close_windows_job(windows_job)
+        _wait_for_process(process)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        raise RuntimeError("Windows bounded execution could not resume its secured process.")
     assert process.stdout is not None
     assert process.stderr is not None
 
@@ -291,14 +329,16 @@ def run_command_bounded(
         _wait_for_process(process)
         if not tree_terminated:
             _close_windows_job(windows_job)
-        for pipe in (process.stdout, process.stderr):
+        cleanup_deadline = time.monotonic() + _CLEANUP_GRACE_SECONDS
+        for reader in readers:
+            reader.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        for reader, pipe in zip(readers, (process.stdout, process.stderr), strict=True):
+            if reader.is_alive():
+                continue
             try:
                 pipe.close()
             except OSError:
                 pass
-        cleanup_deadline = time.monotonic() + _CLEANUP_GRACE_SECONDS
-        for reader in readers:
-            reader.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
 
     if timed_out:
         raise CommandTimeoutError(
