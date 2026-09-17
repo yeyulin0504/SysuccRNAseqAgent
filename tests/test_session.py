@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -275,23 +277,33 @@ class TestChangesetAudit:
 class TestQcDecisionPersistence:
     """M1: a QC checkpoint decision is bound to the live project, not a thread."""
 
+    @staticmethod
+    def _set_run_id(project_dir: Path, run_id: str) -> None:
+        project = load_json(project_dir / "project.json")
+        project.setdefault("status", {})["run_id"] = run_id
+        _write_config(project_dir, project)
+
     def test_record_qc_decision_writes_project_status(
         self, session: ProjectSession, project_dir: Path, tmp_path: Path
     ) -> None:
         session.new_project(_valid_config(tmp_path))
         session.plan()
         session.confirm()
+        self._set_run_id(project_dir, "run-1")
         decision = session.record_qc_decision(
             approved=True,
+            expected_run_id="run-1",
             user="alice",
             thread_id="thread-qc-1",
             note="reads retention > 0.9",
         )
         assert decision["approved"] is True
         assert decision["checkpoint"] == "fastp_qc"
+        assert decision["run_id"] == "run-1"
         # The live project.json carries the decision for every dialogue.
         project = load_json(project_dir / "project.json")
         assert project["status"]["qc"]["approved"] is True
+        assert project["status"]["qc"]["run_id"] == "run-1"
         assert project["status"]["qc"]["user"] == "alice"
         assert project["status"]["qc"]["thread_id"] == "thread-qc-1"
         # And it is on the audit trail.
@@ -304,8 +316,86 @@ class TestQcDecisionPersistence:
         session.new_project(_valid_config(tmp_path))
         session.plan()
         session.confirm()
+        self._set_run_id(project_dir, "run-1")
         before = load_json(project_dir / "project.json")["status"]["state"]
-        session.record_qc_decision(approved=False, user="bob", note="redo fastp")
+        session.record_qc_decision(
+            approved=False,
+            expected_run_id="run-1",
+            user="bob",
+            note="redo fastp",
+        )
         project = load_json(project_dir / "project.json")
         assert project["status"]["state"] == before
         assert project["status"]["qc"]["approved"] is False
+
+    def test_record_qc_decision_rejects_attempt_drift_without_writing_qc(
+        self, session: ProjectSession, project_dir: Path, tmp_path: Path
+    ) -> None:
+        session.new_project(_valid_config(tmp_path))
+        session.plan()
+        session.confirm()
+        self._set_run_id(project_dir, "run-2")
+
+        with pytest.raises(SessionError, match="attempt"):
+            session.record_qc_decision(
+                approved=True,
+                expected_run_id="run-1",
+                user="alice",
+            )
+
+        project = load_json(project_dir / "project.json")
+        assert project["status"]["run_id"] == "run-2"
+        assert "qc" not in project["status"]
+
+    def test_attempt_switch_waits_for_qc_decision_transaction(
+        self, session: ProjectSession, project_dir: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.run_agent import _update_status
+
+        session.new_project(_valid_config(tmp_path))
+        session.plan()
+        session.confirm()
+        self._set_run_id(project_dir, "run-1")
+        decision_inside_transaction = threading.Event()
+        release_decision = threading.Event()
+        switch_started = threading.Event()
+        switch_finished = threading.Event()
+        original_log = session._log
+
+        def blocking_log(event: str, payload: dict) -> None:
+            if event == "qc_decision":
+                decision_inside_transaction.set()
+                release_decision.wait(timeout=5)
+            original_log(event, payload)
+
+        def switch_attempt() -> None:
+            switch_started.set()
+            _update_status(
+                project_dir / "project.json",
+                "preparing",
+                "new attempt",
+                run_id="run-2",
+                attempt_dir=str(project_dir / "attempts" / "run-2"),
+            )
+            switch_finished.set()
+
+        monkeypatch.setattr(session, "_log", blocking_log)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            decision_future = executor.submit(
+                session.record_qc_decision,
+                approved=True,
+                expected_run_id="run-1",
+                user="alice",
+            )
+            assert decision_inside_transaction.wait(timeout=5)
+            switch_future = executor.submit(switch_attempt)
+            assert switch_started.wait(timeout=5)
+            assert not switch_finished.wait(timeout=0.1)
+            release_decision.set()
+            decision = decision_future.result(timeout=5)
+            switch_future.result(timeout=5)
+
+        project = load_json(project_dir / "project.json")
+        assert decision["run_id"] == "run-1"
+        assert project["status"]["run_id"] == "run-2"
+        assert "qc" not in project["status"]

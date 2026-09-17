@@ -641,11 +641,6 @@ def create_app(
         checkpointer (``thread_id == project_id``). Returns ``{"conflict": ...}``
         when a run is already in flight.
         """
-        with _graph_lock:
-            existing = _graph_runs.get(project_id)
-            if existing is not None:
-                return {"conflict": True, "state": existing.get("state", "running")}
-
         entry: dict[str, Any] = {
             "project_id": project_id,
             "state": "running",
@@ -653,6 +648,9 @@ def create_app(
             "error": None,
         }
         with _graph_lock:
+            existing = _graph_runs.get(project_id)
+            if existing is not None:
+                return {"conflict": True, "state": existing.get("state", "running")}
             _graph_runs[project_id] = entry
 
         def _drive() -> None:
@@ -1906,8 +1904,11 @@ def create_app(
             if session.config is None:
                 return {"ok": False, "error": "这个项目还没有分析会话。"}
             try:
+                status = load_json(session.config_path).get("status", {})
+                expected_run_id = str(status.get("run_id") or "").strip()
                 decision = session.record_qc_decision(
                     approved=bool(arguments.get("approved")),
+                    expected_run_id=expected_run_id,
                     note=str(arguments.get("note") or ""),
                 )
             except SessionError as exc:

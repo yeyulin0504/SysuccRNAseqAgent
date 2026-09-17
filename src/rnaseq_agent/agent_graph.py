@@ -255,6 +255,7 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
     try:
         session.record_qc_decision(
             approved=approved,
+            expected_run_id=expected_run_id,
             user=str(decided.get("user", "")),
             thread_id=str(decided.get("thread_id", "")),
             note=str(decided.get("note", "")),

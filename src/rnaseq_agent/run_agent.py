@@ -35,7 +35,7 @@ from .remote import collect_local_fastq_paths
 from .remote_transport import RemoteTransport, create_remote_transport
 from .result_manifest import ResultManifestSummary, create_result_manifest
 from .shell import shell_quote
-from .storage import append_jsonl, load_json, save_json
+from .storage import append_jsonl, load_json, project_state_lock, save_json
 from .validation import validate_local_fastqs
 
 
@@ -877,18 +877,23 @@ def _update_status(
     message: str,
     **fields: Any,
 ) -> None:
-    config = normalize_config(load_json(config_path))
-    status = config.get("status", {})
-    status.update(
-        {
-            "state": state,
-            "message": message,
-            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-    )
-    status.update(fields)
-    config["status"] = status
-    save_json(config_path, config)
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
+        status = config.get("status", {})
+        previous_run_id = str(status.get("run_id") or "")
+        next_run_id = str(fields.get("run_id") or previous_run_id)
+        if "run_id" in fields and next_run_id != previous_run_id:
+            status.pop("qc", None)
+        status.update(
+            {
+                "state": state,
+                "message": message,
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        )
+        status.update(fields)
+        config["status"] = status
+        save_json(config_path, config)
 
 
 def _record_policy_verification(config_path: Path, policy: dict[str, str]) -> None:

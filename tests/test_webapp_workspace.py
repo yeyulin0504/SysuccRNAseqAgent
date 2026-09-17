@@ -8,7 +8,9 @@ control-plane endpoints (run / state / resume).
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -311,3 +313,75 @@ class TestGraphApi:
         client.post("/api/projects/proj_i/graph/run", headers=h)
         second = client.post("/api/projects/proj_i/graph/run", headers=h).json()
         assert "error" in second
+
+    def test_graph_run_check_and_reservation_are_atomic(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        endpoint = next(
+            route.endpoint
+            for route in client.app.routes
+            if getattr(route, "name", "") == "api_graph_run"
+        )
+        endpoint_closure = {
+            name: cell.cell_contents
+            for name, cell in zip(
+                endpoint.__code__.co_freevars,
+                endpoint.__closure__,
+            )
+        }
+        start_graph_run = endpoint_closure["_start_graph_run"]
+        start_closure = {
+            name: cell
+            for name, cell in zip(
+                start_graph_run.__code__.co_freevars,
+                start_graph_run.__closure__,
+            )
+        }
+        barrier = threading.Barrier(2)
+
+        class CoordinatedLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self._uses = threading.local()
+
+            def __enter__(self):
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *_exc) -> None:
+                self._lock.release()
+                count = getattr(self._uses, "count", 0) + 1
+                self._uses.count = count
+                if count == 1 and not threading.current_thread().name.startswith("graph:"):
+                    barrier.wait(timeout=5)
+
+        start_closure["_graph_lock"].cell_contents = CoordinatedLock()
+        release_graph = threading.Event()
+
+        class SlowGraph:
+            def invoke(self, *_args, **_kwargs):
+                release_graph.wait(timeout=5)
+                return {"status": "FAIL"}
+
+        monkeypatch.setattr(
+            "rnaseq_agent.webapp.build_bulk_rna_graph",
+            lambda _checkpointer: SlowGraph(),
+        )
+        project_dir = tmp_path / "atomic_graph_run"
+        project_dir.mkdir()
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(
+                        lambda _index: start_graph_run(
+                            "atomic_graph_run",
+                            project_dir,
+                        ),
+                        range(2),
+                    )
+                )
+        finally:
+            release_graph.set()
+
+        assert sum(bool(result.get("conflict")) for result in results) == 1

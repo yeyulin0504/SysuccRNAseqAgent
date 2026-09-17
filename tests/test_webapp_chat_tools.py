@@ -988,6 +988,13 @@ class TestRollbackAndQcDecisionTools:
         token = _token(client)
         _create_project(client, token, "qc_tool")
         _seed_project(tmp_path, monkeypatch, "qc_tool")
+        project_path = tmp_path / "qc_tool" / "project.json"
+        project_payload = json.loads(project_path.read_text(encoding="utf-8"))
+        project_payload.setdefault("status", {})["run_id"] = "run-qc-tool"
+        project_path.write_text(
+            json.dumps(project_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         _configure_llm(client, token)
         fake = FakeLLM(
             [
@@ -1013,6 +1020,7 @@ class TestRollbackAndQcDecisionTools:
 
         project = _project_json(tmp_path, "qc_tool")
         assert project["status"]["qc"]["approved"] is False
+        assert project["status"]["qc"]["run_id"] == "run-qc-tool"
         assert project["status"]["qc"]["note"] == "reads retention too low"
         tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
         assert tool_result["ok"] is True

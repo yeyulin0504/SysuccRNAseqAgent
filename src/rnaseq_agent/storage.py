@@ -1,8 +1,30 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
+
+
+_PROJECT_STATE_LOCKS_GUARD = threading.Lock()
+_PROJECT_STATE_LOCKS: dict[str, Any] = {}
+
+
+def project_state_lock(config_path: Path):
+    """Return the process-local lock protecting one project's live config.
+
+    The lock is re-entrant because callers such as ``record_qc_decision``
+    perform a compare-and-write transaction and then reuse ``_update_status``.
+    It coordinates in-process attempt switches and QC decisions; the SQLite
+    graph checkpointer remains the durable state store across restarts.
+    """
+    key = str(Path(config_path).resolve())
+    with _PROJECT_STATE_LOCKS_GUARD:
+        lock = _PROJECT_STATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROJECT_STATE_LOCKS[key] = lock
+        return lock
 
 
 def user_state_dir() -> Path:

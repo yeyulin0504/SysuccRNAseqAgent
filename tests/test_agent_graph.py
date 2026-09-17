@@ -250,6 +250,10 @@ class TestM1RealizedCheckpointNodes:
         assert result["qc_decision"]["approved"] is False
         assert result["qc_decision"]["expected_run_id"] == "run-older"
         assert result["qc_decision"]["run_id"] == "run-1"
+        project = json.loads(
+            (project_dir / "project.json").read_text(encoding="utf-8")
+        )
+        assert "qc" not in project["status"]
 
     def test_wait_qc_persistence_failure_cannot_pass(
         self, tmp_path, monkeypatch
@@ -274,6 +278,69 @@ class TestM1RealizedCheckpointNodes:
         assert result["status"] == FAIL
         assert result["qc_decision"]["approved"] is False
         assert "持久化失败" in result["message"]
+
+    def test_wait_qc_attempt_switch_during_persistence_fails_closed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.session import ProjectSession
+
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        _write_json(
+            project_dir / "attempts" / "run-2" / "result_manifest.json",
+            {
+                "schema_version": 1,
+                "summary": {
+                    "ok": True,
+                    "errors": [],
+                    "scientific_files": [
+                        {"name": "fastp/sample_b.json", "category": "scientific"}
+                    ],
+                },
+            },
+        )
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            lambda _payload: {"approved": True, "expected_run_id": "run-1"},
+        )
+        original = ProjectSession.record_qc_decision
+
+        def switch_attempt_then_persist(
+            session,
+            *,
+            expected_run_id=None,
+            **kwargs,
+        ):
+            payload = json.loads(
+                (project_dir / "project.json").read_text(encoding="utf-8")
+            )
+            payload["status"]["run_id"] = "run-2"
+            payload["status"]["attempt_dir"] = str(
+                project_dir / "attempts" / "run-2"
+            )
+            _write_json(project_dir / "project.json", payload)
+            if expected_run_id is None:
+                return original(session, **kwargs)
+            return original(
+                session,
+                expected_run_id=expected_run_id,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.ProjectSession.record_qc_decision",
+            switch_attempt_then_persist,
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+        live_status = json.loads(
+            (project_dir / "project.json").read_text(encoding="utf-8")
+        )["status"]
+
+        assert result["status"] == FAIL
+        assert result["qc_decision"]["approved"] is False
+        assert live_status["run_id"] == "run-2"
+        assert live_status.get("qc", {}).get("approved") is not True
 
     def test_validate_output_without_attempt_raises_contract_failure(
         self, tmp_path

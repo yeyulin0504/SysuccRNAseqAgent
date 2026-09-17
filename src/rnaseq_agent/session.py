@@ -44,7 +44,7 @@ from .capability import (
 )
 from .output_validator import mark_stale_downstream, register_artifacts
 from .run_agent import run_project
-from .storage import append_jsonl, load_json, save_json
+from .storage import append_jsonl, load_json, project_state_lock, save_json
 
 SESSION_FILE = "session.json"
 CHANGESET_FILE = "changesets.jsonl"
@@ -392,6 +392,7 @@ class ProjectSession:
         self,
         *,
         approved: bool,
+        expected_run_id: str,
         checkpoint: str = "fastp_qc",
         user: str = "",
         thread_id: str = "",
@@ -407,34 +408,51 @@ class ProjectSession:
         from .run_agent import _update_status  # local import avoids cycle
 
         assert self.config is not None
-        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        decision = {
-            "checkpoint": checkpoint,
-            "approved": bool(approved),
-            "decided_at": now,
-            "user": user,
-            "thread_id": thread_id,
-            "note": note,
-        }
-        self._log(
-            "qc_decision",
-            {
+        expected_run_id = str(expected_run_id or "").strip()
+        if not expected_run_id:
+            raise SessionError("QC 决策缺少 expected_run_id，无法绑定执行 attempt。")
+
+        with project_state_lock(self.config_path):
+            config = load_json(self.config_path)
+            status = config.get("status", {})
+            current_run_id = str(status.get("run_id") or "").strip()
+            if not current_run_id or current_run_id != expected_run_id:
+                raise SessionError(
+                    "QC 决策绑定的 attempt 已变化："
+                    f"expected={expected_run_id or '<empty>'}, "
+                    f"current={current_run_id or '<empty>'}。"
+                )
+
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            decision = {
                 "checkpoint": checkpoint,
                 "approved": bool(approved),
+                "decided_at": now,
+                "run_id": current_run_id,
                 "user": user,
                 "thread_id": thread_id,
-            },
-        )
-        # Keep the live state word intact; only attach the QC decision block.
-        config = load_json(self.config_path)
-        current_state = str(config.get("status", {}).get("state") or self.state)
-        _update_status(
-            self.config_path,
-            current_state,
-            config.get("status", {}).get("message", "QC 检查点已记录。"),
-            qc=decision,
-        )
-        return decision
+                "note": note,
+            }
+            self._log(
+                "qc_decision",
+                {
+                    "checkpoint": checkpoint,
+                    "approved": bool(approved),
+                    "run_id": current_run_id,
+                    "user": user,
+                    "thread_id": thread_id,
+                },
+            )
+            # Keep the live state word intact; only attach the attempt-bound
+            # QC decision block while holding the same lock as run switches.
+            current_state = str(status.get("state") or self.state)
+            _update_status(
+                self.config_path,
+                current_state,
+                status.get("message", "QC 检查点已记录。"),
+                qc=decision,
+            )
+            return decision
 
     def refresh_status(self) -> dict[str, Any]:
         from .run_agent import refresh_status
