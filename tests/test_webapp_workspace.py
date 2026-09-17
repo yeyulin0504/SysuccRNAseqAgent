@@ -188,6 +188,19 @@ class TestGraphApi:
         ).json()
         assert "error" in resp
 
+    def test_resume_requires_literal_boolean_approval(self, client) -> None:
+        token = _token(client)
+        h = _headers(token)
+        _create_project(client, token, "proj_g_bool")
+
+        resp = client.post(
+            "/api/projects/proj_g_bool/graph/resume",
+            json={"approved": "yes"},
+            headers=h,
+        ).json()
+
+        assert "approved" in resp.get("error", "")
+
     def test_run_fails_cleanly_without_session(self, client) -> None:
         token = _token(client)
         h = _headers(token)

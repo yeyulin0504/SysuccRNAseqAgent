@@ -171,6 +171,21 @@ class TestM1RealizedCheckpointNodes:
         assert result["status"] == "FAIL"
         assert result["qc_evidence"]["ok"] is False
 
+    def test_wait_qc_only_accepts_literal_boolean_true(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            lambda _payload: {"approved": "yes"},
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+
+        assert result["status"] == WAITING_USER
+        assert result["qc_decision"]["approved"] is False
+
     def test_validate_output_without_attempt_raises_contract_failure(
         self, tmp_path
     ) -> None:

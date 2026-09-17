@@ -227,7 +227,10 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
             "downstream": "validate_output -> post_run_gate -> report",
         }
     )
-    approved = bool(decision) and decision.get("approved") is not False
+    # Fail closed just like the LLM tool confirmation path: only the literal
+    # JSON boolean true means approval.  Strings such as "yes", numbers,
+    # missing fields, and non-object resume payloads are rejections.
+    approved = isinstance(decision, dict) and decision.get("approved") is True
     decided = {
         "approved": approved,
         "decided_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

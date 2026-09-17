@@ -3230,12 +3230,14 @@ def create_app(
         """
         _guard(request)
         project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("approved"), bool):
+            return {"error": "缺少 approved（true / false）。"}
         snapshot = _graph_snapshot(project_id, project_dir)
         if snapshot.get("state") != WAITING_USER:
             return {"error": f"当前状态 {snapshot.get('state')} 不在 QC 检查点，无法恢复。"}
-        payload = await request.json()
         decision = {
-            "approved": bool(payload.get("approved", True)),
+            "approved": payload["approved"],
             "user": str(payload.get("user") or ""),
             "thread_id": str(payload.get("thread_id") or project_id),
             "note": str(payload.get("note") or ""),
