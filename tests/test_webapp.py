@@ -418,7 +418,7 @@ class TestWebApp:
         assert result["config"]["llm"]["tool_mode"] == TOOL_MODE_DISABLED
         assert not (tmp_path / "proj" / "project.json").exists()
 
-    @pytest.mark.parametrize("invalid", ["unlimited", False, 0, [], {}])
+    @pytest.mark.parametrize("invalid", ["unlimited", False, 0, [], {}, None])
     def test_config_endpoint_rejects_an_invalid_llm_tool_mode(
         self, client, invalid: object
     ) -> None:
@@ -435,6 +435,7 @@ class TestWebApp:
         ).json()
 
         assert "error" in result
+        assert "tool_mode" in result["error"]
         assert load_llm()["tool_mode"] == TOOL_MODE_APPROVED_EXECUTE
 
     def test_settings_page_exposes_all_four_llm_tool_modes(self, client) -> None:

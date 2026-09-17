@@ -492,6 +492,16 @@ class TestDescribeCall:
         assert "关闭" in describe_call("configure_pipeline", {"step": "rsem", "enabled": False})
         assert "启用" in describe_call("configure_pipeline", {"step": "rsem", "enabled": True})
 
+    def test_refresh_and_report_cards_state_their_persistent_side_effects(self) -> None:
+        refresh = describe_call("refresh_project_status", {})
+        report = describe_call("get_project_report", {})
+
+        assert "项目运行状态" in refresh
+        assert "本地会话" in refresh
+        assert "只读" not in refresh
+        assert "生成或覆盖" in report and "报告文件" in report
+        assert "只读" not in report
+
 
 # -- 图：工具循环 -----------------------------------------------------------
 

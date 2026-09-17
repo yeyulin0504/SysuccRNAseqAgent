@@ -43,8 +43,8 @@
 ======================  ======  ================================================
 read_project_state      never   ``ProjectSession.config`` 只读投影
 browse_remote_samples   never   ``webapp._scan_remote_samples``（只读 SSH）
-refresh_project_status  never   ``session.refresh_status``
-get_project_report      never   ``session.report``
+refresh_project_status  batch   ``session.refresh_status``（更新项目状态并写回本地会话）
+get_project_report      batch   ``session.report``（生成/覆盖报告文件）
 write_project_config    batch   ``webapp._write_project_session``（首次建会话）
 edit_samples            batch   ``session.edit``（``samples.items`` 整体覆盖）
 edit_reference          batch   ``session.edit``（``reference`` 浅合并）
@@ -476,7 +476,8 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         description=(
             "读取项目当前的真实运行进度（提交了哪些作业、跑到哪一步、有没有失败）。"
             "启动分析之后想知道「跑到哪了」就调用它，不要凭上次的答复猜测。"
-            "该操作会把最新状态写回本地会话，因此需要确认。"
+            "该操作会更新 project.json 中的项目运行状态，并把会话状态写回 "
+            "session.json，因此需要确认。"
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         risk=RISK_WRITE,
@@ -1305,10 +1306,13 @@ def describe_call(
         return f"{title}：只读扫描 {arguments.get('path')}"
 
     if name == "refresh_project_status":
-        return f"{title}：读取服务器上的最新进度（只读）"
+        return (
+            f"{title}：读取远端运行进度，更新项目运行状态，"
+            "并把最新状态写回本地会话。"
+        )
 
     if name == "get_project_report":
-        return f"{title}：汇总当前分析结果（只读）"
+        return f"{title}：生成或覆盖当前项目的报告文件。"
 
     return title
 

@@ -1104,12 +1104,18 @@ def create_app(
         llm = payload.get("llm")
         if isinstance(llm, dict):
             llm_patch: dict[str, Any] = {}
-            for key in ("provider", "api_base", "model", "enabled", "tool_mode"):
+            for key in ("provider", "api_base", "model", "enabled"):
                 if key in llm and llm[key] is not None:
                     llm_patch[key] = llm[key]
+            # Presence is significant for the emergency control: explicit
+            # JSON null is invalid, whereas an absent key is the legacy case.
+            if "tool_mode" in llm:
+                llm_patch["tool_mode"] = llm["tool_mode"]
             if "tool_mode" in llm_patch:
                 from .agent_tools import normalize_tool_mode
 
+                if llm_patch["tool_mode"] is None:
+                    return {"error": "tool_mode 不能是 null；请提供明确的权限模式。"}
                 try:
                     llm_patch["tool_mode"] = normalize_tool_mode(
                         llm_patch["tool_mode"]
@@ -1904,7 +1910,8 @@ def create_app(
         - ``read_project_state``  → 只读 ``ProjectSession``；
         - ``browse_remote_samples`` → 复用 ``_scan_remote_samples``（只读 SSH）；
         - ``refresh_project_status`` / ``get_project_report`` → 复用
-          ``session.refresh_status`` / ``session.report``（会更新会话/生成文件）；
+          ``session.refresh_status`` / ``session.report``（刷新会更新 project.json
+          中的项目运行状态并写回 session.json；报告会生成或覆盖 report.md）；
         - ``write_project_config``  → 复用 ``_write_project_session``（与按钮同一条链路）；
         - ``edit_samples`` / ``edit_reference`` / ``edit_connection``
           / ``configure_pipeline`` / ``set_run_resources`` / ``set_diffexp_reference``

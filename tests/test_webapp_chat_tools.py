@@ -1354,39 +1354,158 @@ class TestReadAndDerivedArtifactTools:
         assert tool_result["ok"] is True
         assert tool_result["samples"][0]["sample_id"] == "S1"
 
-    def test_refresh_status_requires_a_card_before_it_updates_session_state(
+    def test_rejected_refresh_does_not_update_project_or_session_state(
         self, client, tmp_path, monkeypatch
     ) -> None:
         token = _token(client)
-        _create_project(client, token, "ro_a")
-        _seed_project(tmp_path, monkeypatch, "ro_a")
+        project_id = "refresh_reject"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
         _configure_llm(client, token)
         fake = FakeLLM(
             [
                 {"tool_calls": [_tool_call("c1", "refresh_project_status", {})]},
-                {"content": "当前还没有开始跑。"},
+                {"content": "没有刷新。"},
             ]
         )
         monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        project_path = tmp_path / project_id / "project.json"
+        session_path = tmp_path / project_id / "session.json"
+        project_before = project_path.read_bytes()
+        session_before = session_path.read_bytes()
 
-        events = _stream(client, token, "跑到哪了", project="ro_a")
+        events = _stream(client, token, "跑到哪了", project=project_id)
         card = _confirm_event(events)
         assert card is not None, events
-        events = _resume(
+        assert project_path.read_bytes() == project_before
+        assert session_path.read_bytes() == session_before
+        _resume(
             client,
             token,
-            project="ro_a",
+            project=project_id,
+            approval_id=card["approval_id"],
+            approved=False,
+        )
+        assert project_path.read_bytes() == project_before
+        assert session_path.read_bytes() == session_before
+
+    def test_approved_refresh_persists_the_real_refreshed_state(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        import rnaseq_agent.run_agent as run_agent
+
+        token = _token(client)
+        project_id = "refresh_approve"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
+        _configure_llm(client, token)
+        monkeypatch.setattr(run_agent, "_read_remote_state", lambda _config, _transport: "completed")
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "refresh_project_status", {})]},
+                {"content": "状态已刷新。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        project_path = tmp_path / project_id / "project.json"
+        session_path = tmp_path / project_id / "session.json"
+        project_before = project_path.read_bytes()
+        session_before = session_path.read_bytes()
+
+        events = _stream(client, token, "跑到哪了", project=project_id)
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert project_path.read_bytes() == project_before
+        assert session_path.read_bytes() == session_before
+        _resume(
+            client,
+            token,
+            project=project_id,
             approval_id=card["approval_id"],
             approved=True,
         )
-        assert fake.seen_messages[-1][-1]["role"] == "tool", fake.seen_messages[-1]
 
-    def test_get_project_report_requires_a_card_before_it_writes_the_report(
+        assert project_path.read_bytes() != project_before
+        assert session_path.read_bytes() != session_before
+        project = json.loads(project_path.read_text(encoding="utf-8"))
+        assert project["status"]["state"] == "completed"
+        assert project["status"]["message"] == "Remote state: completed"
+        assert json.loads(session_path.read_text(encoding="utf-8"))["state"] == "completed"
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["run_state"] == "completed"
+        assert tool_result["status"]["message"] == "Remote state: completed"
+
+    def test_read_only_mode_blocks_refresh_without_updating_project_or_session(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        project_id = "refresh_read_only"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
+        _configure_llm(client, token)
+        save_llm({"tool_mode": "read_only"})
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "refresh_project_status", {})]},
+                {"content": "权限阻止了刷新。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        project_path = tmp_path / project_id / "project.json"
+        session_path = tmp_path / project_id / "session.json"
+        project_before = project_path.read_bytes()
+        session_before = session_path.read_bytes()
+
+        events = _stream(client, token, "跑到哪了", project=project_id)
+
+        assert _confirm_event(events) is None
+        assert project_path.read_bytes() == project_before
+        assert session_path.read_bytes() == session_before
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["error_code"] == "llm_tool_mode_blocked"
+        assert tool_result["tool_mode"] == "read_only"
+
+    def test_rejected_report_does_not_create_a_report_file(
         self, client, tmp_path, monkeypatch
     ) -> None:
         token = _token(client)
-        _create_project(client, token, "ro_b")
-        _seed_project(tmp_path, monkeypatch, "ro_b")
+        project_id = "report_reject"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "get_project_report", {})]},
+                {"content": "没有生成报告。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        report_path = tmp_path / project_id / "report.md"
+        assert not report_path.exists()
+
+        events = _stream(client, token, "给我看看报告", project=project_id)
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert not report_path.exists()
+        _resume(
+            client,
+            token,
+            project=project_id,
+            approval_id=card["approval_id"],
+            approved=False,
+        )
+
+        assert not report_path.exists()
+
+    def test_approved_report_creates_the_real_project_report(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        project_id = "report_approve"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
         _configure_llm(client, token)
         fake = FakeLLM(
             [
@@ -1395,19 +1514,52 @@ class TestReadAndDerivedArtifactTools:
             ]
         )
         monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        report_path = tmp_path / project_id / "report.md"
 
-        events = _stream(client, token, "给我看看报告", project="ro_b")
+        events = _stream(client, token, "给我看看报告", project=project_id)
         card = _confirm_event(events)
         assert card is not None, events
-        events = _resume(
+        assert not report_path.exists()
+        _resume(
             client,
             token,
-            project="ro_b",
+            project=project_id,
             approval_id=card["approval_id"],
             approved=True,
         )
-        tool_content = fake.seen_messages[-1][-1]["content"]
-        assert "report" in tool_content.lower(), tool_content
+
+        assert report_path.is_file()
+        assert project_id in report_path.read_text(encoding="utf-8")
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert Path(tool_result["report_path"]) == report_path
+
+    def test_read_only_mode_blocks_report_without_creating_a_file(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        project_id = "report_read_only"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
+        _configure_llm(client, token)
+        save_llm({"tool_mode": "read_only"})
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("c1", "get_project_report", {})]},
+                {"content": "权限阻止了报告生成。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        report_path = tmp_path / project_id / "report.md"
+
+        events = _stream(client, token, "给我看看报告", project=project_id)
+
+        assert _confirm_event(events) is None
+        assert not report_path.exists()
+        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        assert tool_result["error_code"] == "llm_tool_mode_blocked"
+        assert tool_result["tool_mode"] == "read_only"
 
 
 class TestRollbackAndQcDecisionTools:
