@@ -52,8 +52,9 @@ LLM 行为测试使用脚本化 fake model，验证工具协议和权限，不�
 
 ## 第二阶段：建立真实 Adapter
 
-建议把 `bkbio-eval` 放入独立 Git 仓库并固定版本；当前 WorkBuddy 交付目录不是 Git
-仓库，不适合作为长期真源。主项目保存兼容版本和调用说明，不复制 evaluator 源码。
+`bkbio-eval` 已在 WorkBuddy 交付目录初始化为独立 Git 仓库，基线提交为
+`02d540d8265282ecfcc017ab90673f223fa04c4d`。主项目只保存兼容版本和调用说明，
+不复制 evaluator 源码；接入 CI 或迁移远端时必须固定 evaluator commit。
 
 Adapter 的最小流程：
 
@@ -68,6 +69,18 @@ Adapter 的最小流程：
 第一版只接 counts，不接 FASTQ。若执行环境缺 R/DESeq2，Adapter 应明确返回
 unavailable/skip 原因；不能退回模板统计实现并把结果冒充为主项目输出。
 
+第一版能力矩阵同时冻结为：独立非配对两组、公式 `~ condition`、
+`paired=false`、`min_count_prefilter=0`。任何超出矩阵的请求必须在创建契约和提交
+作业前返回结构化 `NOT_EVALUABLE`，不得静默删除 `patient/cell`、把配对改成非配对，
+或忽略 prefilter。报告必须同时记录 requested/executed design、主项目与 evaluator
+commit、容器 digest、输入校验和、contract id、run/result manifest id；其中
+requested/executed design 必须一致，正式发布报告中的容器 digest 不得为空。
+
+截至 2026-09-17，本机可通过 WSL 的 R 4.5.2、DESeq2 1.46.0、jsonlite 2.0.0
+执行数值 smoke test，但这不是目标发布环境。发布门禁仍以固定 R 4.3.3 / Bioconductor
+3.18 镜像或其等价 digest 为准。Docker Hub 拉取基础镜像和真实 HPC SSH 均因当前
+网络/凭据不可用而不能作为本轮正式验证证据。
+
 ## 第三阶段：修复 evaluator 已知问题
 
 优先处理：
@@ -80,14 +93,42 @@ unavailable/skip 原因；不能退回模板统计实现并把结果冒充为主
    失败。
 3. 保持 `consistency` 的空集合显式失败和 `$param` 阈值引用。
 4. 同步维护 `README.md`、`docs/ADAPTER.md` 和模板，避免契约漂移。
-5. 用带 R/DESeq2 的固定容器落地 `L1_airway_deseq2`，补足 BH 校正更容易被观察
-   的真实用例。
+5. 现有 TCGA 与 airway 都是配对数据，不能直接作为当前 `~ condition` 产品能力的
+   正向 L1。推进顺序固定为：先把它们做成结构化预期拒绝测试，再增加真正独立样本
+   的正向 L1，最后实现具名的 `paired_two_group` 模板后再将两例晋升为正向 L1。
 
 WorkBuddy 交付目录中的 evaluator 已完成参数方向测试、mutation/CLI 子进程的
 Windows UTF-8 修复和多层 `--level unit,L0,L1` 支持。验证结果为
-`116 passed, 1 skipped`；变异测试
-保持 unit `6/6`、L0 `11/11`、L1 `12/12`。该目录仍需迁入正式 Git 仓库，才能对
-这些变更做长期版本追踪。
+`116 passed, 1 skipped`；变异测试保持 unit `6/6`、L0 `11/11`、L1 `12/12`。
+该目录已有本地 Git 基线但尚无远端；配置远端前需复核 TCGA/airway 固化输入的
+再分发条款。
+
+### 3A：把现有配对 L1 改成预期拒绝测试
+
+evaluator 应增加一等公民的 `expected_outcome`，用稳定 reason code 表达
+`unsupported_design`，并断言没有 contract、run id、远程作业或 DESeq2 产物。
+预期拒绝通过单独统计为 `expected_refusal_passed`，不能计入 numerical L1 passed，
+也不能用 skipped 冒充。TCGA 固定请求 `pair_column=patient`、airway 固定请求
+`pair_column=cell`；把 Adapter 的拒绝变异为静默降级时，这两个用例必须失败。
+
+### 3B：新增真正独立样本的正向 L1
+
+候选数据集必须先提交元数据审计：每个实验单位只出现一次、每组至少三个独立
+生物学重复、批次不与 condition 完全混杂，并记录 accession、许可、导出脚本、
+输入哈希和只依赖元数据的纳排规则。首例固定 `~ condition`、`paired=false`、
+`min_count_prefilter=0`。断言分为输入事实、输出结构、阈值内部一致性、交换
+reference/contrast 的变形性质，以及固定 DESeq2 版本下的实现一致性；不得把同一
+数据上事后挑选的 marker 称为独立生物学金标准。
+
+### 3C：实现受限的配对两组模板
+
+不要开放任意公式。新增具名 `paired_two_group`，由代码生成
+`~ pair_id + condition`。样本模型增加 canonical `pair_id`，并要求每个 pair 在两个
+condition 中各恰好一条记录；缺对、重复 pair-condition、空 pair id、少于冻结完整
+pair 数或模型矩阵不满秩均拒绝。Analysis Contract 指纹必须包含模板、pair 映射、
+reference/contrast 和 prefilter 规则。`min_count_prefilter` 的精确定义冻结前继续
+拒绝，不允许只把数值写入配置却不执行。airway/TCGA 晋升正向用例时必须重新审查
+效应量与 marker 断言，不能靠放宽容差消除配对/非配对差异。
 
 ## 第四阶段：CI 与发布门禁
 
@@ -105,7 +146,8 @@ CI 必须使用 `--require-confirmed`，并把“全部 skipped”视为失败�
 下一阶段可以开始扩展 WXS/scRNA 或更多自主工具的前提是：
 
 - 主项目的权限和协议测试稳定通过；
-- counts 直入真实 Adapter 能跑 L0 与至少一个 L1；
+- counts 直入真实 Adapter 能在固定发布环境跑 L0 与至少一个独立样本正向 L1；
+- 配对 TCGA/airway 在配对模板落地前稳定返回预期拒绝，且没有提交远程作业；
 - 每次评测报告能追溯到主项目 commit、容器 digest、Analysis Contract 和输入校验
   和；
 - 失败能区分产品协议错误、运行环境不可用、数值断言失败和 evaluator 自身错误；

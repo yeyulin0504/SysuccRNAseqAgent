@@ -47,6 +47,14 @@ LLM tool_call
 才算批准。字段缺失、字符串 `"yes"`、数字、列表、裸布尔值或其它对象全部按拒绝
 处理。HTTP 入口和图层都必须执行这一规则，不能只依赖前端校验。
 
+批准还必须绑定用户实际看到的对象。QC 检查点已将 durable interrupt 中的
+`run_id` 由服务端注入 resume，并在执行前与当前 attempt 精确比较；attempt 漂移、
+持久化失败、旧 checkpoint 缺少绑定信息或显式拒绝都终止为 `FAIL`，不能继续下游。
+同一原则下一步要扩展到全部工具确认卡：至少保存并验证 `approval_id`、project、
+thread、tool_call ids、工具名与参数摘要、项目/连接 revision、contract/run id、
+policy version 和有效期。旧卡重放、跨项目/线程 resume、等待期间参数或连接变化
+都必须 fail closed。
+
 拒绝一张卡片时，同一模型轮次里尚未展示的动作全部取消。系统必须为 assistant
 声明过的每个 `tool_call_id` 生成对应的 tool 消息，包括：
 
@@ -67,6 +75,11 @@ LLM tool_call
 确认卡片的 guardrail 节点必须无副作用。LangGraph 在 resume 时会重跑该节点，
 任何写盘、远程调用或状态刷新都可能造成重复执行。只有 execute 节点可调用
 `_run_tool`。
+
+execute 节点不能只信 guardrail 之前的结果。执行前应再次调用参数校验、重新读取
+确认策略并验证 approval context；批准状态必须使用字面量布尔判断。对于可能在
+“副作用已完成、checkpoint 尚未写回”之间崩溃的动作，还必须用 ChangeSet、run id
+或幂等键保证恢复时不会重复写配置或重复提交作业。
 
 `batch` 表示一次确认覆盖卡片中的多个配置动作。当前执行仍按工具逐项记录
 ChangeSet；运行时若中途失败，前面已完成的变更不会自动回滚。卡片和工具结果应
@@ -100,6 +113,22 @@ ChangeSet；运行时若中途失败，前面已完成的变更不会自动回�
    一次、拒绝后不写。
 9. 对科学工具添加适用性门禁测试，不能只测配置字段落盘。
 10. 日志记录工具名、风险、参数摘要和结果，不记录密码、API Key 或私钥。
+
+## 下一轮权限加固门禁
+
+- `browse_remote_samples` 当前免确认读取任意绝对路径。应把默认范围限制在用户批准
+  的数据根目录；越界扫描改为 `solo` 确认，并限制超时、文件数、符号链接逃逸和
+  输出大小。
+- CI 增加工具清单完整性元测试：每个 `TOOL_SPECS` 项都必须有 schema、risk、
+  policy、确认卡渲染、executor 映射、图层测试和端点测试；嵌套对象同样要求
+  `additionalProperties: false`。
+- 用 sentinel 密码、API Key、私钥跑完整链路，断言秘密不出现在确认卡、tool
+  result、异常、对话 checkpoint、工具日志和项目日志。
+- 增加两个 thread 同改项目、两个项目同改共享连接、批准等待期间其它入口修改配置
+  的并发测试；共享写入采用 revision/CAS 或项目锁，不能依赖最后写入者覆盖。
+- 提供禁用全部 LLM 写入/执行工具的 kill switch，并纳入发布测试。
+- 当前威胁模型仅覆盖单用户 localhost 与随机 session token。若开放远程或多用户，
+  必须先加入身份、角色、审批人绑定和可追溯审计主体。
 
 ## 当前明确不授予模型的能力
 
