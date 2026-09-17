@@ -3236,8 +3236,19 @@ def create_app(
         snapshot = _graph_snapshot(project_id, project_dir)
         if snapshot.get("state") != WAITING_USER:
             return {"error": f"当前状态 {snapshot.get('state')} 不在 QC 检查点，无法恢复。"}
+        pending_interrupt = snapshot.get("interrupt")
+        evidence = pending_interrupt.get("evidence") if isinstance(pending_interrupt, dict) else None
+        expected_run_id = evidence.get("run_id") if isinstance(evidence, dict) else None
+        if (
+            not isinstance(pending_interrupt, dict)
+            or pending_interrupt.get("checkpoint") != "fastp_qc"
+            or not isinstance(expected_run_id, str)
+            or not expected_run_id
+        ):
+            return {"error": "持久化 interrupt 缺少有效的 QC attempt，无法恢复。"}
         decision = {
             "approved": payload["approved"],
+            "expected_run_id": expected_run_id,
             "user": str(payload.get("user") or ""),
             "thread_id": str(payload.get("thread_id") or project_id),
             "note": str(payload.get("note") or ""),

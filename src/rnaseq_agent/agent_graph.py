@@ -227,19 +227,31 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
             "downstream": "validate_output -> post_run_gate -> report",
         }
     )
-    # Fail closed just like the LLM tool confirmation path: only the literal
-    # JSON boolean true means approval.  Strings such as "yes", numbers,
-    # missing fields, and non-object resume payloads are rejections.
-    approved = isinstance(decision, dict) and decision.get("approved") is True
+    # Approval is valid only for the exact attempt shown by this interrupt.
+    # ``expected_run_id`` is injected by the server from the durable interrupt,
+    # never trusted from a browser payload. Direct graph resumes must provide it
+    # too, otherwise they fail closed.
+    current_run_id = str(evidence.get("run_id") or "")
+    expected_run_id = decision.get("expected_run_id") if isinstance(decision, dict) else None
+    approved = (
+        isinstance(decision, dict)
+        and decision.get("approved") is True
+        and isinstance(expected_run_id, str)
+        and bool(current_run_id)
+        and expected_run_id == current_run_id
+    )
     decided = {
         "approved": approved,
         "decided_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "expected_run_id": expected_run_id,
+        "run_id": current_run_id,
     }
     if isinstance(decision, dict):
         for key in ("user", "thread_id", "note"):
             if decision.get(key) is not None:
                 decided[key] = decision[key]
     # Persist against the project so every dialogue reads the same binding.
+    persistence_error = ""
     try:
         session.record_qc_decision(
             approved=approved,
@@ -247,11 +259,25 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
             thread_id=str(decided.get("thread_id", "")),
             note=str(decided.get("note", "")),
         )
-    except Exception:  # noqa: BLE001 - decision persistence must not crash node
-        pass
+    except Exception as exc:  # noqa: BLE001 - fail closed on audit persistence errors
+        persistence_error = str(exc)
+        approved = False
+        decided["approved"] = False
+        decided["persistence_error"] = persistence_error
+
+    if persistence_error:
+        message = f"QC 决策持久化失败，流程已终止：{persistence_error}"
+    elif approved:
+        message = "fastp QC 已确认，继续下游阶段。"
+    elif isinstance(decision, dict) and decision.get("approved") is False:
+        message = "fastp QC 已明确拒绝，流程已终止。"
+    elif not isinstance(decision, dict) or not isinstance(decision.get("approved"), bool):
+        message = "QC 决策无效：approved 必须是布尔值，流程已终止。"
+    else:
+        message = "QC 决策未绑定当前 attempt，流程已终止。"
     return {
-        "status": PASS if approved else WAITING_USER,
-        "message": "fastp QC 已确认，继续下游阶段。" if approved else "fastp QC 需重新检查。",
+        "status": PASS if approved else FAIL,
+        "message": message,
         "qc_evidence": evidence,
         "qc_decision": decided,
         "run_id": evidence.get("run_id", ""),

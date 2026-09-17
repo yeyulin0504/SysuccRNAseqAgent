@@ -64,6 +64,39 @@ def _wait_graph_terminal(client, token: str, project_id: str, timeout: float = 8
     return last
 
 
+def _seed_graph_checkpoint(
+    project_dir: Path,
+    project_id: str,
+    *,
+    run_id: str | None,
+) -> None:
+    """Write a durable graph snapshot with or without a pending QC interrupt."""
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+
+    from rnaseq_agent.agent_graph import sqlite_checkpointer_for
+
+    def checkpoint(state: dict) -> dict:
+        if run_id is None:
+            return {**state, "status": "WAITING_USER"}
+        interrupt(
+            {
+                "checkpoint": "fastp_qc",
+                "state": "WAITING_USER",
+                "evidence": {"run_id": run_id},
+            }
+        )
+        return state
+
+    builder = StateGraph(dict)
+    builder.add_node("checkpoint", checkpoint)
+    builder.add_edge(START, "checkpoint")
+    builder.add_edge("checkpoint", END)
+    config = {"configurable": {"thread_id": project_id}}
+    with sqlite_checkpointer_for(project_dir) as checkpointer:
+        builder.compile(checkpointer=checkpointer).invoke({"status": ""}, config=config)
+
+
 class TestWorkspace:
     def test_home_and_pages_render(self, client) -> None:
         assert "SYSU" in client.get("/").text
@@ -179,27 +212,85 @@ class TestGraphApi:
         assert st["state"] == "idle"
         assert st["in_flight"] is False
 
-    def test_resume_requires_waiting_user(self, client) -> None:
+    def test_resume_without_approved_reports_type_error(self, client) -> None:
         token = _token(client)
         h = _headers(token)
         _create_project(client, token, "proj_g")
         resp = client.post(
             "/api/projects/proj_g/graph/resume", json={}, headers=h
         ).json()
-        assert "error" in resp
+        assert "approved" in resp.get("error", "")
 
-    def test_resume_requires_literal_boolean_approval(self, client) -> None:
+    @pytest.mark.parametrize("approved", ["yes", 1, [True]])
+    def test_resume_requires_literal_boolean_approval(self, client, approved) -> None:
         token = _token(client)
         h = _headers(token)
         _create_project(client, token, "proj_g_bool")
 
         resp = client.post(
             "/api/projects/proj_g_bool/graph/resume",
-            json={"approved": "yes"},
+            json={"approved": approved},
             headers=h,
         ).json()
 
         assert "approved" in resp.get("error", "")
+
+    def test_resume_with_boolean_still_requires_waiting_checkpoint(self, client) -> None:
+        token = _token(client)
+        h = _headers(token)
+        _create_project(client, token, "proj_g_idle")
+
+        resp = client.post(
+            "/api/projects/proj_g_idle/graph/resume",
+            json={"approved": True},
+            headers=h,
+        ).json()
+
+        assert "不在 QC 检查点" in resp.get("error", "")
+
+    def test_resume_requires_a_real_pending_interrupt(
+        self, client, tmp_path
+    ) -> None:
+        token = _token(client)
+        h = _headers(token)
+        project_id = "proj_g_stale"
+        _create_project(client, token, project_id)
+        _seed_graph_checkpoint(tmp_path / project_id, project_id, run_id=None)
+
+        resp = client.post(
+            f"/api/projects/{project_id}/graph/resume",
+            json={"approved": True},
+            headers=h,
+        ).json()
+
+        assert "interrupt" in resp.get("error", "")
+
+    def test_resume_binds_approval_to_server_snapshot_attempt(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        h = _headers(token)
+        project_id = "proj_g_attempt"
+        _create_project(client, token, project_id)
+        _seed_graph_checkpoint(tmp_path / project_id, project_id, run_id="run-visible")
+
+        class FinishedGraph:
+            def invoke(self, _input, config):
+                return {"status": "FAIL", "config": config}
+
+        monkeypatch.setattr(
+            "rnaseq_agent.webapp.build_bulk_rna_graph",
+            lambda _checkpointer: FinishedGraph(),
+        )
+
+        resp = client.post(
+            f"/api/projects/{project_id}/graph/resume",
+            json={"approved": True, "expected_run_id": "run-client-forged"},
+            headers=h,
+        ).json()
+
+        assert resp["resume"]["approved"] is True
+        assert resp["resume"]["expected_run_id"] == "run-visible"
 
     def test_run_fails_cleanly_without_session(self, client) -> None:
         token = _token(client)

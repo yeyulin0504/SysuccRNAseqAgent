@@ -22,6 +22,7 @@ from rnaseq_agent.agent_graph import (
     sqlite_checkpointer_for,
 )
 from rnaseq_agent.capability import (
+    FAIL,
     FAIL_OUTPUT_CONTRACT,
     NOT_EVALUABLE,
     PASS,
@@ -171,20 +172,108 @@ class TestM1RealizedCheckpointNodes:
         assert result["status"] == "FAIL"
         assert result["qc_evidence"]["ok"] is False
 
-    def test_wait_qc_only_accepts_literal_boolean_true(
+    def test_wait_qc_accepts_literal_true_for_the_displayed_attempt(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        shown: dict = {}
+
+        def approve(payload: dict) -> dict:
+            shown.update(payload)
+            return {"approved": True, "expected_run_id": "run-1"}
+
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            approve,
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+
+        assert shown["evidence"]["run_id"] == "run-1"
+        assert result["status"] == PASS
+        assert result["qc_decision"]["approved"] is True
+        assert result["qc_decision"]["expected_run_id"] == "run-1"
+
+    @pytest.mark.parametrize(
+        "decision",
+        [
+            {"approved": False, "expected_run_id": "run-1"},
+            {},
+            {"approved": "yes", "expected_run_id": "run-1"},
+        ],
+        ids=["literal-false", "missing-approved", "string-approved"],
+    )
+    def test_wait_qc_rejected_or_invalid_decision_terminates(
+        self, tmp_path, monkeypatch, decision
+    ) -> None:
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            lambda _payload: decision,
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+
+        assert result["status"] == FAIL
+        assert result["qc_decision"]["approved"] is False
+        assert result["message"]
+
+    def test_wait_qc_direct_resume_without_expected_run_id_fails_closed(
         self, tmp_path, monkeypatch
     ) -> None:
         project_dir = _minimal_project_dir(tmp_path)
         _write_attempt_manifest(project_dir, ok=True)
         monkeypatch.setattr(
             "rnaseq_agent.agent_graph.interrupt",
-            lambda _payload: {"approved": "yes"},
+            lambda _payload: {"approved": True},
         )
 
         result = node_wait_qc(self._state(project_dir))
 
-        assert result["status"] == WAITING_USER
+        assert result["status"] == FAIL
         assert result["qc_decision"]["approved"] is False
+        assert "attempt" in result["message"]
+
+    def test_wait_qc_attempt_drift_fails_closed(self, tmp_path, monkeypatch) -> None:
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            lambda _payload: {"approved": True, "expected_run_id": "run-older"},
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+
+        assert result["status"] == FAIL
+        assert result["qc_decision"]["approved"] is False
+        assert result["qc_decision"]["expected_run_id"] == "run-older"
+        assert result["qc_decision"]["run_id"] == "run-1"
+
+    def test_wait_qc_persistence_failure_cannot_pass(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            lambda _payload: {"approved": True, "expected_run_id": "run-1"},
+        )
+
+        def fail_persistence(*_args, **_kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.ProjectSession.record_qc_decision",
+            fail_persistence,
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+
+        assert result["status"] == FAIL
+        assert result["qc_decision"]["approved"] is False
+        assert "持久化失败" in result["message"]
 
     def test_validate_output_without_attempt_raises_contract_failure(
         self, tmp_path
