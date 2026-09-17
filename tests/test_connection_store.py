@@ -263,6 +263,39 @@ class TestLlmStore:
 
         assert load_llm(store_dir=store_dir)["tool_mode"] == TOOL_MODE_APPROVED_EXECUTE
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "{not json",
+            "[]",
+            json.dumps({"llm": []}),
+        ],
+    )
+    def test_corrupt_document_or_llm_block_loads_tool_mode_fail_closed(
+        self, store_dir: Path, raw: str
+    ) -> None:
+        store_dir.mkdir(parents=True)
+        (store_dir / CONNECTION_FILE_NAME).write_text(raw, encoding="utf-8")
+
+        assert load_llm(store_dir=store_dir)["tool_mode"] == TOOL_MODE_DISABLED
+
+    def test_persisted_explicit_null_tool_mode_loads_fail_closed(
+        self, store_dir: Path
+    ) -> None:
+        store_dir.mkdir(parents=True)
+        (store_dir / CONNECTION_FILE_NAME).write_text(
+            json.dumps({"llm": {"enabled": True, "tool_mode": None}}),
+            encoding="utf-8",
+        )
+
+        assert load_llm(store_dir=store_dir)["tool_mode"] == TOOL_MODE_DISABLED
+
+    def test_save_rejects_explicit_null_tool_mode(self, store_dir: Path) -> None:
+        with pytest.raises(ValueError, match="tool_mode"):
+            save_llm({"tool_mode": None}, store_dir=store_dir)
+
+        assert load_llm(store_dir=store_dir) == {}
+
     def test_invalid_tool_mode_is_rejected_instead_of_silently_broadening_access(
         self, store_dir: Path
     ) -> None:
@@ -324,6 +357,14 @@ class TestApplyLlmToConfig:
 
         assert merged["llm"]["model"] == "project-model"
         assert merged["llm"]["enabled"] is True  # 共享的 enabled 补齐
+
+    def test_shared_tool_mode_overrides_a_stale_project_value(self) -> None:
+        merged = apply_llm_to_config(
+            {"llm": {"tool_mode": TOOL_MODE_APPROVED_EXECUTE}},
+            {"tool_mode": TOOL_MODE_DISABLED},
+        )
+
+        assert merged["llm"]["tool_mode"] == TOOL_MODE_DISABLED
 
     def test_empty_shared_llm_leaves_config_untouched(self) -> None:
         config = {"llm": {"model": "project-model"}}

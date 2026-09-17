@@ -130,16 +130,29 @@ def _resolve_store_dir(store_dir: Path | None) -> Path:
     return Path(store_dir) if store_dir is not None else connection_home()
 
 
-def _read_payload(directory: Path) -> dict[str, Any]:
-    """Read the raw JSON payload, tolerating a missing or corrupt file."""
+def _read_payload_state(directory: Path) -> tuple[dict[str, Any], bool, bool]:
+    """Return ``(payload, exists, valid_object)`` for the shared settings file.
+
+    Callers that make security decisions must distinguish a missing legacy
+    file from an existing file that cannot be trusted. The former may use
+    compatibility defaults; the latter must fail closed.
+    """
     path = directory / CONNECTION_FILE_NAME
     if not path.is_file():
-        return {}
+        return {}, False, True
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
+        return {}, True, False
+    if not isinstance(raw, dict):
+        return {}, True, False
+    return raw, True, True
+
+
+def _read_payload(directory: Path) -> dict[str, Any]:
+    """Read the object payload, retaining legacy tolerance for non-policy callers."""
+    payload, _exists, _valid = _read_payload_state(directory)
+    return payload
 
 
 def _write_payload(path: Path, payload: dict[str, Any]) -> None:
@@ -206,19 +219,34 @@ def clear_password(*, store_dir: Path | None = None) -> None:
 
 def load_llm(*, store_dir: Path | None = None) -> dict[str, Any]:
     """Return the shared LLM settings, with the API key decrypted when possible."""
-    payload = _read_payload(_resolve_store_dir(store_dir))
-    block = payload.get(LLM_BLOCK_KEY)
-    if not isinstance(block, dict):
-        return {}
-    result = {key: block[key] for key in LLM_FIELDS if block.get(key) is not None}
-    from .agent_tools import TOOL_MODE_DISABLED, normalize_tool_mode
+    payload, _exists, valid_payload = _read_payload_state(
+        _resolve_store_dir(store_dir)
+    )
+    from .agent_tools import (
+        TOOL_MODE_APPROVED_EXECUTE,
+        TOOL_MODE_DISABLED,
+        normalize_tool_mode,
+    )
 
-    try:
-        result["tool_mode"] = normalize_tool_mode(block.get("tool_mode"))
-    except ValueError:
-        # A manually corrupted value must fail closed instead of broadening
-        # privileges through the compatibility default.
+    if not valid_payload:
+        return {"tool_mode": TOOL_MODE_DISABLED}
+    block = payload.get(LLM_BLOCK_KEY)
+    if LLM_BLOCK_KEY not in payload:
+        return {}
+    if not isinstance(block, dict):
+        return {"tool_mode": TOOL_MODE_DISABLED}
+    result = {key: block[key] for key in LLM_FIELDS if block.get(key) is not None}
+    if "tool_mode" not in block:
+        result["tool_mode"] = TOOL_MODE_APPROVED_EXECUTE
+    elif block["tool_mode"] is None:
         result["tool_mode"] = TOOL_MODE_DISABLED
+    else:
+        try:
+            result["tool_mode"] = normalize_tool_mode(block["tool_mode"])
+        except ValueError:
+            # A manually corrupted value must fail closed instead of broadening
+            # privileges through the compatibility default.
+            result["tool_mode"] = TOOL_MODE_DISABLED
     token = block.get(_LLM_API_KEY_KEY)
     if isinstance(token, str) and token:
         secret = _unprotect(token)
@@ -238,8 +266,10 @@ def save_llm(values: dict[str, Any], *, store_dir: Path | None = None) -> dict[s
 
     normalized_values = dict(values)
     if "tool_mode" in normalized_values:
+        if normalized_values["tool_mode"] is None:
+            raise ValueError("tool_mode 不能是 null；请提供明确的权限模式。")
         normalized_values["tool_mode"] = normalize_tool_mode(
-            normalized_values.get("tool_mode")
+            normalized_values["tool_mode"]
         )
 
     directory = _resolve_store_dir(store_dir)
@@ -285,6 +315,12 @@ def apply_llm_to_config(config: dict[str, Any], shared: dict[str, Any]) -> dict[
     for key in LLM_FIELDS:
         value = shared.get(key)
         if value is None or value == "":
+            continue
+        if key == "tool_mode":
+            # The user-level mode is an emergency control and always wins over
+            # stale project data. It must never follow the normal inheritance
+            # rule where project-local values take precedence.
+            block[key] = value
             continue
         if key == "enabled":
             block[key] = bool(block.get(key)) or bool(value)

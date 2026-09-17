@@ -42,9 +42,10 @@ LLM tool_call
 | `approved_write` | `read` + `write` | 只读自动执行；写入仍需人工确认；执行被拒绝 |
 | `approved_execute` | 全部已登记工具 | 只读自动执行；写入与执行仍按原策略确认 |
 
-旧安装没有 `tool_mode` 字段时默认为 `approved_execute`，保持升级兼容。只有字段真正
-缺失（`None`）才使用该默认；未知字符串、布尔、数字、数组或对象均视为配置错误，
-保存 API 拒绝，运行时读取异常则按 `disabled` fail closed。未知工具沿用最高风险
+旧安装的有效配置中真正不存在 `tool_mode` 字段时默认为 `approved_execute`，保持升级
+兼容。显式 JSON `null` 不属于“字段不存在”；它与未知字符串、布尔、数字、数组、
+对象、损坏 JSON、非对象配置根和非对象 `llm` 块一样均视为配置错误。保存 API 拒绝，
+运行时读取异常则按 `disabled` fail closed。未知工具沿用最高风险
 `execute`，除 `approved_execute` 外全部模式先在权限层拒绝；即使处于
 `approved_execute`，后续白名单和参数校验仍会拒绝未登记名称。
 
@@ -53,6 +54,10 @@ LLM tool_call
 模式后，resume 会消费旧卡并拒绝；即使权限在 confirmation 与 execute 之间改变，
 execute 也会在创建一次性 claim 和调用 executor 前停止。直接调用 `_run_tool` 同样
 不能绕过开关。
+
+该开关只限制切换之后新发起的 LLM/规则工具动作，不是远程作业急停开关。已经提交
+给远程调度器的作业不会因模式切到 `disabled` 而终止；需要取消时必须使用项目或
+调度器的作业控制路径，并核对对应的 `run_id` 和远程 job id。
 
 ## 三级策略
 
