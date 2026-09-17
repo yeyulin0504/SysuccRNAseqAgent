@@ -56,6 +56,23 @@ Adapter 与 durable tool approval 合入后的主项目验证结果为
 `approval_id` 绑定、规范化参数签名、配置漂移、过期、跨项目/线程、并发双击、崩溃
 重放 fail closed，以及 claim 不保存原始参数。
 
+后续权限加固已把本阶段基线推进到主项目提交 `3d0bdcb`：执行入口使用项目级 durable
+claim 防止 full/stage 重复提交；LLM 工具采用四档 live kill switch，损坏或显式空配置
+fail closed；SSH 身份、进程树、双流读取、墙钟超时、输出上限与 IPv4/IPv6 规范化已
+完成两轮修复。当前控制端全量验证为
+`832 passed, 1 skipped, 1 warning, 6 subtests passed`。其中 kill switch 固定提交复审
+为 `271 passed, 1 skipped`，无剩余 finding；SSH 最终独立复审结论另行记录。
+
+下一权限阶段分成两个独立边界，不能合并为一个“大读取权限”：
+
+1. 远程批准根决定应用可以在哪些 SSH 目录执行发现，Settings 是唯一授权入口；
+2. 模型数据披露决定 provider 可以接收哪些项目字段，默认仅去标识摘要，精确字段
+   使用单轮、短时、project/thread/provider 绑定授权。
+
+批准根优先实施，因为它阻止结构化入口与对话入口在 SSH 账号范围内任意枚举。
+数据披露随后实施，并复用其授权结果做 provider-safe 投影，但不会反向授予远程
+浏览权限。
+
 ## 第二阶段：建立真实 Adapter
 
 `bkbio-eval` 已在 WorkBuddy 交付目录初始化为独立 Git 仓库，基线提交为

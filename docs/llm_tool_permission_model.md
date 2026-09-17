@@ -59,6 +59,26 @@ execute 也会在创建一次性 claim 和调用 executor 前停止。直接调�
 给远程调度器的作业不会因模式切到 `disabled` 而终止；需要取消时必须使用项目或
 调度器的作业控制路径，并核对对应的 `run_id` 和远程 job id。
 
+## 模型数据披露范围
+
+`tool_mode` 只控制模型能发起什么动作，不代表模型可以读取项目中的全部精确信息。
+系统另设独立的 `data_scope` 边界。默认情况下，provider 只接收去标识项目摘要：
+项目状态、路线、输入类型、样本数、分组计数、确定性样本别名、科学门禁结果和流程
+状态。默认上下文不得包含源样本名、患者标识、FASTQ 文件名、远程或本地路径、
+host/user/job id、报告正文、命令、stdout/stderr、traceback 或凭据。
+
+需要精确信息时，必须使用独立的数据披露确认，按 `sample_ids`、
+`fastq_filenames`、`remote_paths` 和 `report_excerpt` 分开授权。授权绑定 project、
+thread、provider identity、字段类别、项目与数据 revision；只供一轮 provider 请求使用，
+十分钟过期，发送结果不确定时也视为已消费。普通工具确认卡不能顺带扩大
+`data_scope`，而数据披露授权也不能增加写入或执行权限。
+
+原始披露值只在获批的单次 provider 请求中临时组装，不写入持久化对话、tool log
+或 checkpoint。持久记录只保存授权元数据、类别、数量、字节数和结果码。所有
+provider 请求最终都由同一 `ModelContextBuilder` 通过显式 allowlist 构造，并在发送
+前检查已知凭据和私钥标记。详细设计见
+`docs/superpowers/specs/2026-09-17-llm-data-disclosure-design.md`。
+
 ## 三级策略
 
 | 策略 | 适用范围 | 行为 |
@@ -176,9 +196,11 @@ ChangeSet；运行时若中途失败，前面已完成的变更不会自动回�
 
 ## 下一轮权限加固门禁
 
-- `browse_remote_samples` 当前免确认读取任意绝对路径。应把默认范围限制在用户批准
-  的数据根目录；越界扫描改为 `solo` 确认，并限制超时、文件数、符号链接逃逸和
-  输出大小。
+- `browse_remote_samples` 必须限制在 Settings 中为当前 SSH 身份明确批准的数据根。
+  越界扫描直接结构化拒绝，不能转换成普通 `solo` 工具确认；批准根的预览、批准和
+  撤销只允许由 Settings 完成。所有结构化和对话入口统一使用中央授权服务，并限制
+  超时、文件数、符号链接逃逸和输出大小。详细设计见
+  `docs/superpowers/specs/2026-09-17-approved-remote-data-roots-design.md`。
 - CI 增加工具清单完整性元测试：每个 `TOOL_SPECS` 项都必须有 schema、risk、
   policy、确认卡渲染、executor 映射、图层测试和端点测试；嵌套对象同样要求
   `additionalProperties: false`。
