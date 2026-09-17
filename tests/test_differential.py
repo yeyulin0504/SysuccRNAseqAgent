@@ -200,3 +200,17 @@ class TestRenderers:
         assert 'contrast = c("condition", \'treatment\', \'control\')' in script
         assert "_results.tsv" in script
         assert "_summary.json" in script
+        assert "significant_padj_0.05_lfc1 = n_sig_default" in script
+
+    def test_render_script_uses_frozen_significance_cutoffs(self) -> None:
+        config = _config()
+        config["diffexp"].update({"padj_cutoff": 0.1, "lfc_cutoff": 0.75})
+
+        script = render_diffexp_script(config)
+
+        assert "padj_cutoff <- 0.1" in script
+        assert "lfc_cutoff <- 0.75" in script
+        assert "res_df$padj < padj_cutoff" in script
+        assert "abs(res_df$log2FoldChange) >= lfc_cutoff" in script
+        assert "padj_cutoff = padj_cutoff" in script
+        assert "log2fc_cutoff = lfc_cutoff" in script

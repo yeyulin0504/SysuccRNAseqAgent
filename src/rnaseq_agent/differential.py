@@ -210,6 +210,9 @@ def _render_diffexp_script(
     ref_r = _r_quote(reference)
     trt_r = _r_quote(treatment)
     contrast_r = _r_quote(contrast)
+    diffexp = config.get("diffexp", {})
+    padj_cutoff = float(diffexp.get("padj_cutoff", 0.05))
+    lfc_cutoff = float(diffexp.get("lfc_cutoff", 1.0))
 
     return f"""#!/usr/bin/env Rscript
 # 冻结模板 deseq2_independent_two_group（框架 15.3 条件开放）
@@ -221,6 +224,8 @@ args <- commandArgs(trailingOnly = TRUE)
 counts_file <- if (length(args) >= 1) args[[1]] else "{counts_source}"
 coldata_file <- if (length(args) >= 2) args[[2]] else "diffexp/colData.tsv"
 out_prefix <- if (length(args) >= 3) args[[3]] else "diffexp/deseq2"
+padj_cutoff <- {padj_cutoff!r}
+lfc_cutoff <- {lfc_cutoff!r}
 
 dir.create("diffexp", showWarnings = FALSE, recursive = TRUE)
 counts <- as.matrix(read.delim(counts_file, row.names = 1, check.names = FALSE))
@@ -245,14 +250,18 @@ res_df <- res_df[, c("gene", "baseMean", "log2FoldChange", "lfcSE", "stat", "pva
 write.table(res_df, file = paste0(out_prefix, "_results.tsv"),
             sep = "\\t", row.names = FALSE, quote = FALSE)
 
-n_sig <- sum(res_df$padj < 0.05 & abs(res_df$log2FoldChange) >= 1, na.rm = TRUE)
+n_sig <- sum(res_df$padj < padj_cutoff & abs(res_df$log2FoldChange) >= lfc_cutoff, na.rm = TRUE)
+n_sig_default <- sum(res_df$padj < 0.05 & abs(res_df$log2FoldChange) >= 1, na.rm = TRUE)
 summary_json <- list(
   contrast = {contrast_r},
   formula = {_r_quote(DEG_DESIGN_FORMULA)},
   reference_condition = {ref_r},
   treatment_condition = {trt_r},
   tested_genes = nrow(res_df),
-  significant_padj_0.05_lfc1 = n_sig
+  padj_cutoff = padj_cutoff,
+  log2fc_cutoff = lfc_cutoff,
+  significant_genes = n_sig,
+  significant_padj_0.05_lfc1 = n_sig_default
 )
 write(toJSON(summary_json, auto_unbox = TRUE), paste0(out_prefix, "_summary.json"))
 cat("completed", n_sig, "significant genes\\n")
