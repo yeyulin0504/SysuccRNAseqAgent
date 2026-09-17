@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -10,19 +12,93 @@ _PROJECT_STATE_LOCKS_GUARD = threading.Lock()
 _PROJECT_STATE_LOCKS: dict[str, Any] = {}
 
 
+class _ProjectStateLock:
+    """Re-entrant thread lock backed by an OS lock for cross-process CAS."""
+
+    def __init__(self, config_path: Path) -> None:
+        self._thread_lock = threading.RLock()
+        self._local = threading.local()
+        self._lock_path = config_path.parent / ".project-state.lock"
+
+    def __enter__(self):
+        self._thread_lock.acquire()
+        depth = int(getattr(self._local, "depth", 0))
+        handle = None
+        try:
+            if depth == 0:
+                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = self._lock_path.open("a+b")
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                self._acquire_file_lock(handle)
+                self._local.handle = handle
+            self._local.depth = depth + 1
+            return self
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            self._thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        depth = int(getattr(self._local, "depth", 1)) - 1
+        self._local.depth = depth
+        try:
+            if depth == 0:
+                handle = self._local.handle
+                try:
+                    self._release_file_lock(handle)
+                finally:
+                    handle.close()
+                    del self._local.handle
+        finally:
+            self._thread_lock.release()
+
+    @staticmethod
+    def _acquire_file_lock(handle) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+    @staticmethod
+    def _release_file_lock(handle) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def project_state_lock(config_path: Path):
-    """Return the process-local lock protecting one project's live config.
+    """Return the re-entrant process and filesystem lock for live config.
 
     The lock is re-entrant because callers such as ``record_qc_decision``
     perform a compare-and-write transaction and then reuse ``_update_status``.
-    It coordinates in-process attempt switches and QC decisions; the SQLite
-    graph checkpointer remains the durable state store across restarts.
+    The filesystem lock makes read/compare/write sections exclusive across
+    worker processes and is released by the OS if a process exits abruptly.
     """
     key = str(Path(config_path).resolve())
     with _PROJECT_STATE_LOCKS_GUARD:
         lock = _PROJECT_STATE_LOCKS.get(key)
         if lock is None:
-            lock = threading.RLock()
+            lock = _ProjectStateLock(Path(config_path).resolve())
             _PROJECT_STATE_LOCKS[key] = lock
         return lock
 

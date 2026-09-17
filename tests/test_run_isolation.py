@@ -9,7 +9,7 @@ from unittest.mock import patch
 from rnaseq_agent.analysis_contract import sha256_file
 from rnaseq_agent.execution import CommandResult
 from rnaseq_agent.pipeline import render_remote_pipeline_script
-from rnaseq_agent.run_agent import run_project, run_stage_project
+from rnaseq_agent.run_agent import refresh_status, run_project, run_stage_project
 from rnaseq_agent.storage import load_json, save_json
 
 
@@ -151,10 +151,15 @@ class RunIsolationTests(unittest.TestCase):
             project["project"]["title"] = "changed after the attempt started"
             save_json(config_path, project)
 
+            with patch("rnaseq_agent.run_agent._read_remote_state", return_value="completed"):
+                refresh_status(config_path)
             second = run_stage_project(config_path, "de", wait=False)
 
             self.assertEqual(second.state, "submitted")
             self.assertEqual(snapshot_path.read_bytes(), original_snapshot)
+            claims = load_json(config_path)["status"]["execution_claims"]
+            self.assertEqual({claim["stage"] for claim in claims.values()}, {"counts", "de"})
+            self.assertEqual(len({claim["idempotency_key"] for claim in claims.values()}), 2)
             manifest = load_json(manifest_path)
             self.assertEqual(
                 manifest["body"]["fingerprints"]["project_snapshot_sha256"],
@@ -162,7 +167,7 @@ class RunIsolationTests(unittest.TestCase):
             )
 
     @patch("rnaseq_agent.run_agent.create_remote_transport")
-    def test_repeated_submissions_are_isolated_and_keep_stable_fingerprints(
+    def test_explicit_rerun_after_terminal_failure_is_isolated_and_keeps_stable_fingerprints(
         self,
         create_transport,
     ) -> None:
@@ -178,13 +183,14 @@ class RunIsolationTests(unittest.TestCase):
             transport = FakeTransport()
             create_transport.return_value = transport
 
-            first_outcome = run_project(config_path, wait=False)
+            with patch("rnaseq_agent.run_agent._poll_until_finished", return_value="failed"):
+                first_outcome = run_project(config_path, wait=True)
             first_status = load_json(config_path)["status"]
             first_command_count = len(transport.executed)
             second_outcome = run_project(config_path, wait=False)
             second_status = load_json(config_path)["status"]
 
-            self.assertEqual(first_outcome.state, "submitted")
+            self.assertEqual(first_outcome.state, "failed")
             self.assertEqual(second_outcome.state, "submitted")
             first_run_id = first_status["run_id"]
             second_run_id = second_status["run_id"]

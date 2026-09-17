@@ -99,10 +99,15 @@ def upload_project_fastqs(config_path: Path) -> RunOutcome:
 
 
 def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
-    config = normalize_config(load_json(config_path))
-    save_json(config_path, config)
     project_dir = config_path.parent
-    run_id = _new_run_id()
+    claim_start = _begin_execution_claim(config_path, stage="full")
+    conflict = claim_start.get("conflict")
+    if conflict:
+        return RunOutcome("conflict", _claim_conflict_message(conflict), project_dir)
+
+    config = claim_start["config"]
+    run_id = claim_start["run_id"]
+    claim_id = claim_start["claim_id"]
     attempt_dir = project_dir / "attempts" / run_id
     logs_dir = attempt_dir / "agent_logs"
     downloads_dir = attempt_dir / "downloads"
@@ -112,16 +117,6 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
     run_config = _config_for_new_attempt(config, run_id)
     snapshot_path = attempt_dir / "project.snapshot.json"
     save_json(snapshot_path, run_config)
-    _update_status(
-        config_path,
-        "preparing",
-        "Preparing an isolated RNA-seq run attempt.",
-        run_id=run_id,
-        attempt_dir=str(attempt_dir),
-        remote_run_workdir=run_config["server"]["remote_workdir"],
-        started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    )
-
     _log_event(
         logs_dir,
         "run_started",
@@ -181,16 +176,29 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
         )
         support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
+        _transition_execution_claim(
+            config_path,
+            claim_id,
+            expected={"started"},
+            claim_status="submitting",
+            project_state="submitting",
+            project_message="Remote analysis job submission started; retry is blocked pending reconciliation.",
+        )
         submit_result = _submit_remote_job(run_config, logs_dir, transport)
         job_id = submit_result.stdout.strip() or "submitted"
 
-        _update_status(
+        _transition_execution_claim(
             config_path,
-            "submitted",
-            "Remote analysis job submitted.",
-            job_id=job_id,
-            submitted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            manifest_file=str(manifest_path),
+            claim_id,
+            expected={"submitting"},
+            claim_status="submitted",
+            project_state="submitted",
+            project_message="Remote analysis job submitted.",
+            project_fields={
+                "job_id": job_id,
+                "submitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "manifest_file": str(manifest_path),
+            },
         )
         _log_event(
             logs_dir,
@@ -213,7 +221,14 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
                 )
             except Exception as download_exc:
                 message = f"Remote analysis completed, but downloading results failed: {download_exc}"
-                _update_status(config_path, "download_failed", message)
+                _transition_execution_claim(
+                    config_path,
+                    claim_id,
+                    expected={"submitted"},
+                    claim_status="failed",
+                    project_state="download_failed",
+                    project_message=message,
+                )
                 _notify(run_config, "download_failed", message)
                 return RunOutcome("download_failed", message, project_dir)
             _update_status(
@@ -230,6 +245,14 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
                 message = "Remote analysis reported completion, but result validation failed: " + "; ".join(
                     result_summary.errors
                 )
+                _transition_execution_claim(
+                    config_path,
+                    claim_id,
+                    expected={"submitted"},
+                    claim_status="failed",
+                    project_state="result_validation_failed",
+                    project_message=message,
+                )
                 _notify(run_config, "result_validation_failed", message)
                 return RunOutcome("result_validation_failed", message, project_dir)
             message = "RNA-seq analysis completed and results downloaded."
@@ -239,14 +262,29 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
         else:
             message = "RNA-seq analysis failed on the server."
 
-        _update_status(config_path, final_state, message)
+        if final_state == "timeout":
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={"submitted"},
+                claim_status="submitted",
+                project_state=final_state,
+                project_message=message,
+            )
+        else:
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={"submitted"},
+                claim_status="completed" if final_state == "completed" else "failed",
+                project_state=final_state,
+                project_message=message,
+            )
         _notify(run_config, final_state, message)
         return RunOutcome(final_state, message, project_dir)
     except Exception as exc:
         message = str(exc)
-        current_state = normalize_config(load_json(config_path)).get("status", {}).get("state")
-        if current_state not in {"validation_failed", "policy_failed"}:
-            _update_status(config_path, "run_failed", message)
+        _record_execution_exception(config_path, claim_id, message)
         _log_event(logs_dir, "run_failed", {"run_id": run_id, "message": message})
         try:
             _notify(run_config, "run_failed", message)
@@ -282,35 +320,19 @@ def run_stage_project(
     if stage not in ALL_STAGES:
         raise ValueError(f"Unsupported stage: {stage!r}. Allowed: {ALL_STAGES}")
 
-    config = normalize_config(load_json(config_path))
-    save_json(config_path, config)
     project_dir = config_path.parent
+    claim_start = _begin_execution_claim(config_path, stage=stage)
+    existing_outcome = claim_start.get("outcome")
+    if existing_outcome:
+        return existing_outcome
+    conflict = claim_start.get("conflict")
+    if conflict:
+        return RunOutcome("conflict", _claim_conflict_message(conflict), project_dir)
 
-    # -- logical run id (created at qc stage; reused by later stages) -----
-    status = config.get("status", {})
-    run_id = str(status.get("run_id") or "").strip()
-    stage_records = dict(status.get("stages") or {})
-    previous = stage_records.get(stage) or {}
-
-    if run_id and previous.get("status") in {"completed", "stage_completed", "remote_completed"}:
-        return RunOutcome(
-            str(previous["status"]),
-            f"Stage {stage} 已完成（{previous.get('job_id', '')}），跳过重复提交。",
-            project_dir,
-        )
-    if run_id and previous.get("status") in {"running", "queued", "submitted", "preparing"}:
-        return RunOutcome(
-            "submitted",
-            f"Stage {stage} 已在运行（{previous.get('job_id', '')}），请先轮询。",
-            project_dir,
-        )
-
-    if run_id:
-        attempt_dir = project_dir / "attempts" / run_id
-    else:
-        run_id = _new_run_id()
-        attempt_dir = project_dir / "attempts" / run_id
-        stage_records = {}
+    config = claim_start["config"]
+    run_id = claim_start["run_id"]
+    claim_id = claim_start["claim_id"]
+    attempt_dir = project_dir / "attempts" / run_id
 
     logs_dir = attempt_dir / "agent_logs"
     downloads_dir = attempt_dir / "downloads"
@@ -329,16 +351,6 @@ def run_stage_project(
     snapshot_path = attempt_dir / "project.snapshot.json"
     if not snapshot_path.is_file():
         save_json(snapshot_path, run_config)
-    _update_status(
-        config_path,
-        "preparing",
-        f"Preparing isolated run attempt for stage {stage}.",
-        run_id=run_id,
-        attempt_dir=str(attempt_dir),
-        remote_run_workdir=run_config["server"]["remote_workdir"],
-        stage=stage,
-        started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    )
     _log_event(
         logs_dir,
         "stage_run_started",
@@ -411,22 +423,28 @@ def run_stage_project(
         support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
 
+        _transition_execution_claim(
+            config_path,
+            claim_id,
+            expected={"started"},
+            claim_status="submitting",
+            project_state="submitting",
+            project_message=f"Stage {stage} submission started; retry is blocked pending reconciliation.",
+            stage_status="submitting",
+        )
         submit_result = _submit_stage_job(run_config, stage, logs_dir, transport)
         job_id = submit_result.stdout.strip() or "submitted"
-        stage_records[stage] = {
-            "status": "submitted",
-            "job_id": job_id,
-            "submitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-        _update_status(
+        submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _transition_execution_claim(
             config_path,
-            "submitted",
-            f"Stage {stage} submitted.",
-            run_id=run_id,
-            job_id=job_id,
-            submitted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            stages=stage_records,
-            stage=stage,
+            claim_id,
+            expected={"submitting"},
+            claim_status="submitted",
+            project_state="submitted",
+            project_message=f"Stage {stage} submitted.",
+            project_fields={"job_id": job_id, "submitted_at": submitted_at},
+            stage_status="submitted",
+            stage_fields={"job_id": job_id, "submitted_at": submitted_at},
         )
         _log_event(logs_dir, "stage_submitted", {"stage": stage, "run_id": run_id, "job_id": job_id})
 
@@ -446,37 +464,58 @@ def run_stage_project(
                 )
             except Exception as download_exc:
                 message = f"Stage {stage} completed, but downloading results failed: {download_exc}"
-                _update_status(config_path, "download_failed", message, stage=stage)
+                _transition_execution_claim(
+                    config_path,
+                    claim_id,
+                    expected={"submitted"},
+                    claim_status="failed",
+                    project_state="download_failed",
+                    project_message=message,
+                    stage_status="failed",
+                )
                 _notify(run_config, "download_failed", message)
                 return RunOutcome("download_failed", message, project_dir)
             if not summary.ok:
                 message = f"Stage {stage} results are incomplete or invalid: " + "; ".join(summary.errors)
-                _update_status(config_path, "result_validation_failed", message, stage=stage)
+                _transition_execution_claim(
+                    config_path,
+                    claim_id,
+                    expected={"submitted"},
+                    claim_status="failed",
+                    project_state="result_validation_failed",
+                    project_message=message,
+                    stage_status="failed",
+                )
                 _notify(run_config, "result_validation_failed", message)
                 return RunOutcome("result_validation_failed", message, project_dir)
-            stage_records[stage]["status"] = "completed"
-            _update_status(
+            _transition_execution_claim(
                 config_path,
-                "stage_completed",
-                f"Stage {stage} completed and results verified.",
-                run_id=run_id,
-                stages=stage_records,
-                stage=stage,
+                claim_id,
+                expected={"submitted"},
+                claim_status="completed",
+                project_state="stage_completed",
+                project_message=f"Stage {stage} completed and results verified.",
+                stage_status="completed",
             )
             return RunOutcome("stage_completed", f"Stage {stage} completed.", project_dir)
         if final_state == "timeout":
             message = f"Stage {stage} did not finish before the polling timeout."
         else:
             message = f"Stage {stage} failed on the server."
-        stage_records[stage]["status"] = final_state
-        _update_status(config_path, final_state, message, stage=stage, stages=stage_records)
+        _transition_execution_claim(
+            config_path,
+            claim_id,
+            expected={"submitted"},
+            claim_status="submitted" if final_state == "timeout" else "failed",
+            project_state=final_state,
+            project_message=message,
+            stage_status=final_state,
+        )
         _notify(run_config, final_state, message)
         return RunOutcome(final_state, message, project_dir)
     except Exception as exc:
         message = str(exc)
-        current_state = normalize_config(load_json(config_path)).get("status", {}).get("state")
-        if current_state not in {"validation_failed", "policy_failed"}:
-            _update_status(config_path, "run_failed", message, stage=stage)
+        _record_execution_exception(config_path, claim_id, message, stage=stage)
         _log_event(logs_dir, "stage_run_failed", {"run_id": run_id, "stage": stage, "message": message})
         try:
             _notify(run_config, "run_failed", message)
@@ -491,7 +530,26 @@ def refresh_status(config_path: Path) -> dict[str, Any]:
     state = _read_remote_state(active_config, create_remote_transport(active_config))
     if state:
         message = f"Remote state: {state}"
-        _update_status(config_path, state, message)
+        status = config.get("status", {})
+        claim_id = str(status.get("execution_claim_id") or "")
+        claims = status.get("execution_claims")
+        claim = claims.get(claim_id) if isinstance(claims, dict) else None
+        claim_state = str((claim or {}).get("status") or "")
+        if state in {"completed", "failed"} and claim_state in _ACTIVE_EXECUTION_CLAIM_STATUSES:
+            claim_stage = str((claim or {}).get("stage") or "")
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={claim_state},
+                claim_status="completed" if state == "completed" else "failed",
+                project_state=state,
+                project_message=message,
+                stage_status=("completed" if state == "completed" else "failed")
+                if claim_stage != "full"
+                else None,
+            )
+        else:
+            _update_status(config_path, state, message)
     return normalize_config(load_json(config_path)).get("status", {})
 
 
@@ -883,6 +941,274 @@ def _notify(config: dict[str, Any], state: str, message: str) -> None:
     send_completion_email(notification, subject, body)
 
 
+_ACTIVE_EXECUTION_CLAIM_STATUSES = {"started", "submitting", "submitted"}
+def _execution_contract_id(config_path: Path, config: dict[str, Any]) -> str:
+    verified = str(config.get("execution", {}).get("verified_contract_id") or "").strip()
+    if verified:
+        return verified
+    try:
+        path = project_contract_path(config_path, config)
+        if path.is_file():
+            return str(load_json(path).get("contract_id") or "").strip()
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
+
+
+def _execution_claim_key(
+    *,
+    project_id: str,
+    contract_id: str,
+    run_id: str,
+    stage: str,
+) -> str:
+    body = {
+        "project_id": project_id,
+        "contract_id": contract_id,
+        "scope": "full" if stage == "full" else "stage",
+        "run_id": "" if stage == "full" else run_id,
+        "stage": stage,
+    }
+    return f"sha256:{canonical_sha256(body)}"
+
+
+def _reconciliation_payload(*, required: bool) -> dict[str, Any]:
+    if not required:
+        return {"required": False, "action": "none"}
+    return {
+        "required": True,
+        "action": (
+            "Inspect the scheduler and attempt artifacts for this run before manually "
+            "marking the claim completed or failed; never retry while the claim is active."
+        ),
+    }
+
+
+def _claim_conflict_message(claim: dict[str, Any]) -> str:
+    return (
+        "Execution conflict: durable claim "
+        f"{claim.get('claim_id', '<unknown>')} is {claim.get('status', 'active')} "
+        f"for run {claim.get('run_id', '<unknown>')} stage {claim.get('stage', '<unknown>')}. "
+        "Retry is fail-closed. Reconcile the scheduler and attempt artifacts manually, then "
+        "mark the claim terminal before starting another execution."
+    )
+
+
+def _begin_execution_claim(config_path: Path, *, stage: str) -> dict[str, Any]:
+    """Atomically bind one execution before any remote submission side effect."""
+
+    project_dir = config_path.parent
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
+        status = config.setdefault("status", {})
+        raw_claims = status.get("execution_claims")
+        claims: dict[str, dict[str, Any]] = raw_claims if isinstance(raw_claims, dict) else {}
+        project_id = str(config.get("project", {}).get("id") or project_dir.name)
+        contract_id = _execution_contract_id(config_path, config)
+
+        run_id = str(status.get("run_id") or "").strip() if stage != "full" else ""
+        stage_records = dict(status.get("stages") or {})
+        previous = stage_records.get(stage) or {}
+        if stage != "full" and run_id and previous.get("status") in {
+            "completed",
+            "stage_completed",
+            "remote_completed",
+        }:
+            return {
+                "outcome": RunOutcome(
+                    str(previous["status"]),
+                    f"Stage {stage} 已完成（{previous.get('job_id', '')}），跳过重复提交。",
+                    project_dir,
+                )
+            }
+
+        if not run_id:
+            run_id = _new_run_id()
+        idempotency_key = _execution_claim_key(
+            project_id=project_id,
+            contract_id=contract_id,
+            run_id=run_id,
+            stage=stage,
+        )
+
+        for claim in claims.values():
+            if claim.get("status") not in _ACTIVE_EXECUTION_CLAIM_STATUSES:
+                continue
+            return {"conflict": claim}
+
+        if stage != "full" and previous.get("status") in {
+            "running",
+            "queued",
+            "submitted",
+            "preparing",
+            "submitting",
+            "timeout",
+        }:
+            return {
+                "conflict": {
+                    "claim_id": str(previous.get("claim_id") or "legacy-stage-record"),
+                    "run_id": run_id,
+                    "stage": stage,
+                    "status": str(previous.get("status")),
+                }
+            }
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        claim_id = f"{run_id}:{stage}:{uuid4().hex[:8]}"
+        claim = {
+            "claim_version": 1,
+            "claim_id": claim_id,
+            "project_id": project_id,
+            "contract_id": contract_id,
+            "run_id": run_id,
+            "stage": stage,
+            "created_at": now,
+            "updated_at": now,
+            "status": "started",
+            "idempotency_key": idempotency_key,
+            "reconciliation": _reconciliation_payload(required=True),
+        }
+        claims[claim_id] = claim
+
+        attempt_dir = project_dir / "attempts" / run_id
+        project_workdir = str(config.get("server", {}).get("remote_workdir") or "").rstrip("/")
+        remote_run_workdir = f"{project_workdir}/attempts/{run_id}" if project_workdir else ""
+        status.update(
+            {
+                "state": "preparing",
+                "message": (
+                    "Preparing an isolated RNA-seq run attempt."
+                    if stage == "full"
+                    else f"Preparing isolated run attempt for stage {stage}."
+                ),
+                "updated_at": now,
+                "run_id": run_id,
+                "attempt_dir": str(attempt_dir),
+                "remote_run_workdir": remote_run_workdir,
+                "started_at": now,
+                "execution_claim_id": claim_id,
+                "execution_claims": claims,
+            }
+        )
+        if stage != "full":
+            status["stage"] = stage
+            stage_records[stage] = {
+                "status": "preparing",
+                "claim_id": claim_id,
+                "started_at": now,
+            }
+            status["stages"] = stage_records
+        config["status"] = status
+        save_json(config_path, config)
+        return {"config": config, "run_id": run_id, "claim_id": claim_id}
+
+
+def _transition_execution_claim(
+    config_path: Path,
+    claim_id: str,
+    *,
+    expected: set[str],
+    claim_status: str,
+    project_state: str,
+    project_message: str,
+    project_fields: dict[str, Any] | None = None,
+    stage_status: str | None = None,
+    stage_fields: dict[str, Any] | None = None,
+) -> None:
+    """CAS a claim and live project status in one project-state transaction."""
+
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
+        status = config.setdefault("status", {})
+        claims = status.get("execution_claims")
+        if not isinstance(claims, dict) or claim_id not in claims:
+            raise RuntimeError(f"Execution claim disappeared: {claim_id}")
+        claim = claims[claim_id]
+        current = str(claim.get("status") or "")
+        if current not in expected:
+            raise RuntimeError(
+                f"Execution claim CAS failed for {claim_id}: expected {sorted(expected)}, got {current!r}."
+            )
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        claim["status"] = claim_status
+        claim["updated_at"] = now
+        claim["reconciliation"] = _reconciliation_payload(
+            required=claim_status in _ACTIVE_EXECUTION_CLAIM_STATUSES
+        )
+        fields = dict(project_fields or {})
+        claims[claim_id] = claim
+
+        status.update(
+            {
+                "state": project_state,
+                "message": project_message,
+                "updated_at": now,
+                "execution_claim_id": claim_id,
+                "execution_claims": claims,
+            }
+        )
+        status.update(fields)
+        stage = str(claim.get("stage") or "")
+        if stage != "full" and stage_status is not None:
+            stage_records = dict(status.get("stages") or {})
+            record = dict(stage_records.get(stage) or {})
+            record.update({"status": stage_status, "claim_id": claim_id, "updated_at": now})
+            record.update(stage_fields or {})
+            stage_records[stage] = record
+            status["stages"] = stage_records
+            status["stage"] = stage
+        config["status"] = status
+        save_json(config_path, config)
+
+
+def _record_execution_exception(
+    config_path: Path,
+    claim_id: str,
+    message: str,
+    *,
+    stage: str | None = None,
+) -> None:
+    """Close pre-submit failures and preserve ambiguous submit claims."""
+
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
+        status = config.setdefault("status", {})
+        claims = status.get("execution_claims")
+        if not isinstance(claims, dict) or claim_id not in claims:
+            return
+        claim = claims[claim_id]
+        current = str(claim.get("status") or "")
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if current == "started":
+            claim["status"] = "failed"
+            claim["updated_at"] = now
+            claim["reconciliation"] = _reconciliation_payload(required=False)
+            if status.get("state") not in {"validation_failed", "policy_failed"}:
+                status.update({"state": "run_failed", "message": message, "updated_at": now})
+            if stage:
+                stage_records = dict(status.get("stages") or {})
+                record = dict(stage_records.get(stage) or {})
+                record.update({"status": "failed", "claim_id": claim_id, "updated_at": now})
+                stage_records[stage] = record
+                status["stages"] = stage_records
+        elif current in {"submitting", "submitted"}:
+            status.update(
+                {
+                    "state": "reconcile_required",
+                    "message": (
+                        "Execution stopped after remote submission may have started. "
+                        f"Claim {claim_id} remains {current}; inspect the scheduler before any retry."
+                    ),
+                    "updated_at": now,
+                }
+            )
+        claims[claim_id] = claim
+        status["execution_claims"] = claims
+        config["status"] = status
+        save_json(config_path, config)
+
+
 def _update_status(
     config_path: Path,
     state: str,
@@ -909,15 +1235,16 @@ def _update_status(
 
 
 def _record_policy_verification(config_path: Path, policy: dict[str, str]) -> None:
-    config = normalize_config(load_json(config_path))
-    execution = config.setdefault("execution", {})
-    execution["mode"] = policy["mode"]
-    if policy.get("skill_id"):
-        execution["skill_id"] = policy["skill_id"]
-    if policy.get("contract_id"):
-        execution["verified_contract_id"] = policy["contract_id"]
-        execution["verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    save_json(config_path, config)
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
+        execution = config.setdefault("execution", {})
+        execution["mode"] = policy["mode"]
+        if policy.get("skill_id"):
+            execution["skill_id"] = policy["skill_id"]
+        if policy.get("contract_id"):
+            execution["verified_contract_id"] = policy["contract_id"]
+            execution["verified_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        save_json(config_path, config)
 
 
 def _new_run_id() -> str:
