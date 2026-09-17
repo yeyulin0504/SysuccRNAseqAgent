@@ -339,18 +339,23 @@ class TestThreadPersistence:
         ).json()["messages"]
         assert len(saved) == 2
 
-    def test_tool_intent_runs_and_reports_state(self, client) -> None:
-        """工具动作（生成计划）在流式路径下同样要真正执行。"""
+    def test_rule_fallback_refuses_tool_intent_without_confirmation(self, client, tmp_path) -> None:
+        """没有 LLM 工具图时，流式规则兜底也不能直接执行副作用。"""
         token = _token(client)
         _create_project(client, token, "stream_n")
         _with_session(client, token, "stream_n")
+        session_path = tmp_path / "stream_n" / "session.json"
+        before = session_path.read_text(encoding="utf-8")
 
         events = _stream(client, token, "生成执行计划", project="stream_n")
         done = events[-1]["data"]
 
-        assert done["state"] == "planned", done
+        assert done["state"] == "drafting", done
+        assert done["via"] == "confirmation_required", done
+        assert done["confirmation_required"] is True, done
+        assert session_path.read_text(encoding="utf-8") == before
         state = client.get("/api/state?project=stream_n", headers=_headers(token)).json()
-        assert state["state"] == "planned"
+        assert state["state"] == "drafting"
 
 
 class TestPlanWithoutProjectIsActionable:
@@ -376,7 +381,8 @@ class TestPlanWithoutProjectIsActionable:
         assert "当前状态" not in reply, reply
         # 必须指向下一步。
         assert "工作台" in reply, reply
-        assert "project.json" in reply, reply
+        assert done["via"] == "confirmation_required", done
+        assert done["confirmation_required"] is True, done
 
     def test_state_endpoint_confirms_no_config(self, client) -> None:
         """守住前提：这个场景确实是缺 project.json，而不是判定逻辑出错。"""
@@ -386,14 +392,22 @@ class TestPlanWithoutProjectIsActionable:
         assert state["state"] == "idle"
         assert state["config"] is None
 
-    def test_project_with_session_still_plans(self, client) -> None:
-        """守卫不能误伤有配置的项目。"""
+    def test_project_with_session_still_requires_durable_confirmation(
+        self, client, tmp_path
+    ) -> None:
+        """有配置也不能让无 checkpointer 的规则兜底直接生成计划。"""
         token = _token(client)
         _create_project(client, token, "has_session")
         _with_session(client, token, "has_session")
+        session_path = tmp_path / "has_session" / "session.json"
+        before = session_path.read_text(encoding="utf-8")
 
         events = _stream(client, token, "生成执行计划", project="has_session")
-        assert events[-1]["data"]["state"] == "planned"
+        done = events[-1]["data"]
+        assert done["state"] == "drafting", done
+        assert done["via"] == "confirmation_required", done
+        assert done["confirmation_required"] is True, done
+        assert session_path.read_text(encoding="utf-8") == before
 
 
 class TestChatPage:
@@ -491,17 +505,8 @@ class TestComposerSendsOnEnter:
         assert submit in handler, f"{path} 的 Enter 未调用 {submit}"
 
 
-class TestChatWritesConfiguration:
-    """对话落地配置：用户说「你帮我执行」必须真的写盘。
-
-    用户实测（2026-09-16）：把 FASTQ 目录 / 文件名 / 参考基因组贴进对话，再说
-    「你帮我执行，链特异性未知，1是control2是treat」，得到的是
-    「我无法直接执行，只能帮你核对配置」；再点「生成执行计划」，又回到
-    「这个项目还没有分析会话」。用户在「AI 说做不到 ↔ 不知道该点哪」之间死循环。
-
-    根因：写盘能力本身存在（``POST /api/projects/{id}/fastq/session``），只是
-    对话够不着——``route_intent`` 没有任何能写配置的动作。这里补上。
-    """
+class TestChatFallbackPermissions:
+    """规则兜底只能做只读操作，不能绕过 durable 工具确认。"""
 
     CONFIG_MESSAGE = (
         "你帮我填这些信息：原始 FASTQ 数据\n"
@@ -525,133 +530,7 @@ class TestChatWritesConfiguration:
 
     EXECUTE_MESSAGE = "你帮我执行，链特异性未知，1是control2是treat"
 
-    def _send_config_then_execute(self, client, token: str, project: str) -> list[dict]:
-        """两条消息模拟真实对话：先贴配置，再说「你帮我执行」。"""
-        _stream(client, token, self.CONFIG_MESSAGE, project=project)
-        return _stream(client, token, self.EXECUTE_MESSAGE, project=project)
-
-    def test_execute_creates_a_real_session(self, client, tmp_path) -> None:
-        token = _token(client)
-        _create_project(client, token, "cfg_a")
-        self._send_config_then_execute(client, token, "cfg_a")
-
-        project_dir = tmp_path / "cfg_a"
-        assert (project_dir / "project.json").is_file(), "对话没有真正写盘"
-
-    def test_execute_populates_all_four_samples(self, client, tmp_path) -> None:
-        token = _token(client)
-        _create_project(client, token, "cfg_b")
-        self._send_config_then_execute(client, token, "cfg_b")
-
-        project_json = json.loads(
-            (tmp_path / "cfg_b" / "project.json").read_text(encoding="utf-8")
-        )
-        items = project_json["samples"]["items"]
-        assert [item["sample_id"] for item in items] == [
-            "SRR28119110", "SRR28119111", "SRR28119112", "SRR28119113",
-        ]
-
-    def test_two_group_names_cycle_over_four_samples(self, client, tmp_path) -> None:
-        """用户原话：4 个样本、2 个分组名，按 ctrl/treat 顺序排列，不要反问。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_c")
-        self._send_config_then_execute(client, token, "cfg_c")
-
-        project_json = json.loads(
-            (tmp_path / "cfg_c" / "project.json").read_text(encoding="utf-8")
-        )
-        assert [item["condition"] for item in project_json["samples"]["items"]] == [
-            "control", "treat", "control", "treat",
-        ]
-
-    def test_unknown_strandedness_is_persisted(self, client, tmp_path) -> None:
-        """「要允许特异性未知的选项先写着」——不能静默被 auto 覆盖。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_d")
-        self._send_config_then_execute(client, token, "cfg_d")
-
-        project_json = json.loads(
-            (tmp_path / "cfg_d" / "project.json").read_text(encoding="utf-8")
-        )
-        assert project_json["sequencing"]["strandedness"] == "unknown"
-
-    def test_reply_reports_the_real_write(self, client, tmp_path) -> None:
-        token = _token(client)
-        _create_project(client, token, "cfg_e")
-        events = self._send_config_then_execute(client, token, "cfg_e")
-
-        reply = _deltas(events)
-        assert "已写入" in reply, reply
-        assert "SRR28119110" in reply, reply
-        # 不能再出现「我无法直接执行」这类把活推回给用户的措辞。
-        assert "无法直接执行" not in reply, reply
-
-    def test_reply_does_not_claim_a_write_that_did_not_happen(self, client, tmp_path) -> None:
-        """信息不足时必须如实说缺什么，不得谎称已保存。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_f")
-        events = _stream(client, token, "你帮我执行", project="cfg_f")
-
-        reply = _deltas(events)
-        assert "已写入" not in reply, reply
-        assert not (tmp_path / "cfg_f" / "project.json").is_file()
-
-    def test_existing_session_is_not_overwritten(self, client, tmp_path) -> None:
-        """已有会话时不得把用户确认过的样本设计冲掉。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_g")
-        _with_session(client, token, "cfg_g")
-        before = (tmp_path / "cfg_g" / "project.json").read_text(encoding="utf-8")
-
-        events = self._send_config_then_execute(client, token, "cfg_g")
-
-        after = (tmp_path / "cfg_g" / "project.json").read_text(encoding="utf-8")
-        assert after == before, "对话写入覆盖了已有会话"
-        assert "已经有分析会话" in _deltas(events)
-
-    def test_plan_after_chat_write_succeeds(self, client, tmp_path) -> None:
-        """死循环的收尾：写盘之后「生成执行计划」不能再回「还没有分析会话」。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_h")
-        self._send_config_then_execute(client, token, "cfg_h")
-
-        events = _stream(client, token, "生成执行计划", project="cfg_h")
-        reply = _deltas(events)
-
-        assert "还没有分析会话" not in reply, reply
-        assert any(e["event"] == "done" and e["data"].get("steps") for e in events), events
-
-    def test_stream_reports_the_write_as_a_tool_step(self, client) -> None:
-        """思考过程里要能看到「读取对话中的配置 → 写入项目配置」。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_i")
-        events = self._send_config_then_execute(client, token, "cfg_i")
-
-        labels = [e["data"]["label"] for e in events if e["event"] == "step"]
-        assert any("写入项目配置" in label for label in labels), labels
-        write_steps = [
-            e["data"]
-            for e in events
-            if e["event"] == "step" and "写入项目配置" in e["data"]["label"]
-        ]
-        assert write_steps[-1]["status"] == "done", write_steps
-
-    def test_done_event_carries_the_new_state(self, client) -> None:
-        """写盘后状态要从 idle 变成 drafting，前端才跟得上。"""
-        token = _token(client)
-        _create_project(client, token, "cfg_j")
-        events = self._send_config_then_execute(client, token, "cfg_j")
-
-        done = events[-1]["data"]
-        assert done["state"] == "drafting", done
-        assert done["via"] == "tool", done
-
-    def test_non_streaming_endpoint_writes_too(self, client, tmp_path) -> None:
-        """``/api/chat``（工作台走的非流式端点）同样能落地配置。
-
-        该端点不落盘会话消息，跨轮上下文拿不到，因此这里发**一条自包含**的
-        消息（配置 + 执行指令一起给），验证它同样走确定性写盘。
-        """
+    def test_non_streaming_endpoint_refuses_unconfirmed_write(self, client, tmp_path) -> None:
         token = _token(client)
         _create_project(client, token, "cfg_k")
         body = client.post(
@@ -660,37 +539,90 @@ class TestChatWritesConfiguration:
             headers=_headers(token),
         ).json()
 
-        assert "已写入" in body.get("reply", ""), body
-        project_json = json.loads(
-            (tmp_path / "cfg_k" / "project.json").read_text(encoding="utf-8")
-        )
-        assert [item["condition"] for item in project_json["samples"]["items"]] == [
-            "control", "treat", "control", "treat",
-        ]
-        assert project_json["sequencing"]["strandedness"] == "unknown"
+        assert body["confirmation_required"] is True, body
+        assert body["via"] == "confirmation_required", body
+        assert "流式" in body["reply"] or "工作台" in body["reply"], body
+        assert not (tmp_path / "cfg_k" / "project.json").exists()
 
-    def test_remote_reads_are_not_reported_as_missing(self, client, tmp_path) -> None:
-        """写盘回复不得夹带虚假「缺少输入文件」。
-
-        用户贴的是服务器目录，reads 本来就不在本地。早期实现拿本地
-        ``local_data_dir`` 去拼样本文件名，于是每个样本都被报成缺少文件，
-        把「已写入」这条好消息淹没了（2026-09-16 实测）。
-        """
+    def test_stream_without_llm_refuses_unconfirmed_write(self, client, tmp_path) -> None:
         token = _token(client)
-        _create_project(client, token, "cfg_m")
-        events = self._send_config_then_execute(client, token, "cfg_m")
-
-        reply = _deltas(events)
-        assert "缺少输入文件" not in reply, reply
-        assert "mvp_demo_data" not in reply, reply
+        _create_project(client, token, "cfg_no_llm")
+        events = _stream(
+            client,
+            token,
+            self.CONFIG_MESSAGE + "\n" + self.EXECUTE_MESSAGE,
+            project="cfg_no_llm",
+        )
 
         done = events[-1]["data"]
-        assert done["state"] == "drafting", done
-        # 门禁应给出「通过」，而不是一屏 NOT_EVALUABLE 的「不适用」。
-        gate = done.get("gate") or []
-        assert gate, done
-        assert "通过" in " ".join(gate), gate
-        assert "不适用" not in " ".join(gate), gate
+        assert done["confirmation_required"] is True, done
+        assert done["via"] == "confirmation_required", done
+        assert not (tmp_path / "cfg_no_llm" / "project.json").exists()
+
+    def test_stream_llm_failure_refuses_unconfirmed_plan(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        import rnaseq_agent.chat_graph as chat_graph
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        _create_project(client, token, "cfg_llm_fail")
+        _with_session(client, token, "cfg_llm_fail")
+        save_llm({"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"})
+
+        def failed_stream(*_args, **_kwargs):
+            yield "error", "provider unavailable"
+
+        monkeypatch.setattr(chat_graph, "_stream_chat_completion", failed_stream)
+        monkeypatch.setattr(webapp, "_llm_stream_chunks", lambda *_args, **_kwargs: iter([]))
+
+        before = (tmp_path / "cfg_llm_fail" / "session.json").read_text(encoding="utf-8")
+        events = _stream(client, token, "生成执行计划", project="cfg_llm_fail")
+        done = events[-1]["data"]
+
+        assert done["confirmation_required"] is True, done
+        assert done["via"] == "confirmation_required", done
+        assert (tmp_path / "cfg_llm_fail" / "session.json").read_text(encoding="utf-8") == before
+
+    def test_stream_graph_build_failure_refuses_unconfirmed_edit(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        import rnaseq_agent.chat_graph as chat_graph
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        _create_project(client, token, "cfg_graph_fail")
+        _with_session(client, token, "cfg_graph_fail")
+        save_llm({"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"})
+        monkeypatch.setattr(
+            chat_graph,
+            "build_chat_graph",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("graph unavailable")),
+        )
+        monkeypatch.setattr(webapp, "_llm_stream_chunks", lambda *_args, **_kwargs: iter([]))
+
+        project_path = tmp_path / "cfg_graph_fail" / "project.json"
+        before = project_path.read_text(encoding="utf-8")
+        events = _stream(client, token, "把线程改成 16", project="cfg_graph_fail")
+        done = events[-1]["data"]
+
+        assert done["confirmation_required"] is True, done
+        assert done["via"] == "confirmation_required", done
+        assert project_path.read_text(encoding="utf-8") == before
+
+    def test_stream_without_llm_still_allows_read_only_status(self, client) -> None:
+        token = _token(client)
+        _create_project(client, token, "cfg_read")
+        _with_session(client, token, "cfg_read")
+
+        events = _stream(client, token, "状态", project="cfg_read")
+        done = events[-1]["data"]
+
+        assert done["via"] == "tool", done
+        assert done.get("confirmation_required") is not True
+        assert "当前状态" in _deltas(events)
 
 
 class TestConfigureIntentDoesNotStealOtherActions:

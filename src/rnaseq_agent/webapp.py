@@ -1676,8 +1676,7 @@ def create_app(
           / ``configure_pipeline`` / ``set_run_resources`` / ``set_diffexp_reference``
           / ``set_cms_options`` / ``rollback_changes`` → 复用 ``session.edit`` / ``rollback``；
         - ``generate_plan`` / ``confirm_contract`` → 复用 ``session.plan`` / ``confirm``；
-        - ``run_analysis`` → 复用 ``session.execute``（带 stage 时走 ``execute_stage``）；
-        - ``record_qc_decision`` → 复用 ``session.record_qc_decision``。
+        - ``run_analysis`` → 复用 ``session.execute``（带 stage 时走 ``execute_stage``）。
 
         ``approved`` 由图上的人工确认关卡给出。写盘/执行类工具在没有批准时一律
         拒绝——这是纵深防御：即使图的守卫被绕过，这里仍然拦得住。
@@ -1899,27 +1898,6 @@ def create_app(
 
         if name == "set_cms_options":
             return _set_cms_options_tool(session, arguments)
-
-        if name == "record_qc_decision":
-            if session.config is None:
-                return {"ok": False, "error": "这个项目还没有分析会话。"}
-            try:
-                status = load_json(session.config_path).get("status", {})
-                expected_run_id = str(status.get("run_id") or "").strip()
-                decision = session.record_qc_decision(
-                    approved=bool(arguments.get("approved")),
-                    expected_run_id=expected_run_id,
-                    note=str(arguments.get("note") or ""),
-                )
-            except SessionError as exc:
-                return {"ok": False, "error": str(exc), "state": session.state}
-            verdict = "通过，继续下游" if decision["approved"] else "不通过，停在这里"
-            return {
-                "ok": True,
-                "state": session.state,
-                "qc": decision,
-                "reply": f"已记录 QC 检查点决定：{verdict}。",
-            }
 
         if name == "rollback_changes":
             result = execute_intent(session, ChatIntent("rollback", message="已回滚最后一次变更。"))
@@ -2185,6 +2163,25 @@ def create_app(
         action = getattr(intent, "action", "")
         return labels.get(action, action or "会话动作")
 
+    def _rule_intent_requires_confirmation(intent: Any) -> bool:
+        """Only genuinely read-only rule intents may run without LangGraph."""
+        action = str(getattr(intent, "action", "") or "")
+        return action not in {"browse_samples", "status", "summary", "deg_status", "help"}
+
+    def _confirmation_required_result(session: ProjectSession, intent: Any) -> dict[str, Any]:
+        """Refuse risky fallback actions when no durable resume path exists."""
+        label = _intent_label(intent)
+        return {
+            "state": session.state,
+            "via": "confirmation_required",
+            "confirmation_required": True,
+            "action": str(getattr(intent, "action", "") or ""),
+            "reply": (
+                f"“{label}”会修改项目或执行分析，规则兜底不会直接执行。"
+                "请使用支持持久化确认的流式对话，或在结构化工作台中完成该操作。"
+            ),
+        }
+
     def _draft_summary(history_text: list[str]) -> str:
         """One-line「我读到了什么」for the thinking panel, before any write."""
         from .config_intake import extract_config_draft
@@ -2255,13 +2252,10 @@ def create_app(
         if intent is not None and intent.action == "browse_samples":
             return _browse_samples_reply(session, intent, config, connection_config)
 
-        # 落地配置走确定性写盘，并把真实结果（含门禁）回报给用户。
-        if intent is not None and intent.action == "configure_project":
-            return _configure_project_from_chat(
-                project_id,
-                session,
-                _conversation_text(project_dir, thread_id or "main", text),
-            )
+        # 该端点没有 durable 确认 / resume 能力。风险意图不能退回旧规则执行器，
+        # 否则模型不可用时反而能绕过正常工具图的确认门禁。
+        if intent is not None and _rule_intent_requires_confirmation(intent):
+            return _confirmation_required_result(session, intent)
 
         # 1) LLM path (when enabled and reachable).
         # 大模型配置是用户级共享的：项目里没有 project.json 时回退到全局
@@ -2449,11 +2443,25 @@ def create_app(
                     else:
                         yield step("llm", "调用大模型生成答复", "failed", "模型无响应，改用规则路由")
 
-            # 4) 正则兜底：模型没给出答复时才轮到规则路由。
-            #    保留这条路径有两个作用：模型未配置时不至于瘫掉；模型临时不可用时
-            #    仍能完成「贴配置 → 写盘」这类确定性操作。
+            # 4) 正则兜底：模型没给出答复时才轮到规则路由。只读动作仍可运行；
+            #    写盘/执行动作没有 durable resume 路径，必须明确拒绝并引导用户
+            #    回到正常工具图或结构化工作台，不能因模型失败而绕过确认门禁。
             if not llm_handled:
-                if intent is not None and intent.action == "browse_samples":
+                if intent is not None and _rule_intent_requires_confirmation(intent):
+                    blocked = _confirmation_required_result(session, intent)
+                    via = str(blocked["via"])
+                    reply = str(blocked["reply"])
+                    payload_extra = {
+                        "confirmation_required": True,
+                        "action": blocked["action"],
+                    }
+                    yield step(
+                        "tool",
+                        f"拒绝无确认执行：{intent_label}",
+                        "failed",
+                        "请改用支持持久化确认的流式工具路径或结构化工作台",
+                    )
+                elif intent is not None and intent.action == "browse_samples":
                     yield step("tool", f"执行操作：{intent_label}", "running")
                     result = _browse_samples_reply(session, intent, config, connection_config)
                     reply = str(result.get("reply") or "")
@@ -2463,33 +2471,6 @@ def create_app(
                         for k in ("action", "samples", "unmatched", "scanned_path")
                         if k in result
                     }
-                elif intent is not None and intent.action == "configure_project":
-                    yield step("tool", "读取对话中的配置", "running")
-                    chat_history = _conversation_text(
-                        project_dir,
-                        requested_thread or "main",
-                        text,
-                    )
-                    draft_summary = _draft_summary(chat_history)
-                    yield step("tool", "读取对话中的配置", "done", draft_summary)
-                    yield step("tool", "写入项目配置", "running")
-                    result = _configure_project_from_chat(project_id, session, chat_history)
-                    via = "tool"
-                    reply = str(result.get("reply") or "")
-                    failed = "gate" not in result and "已写入" not in reply
-                    yield step(
-                        "tool",
-                        "写入项目配置",
-                        "failed" if failed else "done",
-                        "" if not failed else reply.splitlines()[0] if reply else "",
-                    )
-                    payload_extra = {
-                        k: result[k]
-                        for k in ("gate", "action", "samples")
-                        if k in result
-                    }
-                    # 写盘后状态从 idle 变成 drafting，前端要看到新状态。
-                    active_session = _session_for(project_dir)
                 elif intent is not None:
                     yield step("tool", f"执行操作：{intent_label}", "running")
                     result = _execute_chat_intent(session, intent)

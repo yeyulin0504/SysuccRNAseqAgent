@@ -982,7 +982,7 @@ class TestRollbackAndQcDecisionTools:
         tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
         assert tool_result["ok"] is True
 
-    def test_record_qc_decision_writes_the_shared_project_status(
+    def test_removed_qc_decision_tool_is_rejected_without_a_card_or_status_write(
         self, client, tmp_path, monkeypatch
     ) -> None:
         token = _token(client)
@@ -1007,23 +1007,20 @@ class TestRollbackAndQcDecisionTools:
                         )
                     ]
                 },
-                {"content": "已记录 QC 不通过，分析停在这里。"},
+                {"content": "QC 决策只能在持久化检查点中完成。"},
             ]
         )
         monkeypatch.setattr(cg, "_stream_chat_completion", fake)
 
         events = _stream(client, token, "QC 不通过，先停下", project="qc_tool")
         card = _confirm_event(events)
-        assert card is not None, events
-        assert card["policy"] == "solo", card
-        _resume(client, token, project="qc_tool", approved=True)
+        assert card is None, events
 
         project = _project_json(tmp_path, "qc_tool")
-        assert project["status"]["qc"]["approved"] is False
-        assert project["status"]["qc"]["run_id"] == "run-qc-tool"
-        assert project["status"]["qc"]["note"] == "reads retention too low"
+        assert "qc" not in project["status"]
         tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
-        assert tool_result["ok"] is True
+        assert tool_result["ok"] is False
+        assert "不存在" in tool_result["error"]
 
 
 class TestStageAwareRunAnalysis:

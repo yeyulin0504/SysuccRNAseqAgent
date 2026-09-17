@@ -176,6 +176,10 @@ class TestToolContract:
             properties
         )
 
+    def test_qc_decision_is_not_exposed_as_a_general_llm_tool(self) -> None:
+        names = {schema["function"]["name"] for schema in tool_schemas()}
+        assert "record_qc_decision" not in names
+
 
 class TestConfirmationPolicy:
     """用户 2026-09-16 定的确认边界：配置合并、执行单独。"""

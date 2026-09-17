@@ -57,7 +57,6 @@ rollback_changes        batch   ``session.rollback``
 generate_plan           solo    ``session.plan``
 confirm_contract        solo    ``session.confirm``
 run_analysis            solo    ``session.execute`` / ``session.execute_stage``
-record_qc_decision      solo    ``session.record_qc_decision``
 ======================  ======  ================================================
 """
 
@@ -530,24 +529,6 @@ TOOL_SPECS: dict[str, ToolSpec] = {
             "additionalProperties": False,
         },
         risk=RISK_WRITE,
-    ),
-    "record_qc_decision": ToolSpec(
-        name="record_qc_decision",
-        label="记录 QC 检查点决定",
-        description=(
-            "在比对后的 QC 检查点记录「继续 / 不继续」的决定。"
-            "只有项目已经跑到该检查点、用户看过 QC 结果并明确表态后才调用。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "approved": {"type": "boolean", "description": "True = 通过，继续下游"},
-                "note": {"type": "string", "description": "用户的理由或备注"},
-            },
-            "required": ["approved"],
-            "additionalProperties": False,
-        },
-        risk=RISK_EXECUTE,
     ),
 }
 
@@ -1231,11 +1212,6 @@ def describe_call(
         if stage:
             return f"{title}：只跑 {stage} 阶段（在服务器上执行）"
         return f"{title}：跑完整流水线（在服务器上执行）"
-
-    if name == "record_qc_decision":
-        verdict = "通过，继续下游" if arguments.get("approved") else "不通过，停在这里"
-        note = str(arguments.get("note") or "").strip()
-        return f"{title}：{verdict}" + (f"（备注：{note}）" if note else "")
 
     if name == "browse_remote_samples":
         return f"{title}：只读扫描 {arguments.get('path')}"

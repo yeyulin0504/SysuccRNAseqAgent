@@ -104,32 +104,39 @@ class TestWebApp:
         resp = client.post("/api/resume", headers=_headers(token)).json()
         assert "error" in resp  # not in WAITING_USER yet
 
-    def test_chat_routes_intent_to_session(self, client, tmp_path: Path) -> None:
+    def test_non_streaming_chat_refuses_actions_without_durable_confirmation(
+        self, client, tmp_path: Path
+    ) -> None:
         token = _token(client)
         _new_project(client, token)
+        config_path = tmp_path / "proj" / "project.json"
+        session_path = tmp_path / "proj" / "session.json"
+        config_before = config_path.read_text(encoding="utf-8")
+        session_before = session_path.read_text(encoding="utf-8")
 
-        # Chat requests the plan in natural language.
+        # This legacy endpoint has no checkpointer-backed resume path, so it
+        # must refuse side effects instead of bypassing the tool guardrail.
         resp = client.post(
             "/api/chat",
             json={"message": "生成执行计划"},
             headers=_headers(token),
         ).json()
-        assert resp.get("state") == "planned"
-        assert "steps" in resp
+        assert resp["state"] == "drafting"
+        assert resp["via"] == "confirmation_required"
+        assert resp["confirmation_required"] is True
+        assert resp["action"] == "plan"
 
-        # Chat edits the thread count.
         resp = client.post(
             "/api/chat",
             json={"message": "把线程改成 24"},
             headers=_headers(token),
         ).json()
-        assert resp.get("state") == "drafting"
-        assert "操作未完成" not in resp.get("reply", "")
-
-        # Threads change is persisted in the config snapshot.
-        config_path = tmp_path / "proj" / "project.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        assert config["server"]["threads"] == 24
+        assert resp["state"] == "drafting"
+        assert resp["via"] == "confirmation_required"
+        assert resp["confirmation_required"] is True
+        assert resp["action"] == "edit"
+        assert config_path.read_text(encoding="utf-8") == config_before
+        assert session_path.read_text(encoding="utf-8") == session_before
 
     def test_chat_unrecognized_returns_hint(self, client, tmp_path: Path) -> None:
         token = _token(client)
@@ -779,15 +786,18 @@ class TestWebApp:
             return FakeResp()
 
         monkeypatch.setattr(requests, "post", fake_post)
-        # A non-actionable question hits the LLM, fails, then falls to hint.
+        session_path = tmp_path / "proj" / "session.json"
+        before = session_path.read_text(encoding="utf-8")
         resp = client.post(
             "/api/chat",
             json={"message": "生成执行计划"},
             headers=_headers(token),
         ).json()
-        # Rule router takes over.
-        assert resp.get("state") == "planned"
-        assert "steps" in resp
+        assert resp["state"] == "drafting"
+        assert resp["via"] == "confirmation_required"
+        assert resp["confirmation_required"] is True
+        assert resp["action"] == "plan"
+        assert session_path.read_text(encoding="utf-8") == before
 
 
 class TestSystemPromptForbidsFakeWrites:
