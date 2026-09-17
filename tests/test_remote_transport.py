@@ -22,6 +22,7 @@ from rnaseq_agent.remote_transport import (
     ParamikoTransport,
     SystemSSHTransport,
     _connect_paramiko_with_deadline,
+    _prepare_paramiko_client_with_deadline,
     create_remote_transport,
 )
 from rnaseq_agent.ssh_auth import (
@@ -716,6 +717,71 @@ def test_paramiko_closes_client_and_maps_host_key_loader_error(monkeypatch) -> N
     assert client.closed is True
 
 
+def test_paramiko_prepare_start_interruption_abandons_worker(monkeypatch) -> None:
+    class BlockingHostKeyClient:
+        def __init__(self) -> None:
+            self.loader_entered = threading.Event()
+            self.release_loader = threading.Event()
+            self.close_count = 0
+            self.policy_called = False
+
+        def load_system_host_keys(self) -> None:
+            self.loader_entered.set()
+            self.release_loader.wait()
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            self.policy_called = True
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = BlockingHostKeyClient()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    started_workers: list[threading.Thread] = []
+    published_results: list[object] = []
+    original_start = threading.Thread.start
+    original_put_nowait = __import__("queue").Queue.put_nowait
+
+    def interrupt_after_start(worker) -> None:
+        started_workers.append(worker)
+        original_start(worker)
+        assert client.loader_entered.wait(0.5)
+        raise KeyboardInterrupt()
+
+    def record_publication(result_queue, result) -> None:
+        published_results.append(result)
+        original_put_nowait(result_queue, result)
+
+    monkeypatch.setattr(
+        "rnaseq_agent.remote_transport.threading.Thread.start",
+        interrupt_after_start,
+    )
+    monkeypatch.setattr(
+        "rnaseq_agent.remote_transport.queue.Queue.put_nowait",
+        record_publication,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _prepare_paramiko_client_with_deadline(
+                fake_paramiko,
+                time.monotonic() + 1,
+            )
+        close_count_at_interruption = client.close_count
+    finally:
+        client.release_loader.set()
+        for worker in started_workers:
+            worker.join(1)
+
+    assert all(not worker.is_alive() for worker in started_workers)
+    assert close_count_at_interruption >= 1
+    assert client.close_count >= 1
+    assert client.policy_called is False
+    assert published_results == []
+
+
 def test_paramiko_dns_resolution_obeys_total_deadline(monkeypatch) -> None:
     import paramiko
 
@@ -1155,6 +1221,84 @@ def test_paramiko_handshake_publication_interruption_abandons_result(monkeypatch
     assert socket_closed_at_interruption is True
     assert client.close_count >= 1
     assert connection.closed is True
+    assert client.exec_called is False
+
+
+def test_paramiko_handshake_start_interruption_abandons_worker(monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.connect_entered = threading.Event()
+            self.release_connect = threading.Event()
+            self.close_count = 0
+            self.exec_called = False
+
+        def connect(self, **kwargs) -> None:
+            self.connect_entered.set()
+            self.release_connect.wait()
+
+        def exec_command(self, *args, **kwargs):
+            self.exec_called = True
+            raise AssertionError("interrupted client must not execute a command")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = BlockingClient()
+    connection = FakeSocket()
+    started_workers: list[threading.Thread] = []
+    published_results: list[object] = []
+    original_start = threading.Thread.start
+    original_put_nowait = __import__("queue").Queue.put_nowait
+
+    def interrupt_after_start(worker) -> None:
+        started_workers.append(worker)
+        original_start(worker)
+        assert client.connect_entered.wait(0.5)
+        raise SystemExit()
+
+    def record_publication(result_queue, result) -> None:
+        published_results.append(result)
+        original_put_nowait(result_queue, result)
+
+    monkeypatch.setattr(
+        "rnaseq_agent.remote_transport.threading.Thread.start",
+        interrupt_after_start,
+    )
+    monkeypatch.setattr(
+        "rnaseq_agent.remote_transport.queue.Queue.put_nowait",
+        record_publication,
+    )
+    try:
+        with pytest.raises(SystemExit):
+            _connect_paramiko_with_deadline(
+                client,
+                connection,
+                hostname="192.0.2.10",
+                port=22,
+                username="researcher",
+                password="secret",
+                deadline=time.monotonic() + 1,
+            )
+        client_close_count_at_interruption = client.close_count
+        socket_close_count_at_interruption = connection.close_count
+    finally:
+        client.release_connect.set()
+        for worker in started_workers:
+            worker.join(1)
+
+    assert all(not worker.is_alive() for worker in started_workers)
+    assert client_close_count_at_interruption >= 1
+    assert socket_close_count_at_interruption >= 1
+    assert client.close_count >= 1
+    assert connection.close_count >= 1
+    assert published_results == []
     assert client.exec_called is False
 
 

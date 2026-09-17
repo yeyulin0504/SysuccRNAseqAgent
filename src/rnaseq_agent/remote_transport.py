@@ -171,13 +171,13 @@ def _connect_paramiko_with_deadline(
     # Closing Paramiko and its socket interrupts real handshake/auth waits. The
     # daemon only remains if a dependency ignores close; any late return closes
     # both resources again and cannot publish a usable client.
-    worker = threading.Thread(
-        target=connect,
-        name="rnaseq-agent-paramiko-connect",
-        daemon=True,
-    )
-    worker.start()
     try:
+        worker = threading.Thread(
+            target=connect,
+            name="rnaseq-agent-paramiko-connect",
+            daemon=True,
+        )
+        worker.start()
         try:
             result = result_queue.get(timeout=_remaining_remote_time(deadline))
         except queue.Empty as exc:
@@ -241,13 +241,13 @@ def _prepare_paramiko_client_with_deadline(paramiko: Any, deadline: float) -> An
         if abandoned.is_set() and client is not None:
             client.close()
 
-    worker = threading.Thread(
-        target=prepare,
-        name="rnaseq-agent-paramiko-prepare",
-        daemon=True,
-    )
-    worker.start()
     try:
+        worker = threading.Thread(
+            target=prepare,
+            name="rnaseq-agent-paramiko-prepare",
+            daemon=True,
+        )
+        worker.start()
         try:
             succeeded, result = result_queue.get(
                 timeout=_remaining_remote_time(deadline)
