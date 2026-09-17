@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
+import queue
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -29,6 +32,164 @@ def _remaining_remote_time(deadline: float) -> float:
             f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
         )
     return remaining
+
+
+def _resolve_remote_addresses(
+    host: str,
+    port: int,
+    deadline: float,
+) -> list[tuple[int, int, int, str, tuple[Any, ...]]]:
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if literal.version == 4:
+            address = (host, port)
+            family = socket.AF_INET
+        else:
+            address = (host, port, 0, 0)
+            family = socket.AF_INET6
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)]
+
+    result_queue: queue.Queue[
+        tuple[
+            bool,
+            list[tuple[int, int, int, str, tuple[Any, ...]]] | Exception,
+        ]
+    ] = queue.Queue(maxsize=1)
+    abandoned = threading.Event()
+
+    def resolve() -> None:
+        try:
+            result: list[tuple[int, int, int, str, tuple[Any, ...]]] | Exception = (
+                socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+            )
+            succeeded = True
+        except Exception as exc:
+            result = exc
+            succeeded = False
+        if not abandoned.is_set():
+            try:
+                result_queue.put_nowait((succeeded, result))
+            except queue.Full:
+                pass
+
+    # CPython cannot cancel a blocked platform resolver. A daemon thread lets the
+    # caller honor its deadline; it only resolves addresses and never sees a
+    # credential or opens a socket if the abandoned lookup returns later.
+    resolver = threading.Thread(
+        target=resolve,
+        name="rnaseq-agent-dns-resolver",
+        daemon=True,
+    )
+    resolver.start()
+    try:
+        try:
+            succeeded, result = result_queue.get(
+                timeout=_remaining_remote_time(deadline)
+            )
+        except queue.Empty as exc:
+            raise CommandTimeoutError(
+                f"Remote command exceeded the "
+                f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+            ) from exc
+        _remaining_remote_time(deadline)
+    finally:
+        abandoned.set()
+    if not succeeded:
+        assert isinstance(result, Exception)
+        raise result
+    assert isinstance(result, list)
+    return result
+
+
+def _connect_remote_socket(host: str, port: int, deadline: float) -> socket.socket:
+    addresses = _resolve_remote_addresses(host, port, deadline)
+    last_error: OSError | None = None
+    for family, socktype, protocol, _, address in addresses:
+        connection = socket.socket(family, socktype, protocol)
+        try:
+            connection.settimeout(_remaining_remote_time(deadline))
+            connection.connect(address)
+            _remaining_remote_time(deadline)
+            return connection
+        except BaseException as exc:
+            connection.close()
+            if isinstance(exc, OSError):
+                last_error = exc
+                continue
+            raise
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"No network address was found for {host}:{port}.")
+
+
+def _connect_paramiko_with_deadline(
+    client: Any,
+    connection: socket.socket,
+    *,
+    hostname: str,
+    port: int,
+    username: str,
+    password: str | None,
+    deadline: float,
+) -> None:
+    remaining = _remaining_remote_time(deadline)
+    result_queue: queue.Queue[Exception | None] = queue.Queue(maxsize=1)
+    abandoned = threading.Event()
+
+    def connect() -> None:
+        try:
+            client.connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                timeout=remaining,
+                auth_timeout=remaining,
+                banner_timeout=remaining,
+                allow_agent=False,
+                look_for_keys=False,
+                sock=connection,
+            )
+            result: Exception | None = None
+        except Exception as exc:
+            result = exc
+        if abandoned.is_set():
+            client.close()
+            connection.close()
+            return
+        try:
+            result_queue.put_nowait(result)
+        except queue.Full:
+            pass
+        if abandoned.is_set():
+            client.close()
+            connection.close()
+
+    # Closing Paramiko and its socket interrupts real handshake/auth waits. The
+    # daemon only remains if a dependency ignores close; any late return closes
+    # both resources again and cannot publish a usable client.
+    worker = threading.Thread(
+        target=connect,
+        name="rnaseq-agent-paramiko-connect",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        result = result_queue.get(timeout=_remaining_remote_time(deadline))
+    except queue.Empty as exc:
+        abandoned.set()
+        client.close()
+        connection.close()
+        raise CommandTimeoutError(
+            f"Remote command exceeded the "
+            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+        ) from exc
+    if result is not None:
+        raise result
+    _remaining_remote_time(deadline)
 
 
 class RemoteTransport(Protocol):
@@ -162,34 +323,28 @@ class ParamikoTransport:
             raise RuntimeError(
                 "密码登录需要 Paramiko。请重新安装项目依赖后再试。"
             ) from exc
+        if deadline is None:
+            deadline = time.monotonic() + REMOTE_COMMAND_TIMEOUT_SECONDS
         client = paramiko.SSHClient()
         client.load_system_host_keys()
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        connection = None
         try:
-            if deadline is None:
-                connect_timeout = 15.0
-                banner_timeout = 20.0
-                auth_timeout = 20.0
-            else:
-                remaining = _remaining_remote_time(deadline)
-                connect_timeout = min(15.0, remaining)
-                banner_timeout = min(20.0, remaining)
-                auth_timeout = min(20.0, remaining)
-            client.connect(
+            connection = _connect_remote_socket(self.host, self.port, deadline)
+            _connect_paramiko_with_deadline(
+                client,
+                connection,
                 hostname=self.host,
                 port=self.port,
                 username=self.user,
                 password=self.password,
-                timeout=connect_timeout,
-                auth_timeout=auth_timeout,
-                banner_timeout=banner_timeout,
-                allow_agent=False,
-                look_for_keys=False,
+                deadline=deadline,
             )
-            if deadline is not None:
-                _remaining_remote_time(deadline)
+            _remaining_remote_time(deadline)
         except Exception as exc:
             client.close()
+            if connection is not None:
+                connection.close()
             if "known_hosts" in str(exc):
                 raise RuntimeError(
                     "服务器主机指纹尚未被本机信任。请先在终端手动执行一次 "

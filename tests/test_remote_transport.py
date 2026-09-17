@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -518,7 +519,330 @@ def test_paramiko_connection_time_counts_toward_total_deadline(monkeypatch) -> N
     assert client.closed is True
 
 
+def test_paramiko_dns_resolution_obeys_total_deadline(monkeypatch) -> None:
+    import paramiko
+
+    transport = ParamikoTransport(
+        SERVER,
+        SSHCredential(mode="password", password="resolver-secret"),
+    )
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    resolver_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    resolver_exited = threading.Event()
+    connect_calls: list[dict[str, object]] = []
+    original_connect = paramiko.SSHClient.connect
+
+    def delayed_getaddrinfo(*args, **kwargs):
+        resolver_calls.append((args, kwargs))
+        try:
+            time.sleep(0.12)
+            raise socket.timeout("delayed resolver")
+        finally:
+            resolver_exited.set()
+
+    def recording_connect(client, *args, **kwargs):
+        connect_calls.append(kwargs)
+        return original_connect(client, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", delayed_getaddrinfo)
+    monkeypatch.setattr(paramiko.SSHClient, "connect", recording_connect)
+    started = time.monotonic()
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.10
+    assert resolver_exited.wait(1)
+    assert resolver_calls
+    assert "resolver-secret" not in repr(resolver_calls)
+    assert connect_calls == []
+
+
+def test_paramiko_abandons_nonreturning_dns_without_late_connect(monkeypatch) -> None:
+    import paramiko
+
+    transport = ParamikoTransport(
+        SERVER,
+        SSHCredential(mode="password", password="resolver-secret"),
+    )
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    resolver_entered = threading.Event()
+    release_resolver = threading.Event()
+    resolver_exited = threading.Event()
+    connect_calls: list[dict[str, object]] = []
+    result: list[BaseException | None] = []
+    original_connect = paramiko.SSHClient.connect
+
+    def blocked_getaddrinfo(*args, **kwargs):
+        resolver_entered.set()
+        try:
+            release_resolver.wait()
+            raise socket.timeout("released resolver")
+        finally:
+            resolver_exited.set()
+
+    def recording_connect(client, *args, **kwargs):
+        connect_calls.append(kwargs)
+        return original_connect(client, *args, **kwargs)
+
+    def execute() -> None:
+        try:
+            transport.execute("printf ok")
+        except BaseException as exc:
+            result.append(exc)
+        else:
+            result.append(None)
+
+    monkeypatch.setattr(socket, "getaddrinfo", blocked_getaddrinfo)
+    monkeypatch.setattr(paramiko.SSHClient, "connect", recording_connect)
+    worker = threading.Thread(target=execute, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    assert resolver_entered.wait(0.5)
+    worker.join(0.10)
+    finished_within_budget = not worker.is_alive()
+    elapsed = time.monotonic() - started
+    calls_at_deadline = list(connect_calls)
+
+    release_resolver.set()
+    assert resolver_exited.wait(1)
+    worker.join(1)
+
+    assert finished_within_budget
+    assert elapsed < 0.10
+    assert len(result) == 1
+    assert isinstance(result[0], CommandTimeoutError)
+    assert calls_at_deadline == []
+    assert connect_calls == []
+
+
+def test_paramiko_closes_socket_when_tcp_connect_returns_after_deadline(monkeypatch) -> None:
+    class DelayedSocket:
+        def __init__(self, *args) -> None:
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def connect(self, address) -> None:
+            time.sleep(0.05)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeSSHClient:
+        def __init__(self) -> None:
+            self.connect_called = False
+            self.closed = False
+
+        def load_system_host_keys(self) -> None:
+            pass
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            pass
+
+        def connect(self, **kwargs) -> None:
+            self.connect_called = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = FakeSSHClient()
+    connection = DelayedSocket()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(socket, "socket", lambda *args: connection)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.03)
+    transport = ParamikoTransport(
+        {**SERVER, "host": "192.0.2.10"},
+        SSHCredential(mode="password", password="secret"),
+    )
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    assert connection.closed is True
+    assert client.connect_called is False
+    assert client.closed is True
+
+
+def test_paramiko_handshake_obeys_total_deadline(monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self, *args) -> None:
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def connect(self, address) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    class DelayedSSHClient:
+        def __init__(self) -> None:
+            self.connect_exited = threading.Event()
+            self.late_closed = threading.Event()
+            self.close_count = 0
+            self.exec_called = False
+
+        def load_system_host_keys(self) -> None:
+            pass
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            pass
+
+        def connect(self, **kwargs) -> None:
+            try:
+                time.sleep(0.12)
+            finally:
+                self.connect_exited.set()
+
+        def exec_command(self, *args, **kwargs):
+            self.exec_called = True
+            raise AssertionError("expired client must not execute a command")
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.connect_exited.is_set():
+                self.late_closed.set()
+
+    client = DelayedSSHClient()
+    connection = FakeSocket()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(socket, "socket", lambda *args: connection)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    transport = ParamikoTransport(
+        {**SERVER, "host": "192.0.2.10"},
+        SSHCredential(mode="password", password="secret"),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.10
+    assert client.connect_exited.wait(1)
+    assert client.late_closed.wait(1)
+    assert client.close_count >= 1
+    assert connection.closed is True
+    assert client.exec_called is False
+
+
+def test_paramiko_abandons_nonreturning_handshake_without_late_success(monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self, *args) -> None:
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def connect(self, address) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    class BlockingSSHClient:
+        def __init__(self) -> None:
+            self.connect_entered = threading.Event()
+            self.release_connect = threading.Event()
+            self.connect_exited = threading.Event()
+            self.late_closed = threading.Event()
+            self.close_count = 0
+            self.exec_called = False
+
+        def load_system_host_keys(self) -> None:
+            pass
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            pass
+
+        def connect(self, **kwargs) -> None:
+            self.connect_entered.set()
+            try:
+                self.release_connect.wait()
+            finally:
+                self.connect_exited.set()
+
+        def exec_command(self, *args, **kwargs):
+            self.exec_called = True
+            raise AssertionError("abandoned client must not execute a command")
+
+        def close(self) -> None:
+            self.close_count += 1
+            if self.connect_exited.is_set():
+                self.late_closed.set()
+
+    client = BlockingSSHClient()
+    connection = FakeSocket()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(socket, "socket", lambda *args: connection)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    transport = ParamikoTransport(
+        {**SERVER, "host": "192.0.2.10"},
+        SSHCredential(mode="password", password="secret"),
+    )
+    result: list[BaseException | None] = []
+
+    def execute() -> None:
+        try:
+            transport.execute("printf ok")
+        except BaseException as exc:
+            result.append(exc)
+        else:
+            result.append(None)
+
+    worker = threading.Thread(target=execute, daemon=True)
+    started = time.monotonic()
+    worker.start()
+    assert client.connect_entered.wait(0.5)
+    worker.join(0.10)
+    finished_within_budget = not worker.is_alive()
+    elapsed = time.monotonic() - started
+
+    client.release_connect.set()
+    assert client.connect_exited.wait(1)
+    assert client.late_closed.wait(1)
+    worker.join(1)
+
+    assert finished_within_budget
+    assert elapsed < 0.10
+    assert len(result) == 1
+    assert isinstance(result[0], CommandTimeoutError)
+    assert client.close_count >= 1
+    assert connection.closed is True
+    assert client.exec_called is False
+
+
 def test_paramiko_maps_connection_socket_timeout_to_typed_error(monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self, *args) -> None:
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def connect(self, address) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
     class TimeoutSSHClient:
         def __init__(self) -> None:
             self.closed = False
@@ -540,13 +864,23 @@ def test_paramiko_maps_connection_socket_timeout_to_typed_error(monkeypatch) -> 
         SSHClient=lambda: client,
         RejectPolicy=lambda: object(),
     )
+    connection = FakeSocket()
     monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 22))
+        ],
+    )
+    monkeypatch.setattr(socket, "socket", lambda *args: connection)
     transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
 
     with pytest.raises(CommandTimeoutError):
         transport.execute("printf ok")
 
     assert client.closed is True
+    assert connection.closed is True
 
 
 def test_paramiko_connect_receives_remaining_total_budget(monkeypatch) -> None:
@@ -568,11 +902,42 @@ def test_paramiko_connect_receives_remaining_total_budget(monkeypatch) -> None:
             self.closed = True
 
     client = FakeSSHClient()
+    sockets = []
+
+    class FakeSocket:
+        def __init__(self, family, socktype, protocol=0) -> None:
+            self.family = family
+            self.socktype = socktype
+            self.protocol = protocol
+            self.timeouts: list[float] = []
+            self.closed = False
+            sockets.append(self)
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeouts.append(timeout)
+
+        def connect(self, address) -> None:
+            if len(sockets) == 1:
+                time.sleep(0.02)
+                raise ConnectionRefusedError(10061, "first address refused")
+
+        def close(self) -> None:
+            self.closed = True
+
     fake_paramiko = SimpleNamespace(
         SSHClient=lambda: client,
         RejectPolicy=lambda: object(),
     )
     monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 22, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 22)),
+        ],
+    )
+    monkeypatch.setattr(socket, "socket", FakeSocket)
     transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
     timeout_seconds = 0.25
 
@@ -580,9 +945,80 @@ def test_paramiko_connect_receives_remaining_total_budget(monkeypatch) -> None:
 
     assert connected is client
     assert client.connect_kwargs is not None
+    assert client.connect_kwargs["hostname"] == SERVER["host"]
+    assert client.connect_kwargs["sock"] is sockets[1]
     assert 0 < client.connect_kwargs["timeout"] <= timeout_seconds
     assert client.connect_kwargs["auth_timeout"] == client.connect_kwargs["timeout"]
     assert client.connect_kwargs["banner_timeout"] == client.connect_kwargs["timeout"]
+    assert sockets[0].closed is True
+    assert sockets[1].closed is False
+    assert sockets[1].timeouts[0] < sockets[0].timeouts[0]
+
+
+@pytest.mark.parametrize(
+    ("host", "family", "address"),
+    [
+        ("192.0.2.10", socket.AF_INET, ("192.0.2.10", 22)),
+        ("2001:db8::1", socket.AF_INET6, ("2001:db8::1", 22, 0, 0)),
+    ],
+)
+def test_paramiko_literal_ip_skips_dns_and_preserves_host_key_name(
+    monkeypatch,
+    host: str,
+    family: int,
+    address: tuple,
+) -> None:
+    class FakeSocket:
+        def __init__(self, actual_family, socktype, protocol=0) -> None:
+            self.family = actual_family
+            self.connected_address = None
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def connect(self, actual_address) -> None:
+            self.connected_address = actual_address
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeSSHClient:
+        def load_system_host_keys(self) -> None:
+            pass
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            pass
+
+        def connect(self, **kwargs) -> None:
+            self.connect_kwargs = kwargs
+
+        def close(self) -> None:
+            pass
+
+    client = FakeSSHClient()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: pytest.fail("literal IP must not invoke DNS"),
+    )
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    transport = ParamikoTransport(
+        {**SERVER, "host": host},
+        SSHCredential(mode="password", password="secret"),
+    )
+
+    connected = transport._connect(time.monotonic() + 0.25)
+
+    assert connected is client
+    assert client.connect_kwargs["hostname"] == host
+    assert client.connect_kwargs["sock"].family == family
+    assert client.connect_kwargs["sock"].connected_address == address
 
 
 if __name__ == "__main__":
