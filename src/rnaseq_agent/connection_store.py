@@ -47,7 +47,7 @@ _PASSWORD_KEY = "password_protected"
 # 大模型接入（OpenAI 兼容端点）同样是用户级共享配置：存在同一个文件的
 # ``llm`` 子对象里，API Key 与密码用同一套 DPAPI 加密。
 LLM_BLOCK_KEY = "llm"
-LLM_FIELDS = ("enabled", "provider", "api_base", "model")
+LLM_FIELDS = ("enabled", "provider", "api_base", "model", "tool_mode")
 _LLM_API_KEY_KEY = "api_key_protected"
 
 
@@ -211,6 +211,14 @@ def load_llm(*, store_dir: Path | None = None) -> dict[str, Any]:
     if not isinstance(block, dict):
         return {}
     result = {key: block[key] for key in LLM_FIELDS if block.get(key) is not None}
+    from .agent_tools import TOOL_MODE_DISABLED, normalize_tool_mode
+
+    try:
+        result["tool_mode"] = normalize_tool_mode(block.get("tool_mode"))
+    except ValueError:
+        # A manually corrupted value must fail closed instead of broadening
+        # privileges through the compatibility default.
+        result["tool_mode"] = TOOL_MODE_DISABLED
     token = block.get(_LLM_API_KEY_KEY)
     if isinstance(token, str) and token:
         secret = _unprotect(token)
@@ -226,6 +234,14 @@ def save_llm(values: dict[str, Any], *, store_dir: Path | None = None) -> dict[s
     encrypted, omitting the key keeps whatever was stored, and an explicit
     empty string clears it.
     """
+    from .agent_tools import normalize_tool_mode
+
+    normalized_values = dict(values)
+    if "tool_mode" in normalized_values:
+        normalized_values["tool_mode"] = normalize_tool_mode(
+            normalized_values.get("tool_mode")
+        )
+
     directory = _resolve_store_dir(store_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONNECTION_FILE_NAME
@@ -235,11 +251,11 @@ def save_llm(values: dict[str, Any], *, store_dir: Path | None = None) -> dict[s
     if not isinstance(block, dict):
         block = {}
     for key in LLM_FIELDS:
-        if key in values and values[key] is not None:
-            block[key] = values[key]
+        if key in normalized_values and normalized_values[key] is not None:
+            block[key] = normalized_values[key]
 
-    if "api_key" in values:
-        new_key = str(values.get("api_key") or "")
+    if "api_key" in normalized_values:
+        new_key = str(normalized_values.get("api_key") or "")
         if new_key:
             block[_LLM_API_KEY_KEY] = _protect(new_key)
         else:

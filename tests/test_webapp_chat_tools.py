@@ -217,6 +217,28 @@ def _session_json_exists(tmp_path: Path, project_id: str) -> bool:
     return (tmp_path / project_id / "session.json").is_file()
 
 
+class TestExecutorPermissionDefense:
+    def test_direct_executor_call_still_obeys_the_live_kill_switch(
+        self, client, tmp_path
+    ) -> None:
+        from rnaseq_agent.agent_tools import TOOL_MODE_DISABLED
+        from rnaseq_agent.connection_store import save_llm
+
+        save_llm({"tool_mode": TOOL_MODE_DISABLED})
+        project_dir = tmp_path / "bypass"
+        project_dir.mkdir()
+
+        result = client.app.state.llm_tool_executor(
+            "set_run_resources", {"threads": 16}, project_dir, True
+        )
+
+        assert result["ok"] is False
+        assert result["blocked"] is True
+        assert result["tool_mode"] == TOOL_MODE_DISABLED
+        assert not (project_dir / "project.json").exists()
+        assert not (project_dir / "session.json").exists()
+
+
 class TestModelWritesConfigViaTool:
     """模型调 write_project_config：确认前不写，批准后恰好写一次。"""
 
@@ -1284,7 +1306,7 @@ class TestDiffexpAndCmsTools:
         assert any("30" in reason for reason in tool_result["gate_warnings"])
 
 
-class TestReadOnlyStatusTools:
+class TestReadAndDerivedArtifactTools:
     def test_browse_remote_samples_runs_without_a_card_and_returns_pairs(
         self, client, tmp_path, monkeypatch
     ) -> None:
@@ -1332,7 +1354,9 @@ class TestReadOnlyStatusTools:
         assert tool_result["ok"] is True
         assert tool_result["samples"][0]["sample_id"] == "S1"
 
-    def test_refresh_status_runs_without_a_card(self, client, tmp_path, monkeypatch) -> None:
+    def test_refresh_status_requires_a_card_before_it_updates_session_state(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
         token = _token(client)
         _create_project(client, token, "ro_a")
         _seed_project(tmp_path, monkeypatch, "ro_a")
@@ -1346,10 +1370,20 @@ class TestReadOnlyStatusTools:
         monkeypatch.setattr(cg, "_stream_chat_completion", fake)
 
         events = _stream(client, token, "跑到哪了", project="ro_a")
-        assert _confirm_event(events) is None, events
+        card = _confirm_event(events)
+        assert card is not None, events
+        events = _resume(
+            client,
+            token,
+            project="ro_a",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
         assert fake.seen_messages[-1][-1]["role"] == "tool", fake.seen_messages[-1]
 
-    def test_get_project_report_runs_without_a_card(self, client, tmp_path, monkeypatch) -> None:
+    def test_get_project_report_requires_a_card_before_it_writes_the_report(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
         token = _token(client)
         _create_project(client, token, "ro_b")
         _seed_project(tmp_path, monkeypatch, "ro_b")
@@ -1363,7 +1397,15 @@ class TestReadOnlyStatusTools:
         monkeypatch.setattr(cg, "_stream_chat_completion", fake)
 
         events = _stream(client, token, "给我看看报告", project="ro_b")
-        assert _confirm_event(events) is None, events
+        card = _confirm_event(events)
+        assert card is not None, events
+        events = _resume(
+            client,
+            token,
+            project="ro_b",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
         tool_content = fake.seen_messages[-1][-1]["content"]
         assert "report" in tool_content.lower(), tool_content
 

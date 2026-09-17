@@ -74,6 +74,7 @@ except ImportError:  # pragma: no cover - exercised only without langgraph
 
 from .agent_tools import (
     CONNECTION_FIELDS,
+    TOOL_MODE_DISABLED,
     POLICY_NEVER,
     POLICY_SOLO,
     ToolCall,
@@ -84,7 +85,10 @@ from .agent_tools import (
     parse_message_tool_calls,
     risk_of,
     split_calls_for_round,
+    normalize_tool_mode,
+    tool_allowed,
     tool_labels,
+    tool_mode_block,
     tool_schemas,
     validate_call,
 )
@@ -108,6 +112,11 @@ ConfigReader = Callable[[Path], dict[str, Any]]
 #: server-side value that an approval must bind to.  The web implementation
 #: includes both project.json and the user-level shared connection store.
 ApprovalContextReader = Callable[[Path], dict[str, Any]]
+
+#: Read the user-level tool permission at every security boundary. The value
+#: must not be captured when the graph is built because settings can tighten
+#: while an approval card is waiting in a durable checkpoint.
+ToolModeReader = Callable[[], str]
 
 #: Increment whenever confirmation grouping or interpretation changes.  A card
 #: issued under an older policy version must be re-issued instead of being
@@ -215,7 +224,12 @@ def _stream_chat_completion(
         "temperature": 0.2,
         "stream": True,
     }
-    tools = tool_schemas()
+    llm_block = llm_config.get("llm", llm_config)
+    try:
+        mode = normalize_tool_mode(llm_block.get("tool_mode"))
+    except (AttributeError, ValueError):
+        mode = TOOL_MODE_DISABLED
+    tools = tool_schemas(mode)
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -474,6 +488,7 @@ def build_chat_graph(
     approval_context_reader: ApprovalContextReader | None = None,
     clock: Callable[[], datetime] | None = None,
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS,
+    tool_mode_reader: ToolModeReader | None = None,
 ):
     """Compile the conversation graph.
 
@@ -486,6 +501,17 @@ def build_chat_graph(
 
     now = clock or (lambda: datetime.now(timezone.utc))
     ttl_seconds = max(1, int(approval_ttl_seconds))
+
+    def _live_tool_mode() -> str:
+        try:
+            raw = (
+                tool_mode_reader()
+                if tool_mode_reader is not None
+                else llm_config.get("llm", llm_config).get("tool_mode")
+            )
+            return normalize_tool_mode(raw)
+        except Exception:  # noqa: BLE001 - unreadable policy must fail closed
+            return TOOL_MODE_DISABLED
 
     def _current_config(state: ChatState) -> dict[str, Any]:
         """Read the project config for card rendering; never raises."""
@@ -585,7 +611,15 @@ def build_chat_graph(
         writer = get_stream_writer()
         raw_message: dict[str, Any] = {}
         streamed = False
-        for kind, payload in _stream_chat_completion(llm_config, messages, timeout=timeout):
+        runtime_llm_config = deepcopy(llm_config)
+        runtime_block = runtime_llm_config.setdefault("llm", {})
+        if not isinstance(runtime_block, dict):
+            runtime_block = {}
+            runtime_llm_config["llm"] = runtime_block
+        runtime_block["tool_mode"] = _live_tool_mode()
+        for kind, payload in _stream_chat_completion(
+            runtime_llm_config, messages, timeout=timeout
+        ):
             if kind == "delta":
                 streamed = True
                 try:
@@ -661,6 +695,7 @@ def build_chat_graph(
 
     def _split_head(
         state: ChatState,
+        mode: str,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         """Peel the first confirmation group off the deferred queue.
 
@@ -682,6 +717,10 @@ def build_chat_graph(
         rejected: list[dict[str, Any]] = []
         for call in head.calls:
             name = str(call.get("name") or "")
+            blocked = tool_mode_block(name, mode)
+            if blocked is not None:
+                rejected.append({**call, "_blocked": blocked})
+                continue
             problems = validate_call(name, call.get("arguments") or {})
             if problems:
                 rejected.append({**call, "_reason": "；".join(problems)})
@@ -715,15 +754,21 @@ def build_chat_graph(
             }
 
         # 参数校验先于确认：不合法的调用没有让人签字的必要。
-        valid, rest, rejected = _split_head(state)
+        mode = _live_tool_mode()
+        valid, rest, rejected = _split_head(state, mode)
 
         if rejected:
             messages = list(state.get("messages") or [])
             for item in rejected:
+                blocked = item.get("_blocked")
                 messages.append(
                     _tool_error_message(
                         str(item.get("call_id") or ""),
-                        {"ok": False, "error": str(item.get("_reason") or "")},
+                        (
+                            blocked
+                            if isinstance(blocked, dict)
+                            else {"ok": False, "error": str(item.get("_reason") or "")}
+                        ),
                     )
                 )
             if not valid:
@@ -790,6 +835,7 @@ def build_chat_graph(
             "thread_id": str(state.get("thread_id") or ""),
             "calls": bound_calls,
             "policy": policy,
+            "tool_mode": mode,
             "confirmation_policy_version": CONFIRMATION_POLICY_VERSION,
             **snapshot,
             "issued_at": _utc_iso(issued_at),
@@ -828,7 +874,7 @@ def build_chat_graph(
             "rejected": False,
         }
 
-    def _approval_context_error(state: ChatState) -> str:
+    def _approval_context_error(state: ChatState, live_mode: str | None = None) -> str:
         context = state.get("approval_context") or {}
         if not isinstance(context, dict) or not context.get("approval_id"):
             return "没有可用的持久化确认上下文，操作未执行。"
@@ -836,6 +882,9 @@ def build_chat_graph(
             return "确认上下文版本已变化，请重新发起操作。"
         if context.get("confirmation_policy_version") != CONFIRMATION_POLICY_VERSION:
             return "确认策略版本已变化，请重新发起操作。"
+        live_mode = live_mode or _live_tool_mode()
+        if str(context.get("tool_mode") or "") != live_mode:
+            return f"LLM 工具权限模式已变为 {live_mode}，旧确认卡不能继续执行。"
         if str(context.get("project_id") or "") != str(state.get("project_id") or ""):
             return "确认卡不属于当前项目，操作未执行。"
         if str(context.get("thread_id") or "") != str(state.get("thread_id") or ""):
@@ -880,6 +929,37 @@ def build_chat_graph(
             if str(fresh.get(key) or "") != str(context.get(key) or ""):
                 return "项目或共享连接配置已变化，请重新确认。"
         return ""
+
+    def _reject_for_mode(state: ChatState, mode: str) -> ChatState:
+        """Consume all queued calls with structured live-policy denials."""
+        messages = list(state.get("messages") or [])
+        calls = [
+            *list(state.get("pending_calls") or []),
+            *list(state.get("deferred_calls") or []),
+        ]
+        for call in calls:
+            name = str(call.get("name") or "")
+            payload = tool_mode_block(name, mode) or {
+                "ok": False,
+                "blocked": True,
+                "error_code": "llm_tool_mode_changed",
+                "tool_mode": mode,
+                "tool": name,
+                "error": f"LLM 工具权限模式已变化，{name} 未执行。",
+            }
+            messages.append(
+                _tool_error_message(str(call.get("call_id") or ""), payload)
+            )
+        return {
+            "messages": messages,
+            "pending_calls": [],
+            "deferred_calls": [],
+            "confirmed": False,
+            "rejected": True,
+            "via": "rejected",
+            "approval_context": {},
+            "confirmation_card": {},
+        }
 
     def _reject_approval(
         state: ChatState,
@@ -950,7 +1030,13 @@ def build_chat_graph(
                 note=note,
                 explicit_user_rejection=True,
             )
-        problem = _approval_context_error(state)
+        live_mode = _live_tool_mode()
+        if any(
+            not tool_allowed(str(call.get("name") or ""), live_mode)
+            for call in list(state.get("pending_calls") or [])
+        ):
+            return _reject_for_mode(state, live_mode)
+        problem = _approval_context_error(state, live_mode)
         if problem:
             return _reject_approval(state, error=problem, note=note)
         return {"confirmed": True, "rejected": False}
@@ -985,6 +1071,10 @@ def build_chat_graph(
         log = list(state.get("tool_log") or [])
         latest_reply = ""
 
+        live_mode = _live_tool_mode()
+        if any(not tool_allowed(str(call.get("name") or ""), live_mode) for call in calls):
+            return _reject_for_mode(state, live_mode)
+
         # Validate again immediately before the only side-effecting boundary.
         # This catches policy changes, argument/state tampering, expiry, and
         # project/shared-config drift that happened after the card was issued.
@@ -1002,7 +1092,7 @@ def build_chat_graph(
         if needs_approval:
             if not approved:
                 return _reject_approval(state, error="当前工具需要确认，但没有有效批准。")
-            problem = _approval_context_error(state)
+            problem = _approval_context_error(state, live_mode)
             if problem:
                 return _reject_approval(state, error=problem)
         elif state.get("approval_context"):

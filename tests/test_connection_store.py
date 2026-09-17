@@ -14,6 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from rnaseq_agent.agent_tools import (
+    TOOL_MODE_APPROVED_EXECUTE,
+    TOOL_MODE_DISABLED,
+    TOOL_MODE_READ_ONLY,
+)
 from rnaseq_agent.connection_store import (
     CONNECTION_FILE_NAME,
     apply_connection_to_config,
@@ -247,6 +252,55 @@ class TestLlmStore:
 
     def test_load_llm_missing_file_returns_empty(self, store_dir: Path) -> None:
         assert load_llm(store_dir=store_dir) == {}
+
+    def test_tool_mode_round_trips_with_the_user_level_llm_settings(self, store_dir: Path) -> None:
+        save_llm({"enabled": True, "tool_mode": TOOL_MODE_READ_ONLY}, store_dir=store_dir)
+
+        assert load_llm(store_dir=store_dir)["tool_mode"] == TOOL_MODE_READ_ONLY
+
+    def test_existing_settings_default_to_full_approved_execution(self, store_dir: Path) -> None:
+        save_llm({"enabled": True, "model": "m"}, store_dir=store_dir)
+
+        assert load_llm(store_dir=store_dir)["tool_mode"] == TOOL_MODE_APPROVED_EXECUTE
+
+    def test_invalid_tool_mode_is_rejected_instead_of_silently_broadening_access(
+        self, store_dir: Path
+    ) -> None:
+        with pytest.raises(ValueError, match="tool_mode"):
+            save_llm({"tool_mode": "unlimited"}, store_dir=store_dir)
+
+        assert load_llm(store_dir=store_dir) == {}
+
+    @pytest.mark.parametrize("value", [False, 0, [], {}])
+    def test_non_string_tool_modes_cannot_fall_back_to_full_access(
+        self, store_dir: Path, value: object
+    ) -> None:
+        with pytest.raises(ValueError, match="tool_mode"):
+            save_llm({"tool_mode": value}, store_dir=store_dir)
+
+        assert load_llm(store_dir=store_dir) == {}
+
+    @pytest.mark.parametrize("value", ["unlimited", False, 0, [], {}])
+    def test_corrupt_persisted_tool_mode_loads_fail_closed(
+        self, store_dir: Path, value: object
+    ) -> None:
+        store_dir.mkdir(parents=True)
+        (store_dir / CONNECTION_FILE_NAME).write_text(
+            json.dumps({"llm": {"enabled": True, "tool_mode": value}}),
+            encoding="utf-8",
+        )
+
+        assert load_llm(store_dir=store_dir)["tool_mode"] == TOOL_MODE_DISABLED
+
+    def test_disabled_tool_mode_coexists_with_the_api_key(self, store_dir: Path) -> None:
+        save_llm(
+            {"api_key": "sk-secret", "tool_mode": TOOL_MODE_DISABLED},
+            store_dir=store_dir,
+        )
+
+        loaded = load_llm(store_dir=store_dir)
+        assert loaded["api_key"] == "sk-secret"
+        assert loaded["tool_mode"] == TOOL_MODE_DISABLED
 
 
 class TestApplyLlmToConfig:

@@ -13,11 +13,13 @@
 
 ```text
 LLM tool_call
-  -> schema 与语义校验，并规范化为实际执行参数
+  -> 用户级 live tool_mode 过滤 schema
+  -> guardrail 重新读取 tool_mode，再做语义校验与参数规范化
   -> confirmation_policy 分组
   -> 人工确认（如需要）
+  -> resume / execute 重新读取 tool_mode
   -> durable approval context 与一次性 claim 校验
-  -> _run_tool 二次权限检查
+  -> _run_tool 再次读取 tool_mode 并二次检查
   -> ProjectSession / 确定性服务
   -> tool 结果回灌给 LLM
 ```
@@ -26,12 +28,38 @@ LLM tool_call
 一份风险判断。`_run_tool` 是模型与真实系统之间的唯一执行桥，新增工具必须在这里
 映射到已有的确定性实现。
 
+## 全局工具权限模式
+
+用户级 LLM 设置包含一个全局 `tool_mode`。它控制的是**模型与规则 fallback 代表
+模型发起的工具动作**，不改变结构化工作台按钮、项目状态机或 QC 检查点的权限。
+设置页是唯一修改入口，`TOOL_SPECS` 不提供修改该字段的工具，因此模型不能自行
+抬高权限。
+
+| 模式 | 向模型暴露的工具 | 运行时行为 |
+|---|---|---|
+| `disabled` | 无 | 所有模型工具调用和规则工具意图返回结构化 `blocked` |
+| `read_only` | 仅 `risk=read` | 只读可自动执行，写入与执行被拒绝 |
+| `approved_write` | `read` + `write` | 只读自动执行；写入仍需人工确认；执行被拒绝 |
+| `approved_execute` | 全部已登记工具 | 只读自动执行；写入与执行仍按原策略确认 |
+
+旧安装没有 `tool_mode` 字段时默认为 `approved_execute`，保持升级兼容。只有字段真正
+缺失（`None`）才使用该默认；未知字符串、布尔、数字、数组或对象均视为配置错误，
+保存 API 拒绝，运行时读取异常则按 `disabled` fail closed。未知工具沿用最高风险
+`execute`，除 `approved_execute` 外全部模式先在权限层拒绝；即使处于
+`approved_execute`，后续白名单和参数校验仍会拒绝未登记名称。
+
+模式在 provider schema、guardrail、confirmation/resume、execute 和 `_run_tool`
+五处读取同一用户级 live 值。确认卡同时绑定发卡时的模式。等待确认时切到更严格
+模式后，resume 会消费旧卡并拒绝；即使权限在 confirmation 与 execute 之间改变，
+execute 也会在创建一次性 claim 和调用 executor 前停止。直接调用 `_run_tool` 同样
+不能绕过开关。
+
 ## 三级策略
 
 | 策略 | 适用范围 | 行为 |
 |---|---|---|
-| `never` | 读取项目、只读扫描、读取状态与报告 | 参数合法后自动执行 |
-| `batch` | 样本、参考、分析开关、资源和模型参数等项目配置 | 同一模型轮次合并成一张确认卡 |
+| `never` | 读取已有项目配置、只读扫描远程目录 | 参数合法后自动执行 |
+| `batch` | 样本、参考、分析开关、资源、刷新状态和生成报告等会落盘的动作 | 同一模型轮次合并成一张确认卡 |
 | `solo` | 计划、冻结契约、运行，以及服务器连接目标 | 每个动作单独确认 |
 
 连接配置虽然通常只是写配置，但它决定命令发往哪台服务器，因此固定为 `solo`。
@@ -43,14 +71,15 @@ QC 决策不属于普通 LLM 工具。它只能通过运行图已经持久化的
 在没有真实 QC checkpoint 时自行构造“通过/拒绝”决定，或把旧运行的批准重放到新
 运行。`record_qc_decision` 不得重新加入 `TOOL_SPECS` 或 `_run_tool`。
 
-`never` 表示不需要人工签字，不等于代码可以做任意副作用。允许的副作用仅限于
-刷新本地运行状态或生成确定性的派生报告。它不能提交作业、修改科学参数、改变
-连接目标或写入用户决定。
+`never` 表示不需要人工签字，也表示实现必须没有持久化副作用。当前只有读取已有
+项目配置和只读 SSH 目录扫描属于这一类。`refresh_project_status` 会保存会话状态，
+`get_project_report` 会生成报告文件，两者都属于 `write`，不能在 `read_only` 下运行。
 
-没有 LangGraph checkpointer/resume 能力的规则 fallback 只能自动执行只读动作。
-无论是非流式 `/api/chat`、LLM 未配置、模型请求失败还是图构建失败，只要规则意图
-会写配置、生成计划、冻结契约或运行分析，就返回 `confirmation_required`，不得退回
-旧规则执行器直接写盘，也不得生成无法恢复的伪确认卡。
+没有 LangGraph checkpointer/resume 能力的规则 fallback 同样先读取 `tool_mode`。
+模式允许的只读动作可以自动执行；模式不允许的动作返回结构化 `blocked`。模式允许
+但需要确认的写入或执行返回 `confirmation_required`。无论是非流式 `/api/chat`、
+LLM 未配置、模型请求失败还是图构建失败，都不得退回旧规则执行器直接写盘，也不得
+生成无法恢复的伪确认卡。
 
 ## 批准语义
 
@@ -63,7 +92,7 @@ QC 决策不属于普通 LLM 工具。它只能通过运行图已经持久化的
 持久化失败、旧 checkpoint 缺少绑定信息或显式拒绝都终止为 `FAIL`，不能继续下游。
 普通工具确认卡也采用同一原则：guardrail 在 durable checkpoint 中保存
 `approval_id`、project、thread、tool_call ids、工具名、规范化参数摘要、项目/共享
-连接 revision 与 hash、contract/run id、policy version 和有效期。浏览器恢复时必须
+连接 revision 与 hash、contract/run id、policy version、tool mode 和有效期。浏览器恢复时必须
 回传实际看到的 `approval_id`；Web 层和图层都会校验。旧卡重放、跨项目/线程 resume、
 等待期间参数、连接、契约或 run 变化都 fail closed。项目或绑定文件不可读时不展示
 可批准卡片，执行前也会再次拒绝。
@@ -137,6 +166,8 @@ ChangeSet；运行时若中途失败，前面已完成的变更不会自动回�
 9. 对科学工具添加适用性门禁测试，不能只测配置字段落盘。
 10. 为副作用工具绑定 durable approval context，并在 executor 前创建一次性 claim。
 11. 日志记录工具名、风险、参数摘要和结果，不记录密码、API Key 或私钥。
+12. 在四种 `tool_mode` 下测试 schema 暴露、guardrail 和 executor；等待确认期间
+    收紧权限必须使旧卡失效。
 
 ## 下一轮权限加固门禁
 
@@ -151,7 +182,6 @@ ChangeSet；运行时若中途失败，前面已完成的变更不会自动回�
 - 同一 project/thread 的重复 resume 已串行化并有 durable claim 兜底。下一步增加
   两个 thread 同改项目、两个项目同改共享连接的并发测试；共享写入采用 revision/CAS
   或项目级写锁，不能依赖最后写入者覆盖。
-- 提供禁用全部 LLM 写入/执行工具的 kill switch，并纳入发布测试。
 - 当前威胁模型仅覆盖单用户 localhost 与随机 session token。若开放远程或多用户，
   必须先加入身份、角色、审批人绑定和可追溯审计主体。
 

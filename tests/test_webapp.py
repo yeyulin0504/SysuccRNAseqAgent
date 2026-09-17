@@ -138,6 +138,39 @@ class TestWebApp:
         assert config_path.read_text(encoding="utf-8") == config_before
         assert session_path.read_text(encoding="utf-8") == session_before
 
+    @pytest.mark.parametrize(
+        ("mode", "message", "expected_via"),
+        [
+            ("disabled", "查看当前状态", "blocked"),
+            ("read_only", "查看当前状态", "tool"),
+            ("read_only", "把线程改成 24", "blocked"),
+            ("approved_write", "把线程改成 24", "confirmation_required"),
+            ("approved_write", "生成执行计划", "blocked"),
+            ("approved_execute", "生成执行计划", "confirmation_required"),
+        ],
+    )
+    def test_rule_fallback_obeys_the_llm_tool_mode_without_writing(
+        self, client, tmp_path: Path, mode: str, message: str, expected_via: str
+    ) -> None:
+        from rnaseq_agent.connection_store import save_llm
+
+        token = _token(client)
+        _new_project(client, token)
+        save_llm({"tool_mode": mode})
+        config_path = tmp_path / "proj" / "project.json"
+        session_path = tmp_path / "proj" / "session.json"
+        before = (config_path.read_bytes(), session_path.read_bytes())
+
+        result = client.post(
+            "/api/chat", json={"message": message}, headers=_headers(token)
+        ).json()
+
+        assert result.get("via", "tool") == expected_via
+        if expected_via == "blocked":
+            assert result["blocked"] is True
+            assert result["tool_mode"] == mode
+        assert (config_path.read_bytes(), session_path.read_bytes()) == before
+
     def test_chat_unrecognized_returns_hint(self, client, tmp_path: Path) -> None:
         token = _token(client)
         _new_project(client, token)
@@ -253,6 +286,67 @@ class TestWebApp:
             headers=_headers(token),
         ).json()
         assert resp["config"]["llm"]["api_key_set"] is False
+
+    def test_config_endpoint_persists_and_returns_the_llm_tool_mode(self, client) -> None:
+        from rnaseq_agent.agent_tools import TOOL_MODE_READ_ONLY
+        from rnaseq_agent.connection_store import load_llm
+
+        token = _token(client)
+        _new_project(client, token)
+        saved = client.post(
+            "/api/config",
+            json={"llm": {"tool_mode": TOOL_MODE_READ_ONLY}},
+            headers=_headers(token),
+        ).json()
+
+        assert saved["config"]["llm"]["tool_mode"] == TOOL_MODE_READ_ONLY
+        assert load_llm()["tool_mode"] == TOOL_MODE_READ_ONLY
+        assert client.get("/api/config", headers=_headers(token)).json()["config"]["llm"][
+            "tool_mode"
+        ] == TOOL_MODE_READ_ONLY
+
+    def test_tool_mode_can_be_changed_as_a_global_setting_without_creating_a_project(
+        self, client, tmp_path: Path
+    ) -> None:
+        from rnaseq_agent.agent_tools import TOOL_MODE_DISABLED
+
+        token = _token(client)
+        result = client.post(
+            "/api/config",
+            json={"llm": {"tool_mode": TOOL_MODE_DISABLED}},
+            headers=_headers(token),
+        ).json()
+
+        assert "error" not in result
+        assert result["config"]["llm"]["tool_mode"] == TOOL_MODE_DISABLED
+        assert not (tmp_path / "proj" / "project.json").exists()
+
+    @pytest.mark.parametrize("invalid", ["unlimited", False, 0, [], {}])
+    def test_config_endpoint_rejects_an_invalid_llm_tool_mode(
+        self, client, invalid: object
+    ) -> None:
+        from rnaseq_agent.agent_tools import TOOL_MODE_APPROVED_EXECUTE
+        from rnaseq_agent.connection_store import load_llm, save_llm
+
+        token = _token(client)
+        _new_project(client, token)
+        save_llm({"tool_mode": TOOL_MODE_APPROVED_EXECUTE})
+        result = client.post(
+            "/api/config",
+            json={"llm": {"tool_mode": invalid}},
+            headers=_headers(token),
+        ).json()
+
+        assert "error" in result
+        assert load_llm()["tool_mode"] == TOOL_MODE_APPROVED_EXECUTE
+
+    def test_settings_page_exposes_all_four_llm_tool_modes(self, client) -> None:
+        page = client.get("/settings").text
+
+        assert 'id="llmToolMode"' in page
+        for mode in ("disabled", "read_only", "approved_write", "approved_execute"):
+            assert f'value="{mode}"' in page
+        assert '<option value="approved_execute" selected>' in page
 
     def test_demo_config_prefills_real_connections(self, client) -> None:
         token = _token(client)

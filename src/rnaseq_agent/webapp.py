@@ -134,6 +134,16 @@ def _shared_llm_config() -> dict[str, Any] | None:
     return {"llm": shared}
 
 
+def _live_llm_tool_mode() -> str:
+    """Read the current user-level kill switch, failing closed if corrupted."""
+    from .agent_tools import TOOL_MODE_DISABLED, normalize_tool_mode
+
+    try:
+        return normalize_tool_mode(load_llm().get("tool_mode"))
+    except (AttributeError, ValueError):
+        return TOOL_MODE_DISABLED
+
+
 def _connection_as_config() -> dict[str, Any] | None:
     """Wrap the shared connection as a minimal ``{"server": ...}`` config.
 
@@ -231,6 +241,7 @@ def _editable_config(config: dict[str, Any]) -> dict[str, Any]:
             "provider": llm.get("provider", ""),
             "api_base": llm.get("api_base", ""),
             "model": llm.get("model", ""),
+            "tool_mode": _live_llm_tool_mode(),
             "api_key_set": bool(llm.get("api_key")),
         },
         "container": {
@@ -1034,6 +1045,7 @@ def create_app(
         session = _session_for(_legacy_dir_for(request, payload))
         patch: dict[str, Any] = {}
         note_parts: list[str] = []
+        global_llm_saved = False
 
         server = payload.get("server")
         if isinstance(server, dict):
@@ -1079,24 +1091,54 @@ def create_app(
         llm = payload.get("llm")
         if isinstance(llm, dict):
             llm_patch: dict[str, Any] = {}
-            for key in ("provider", "api_base", "model", "enabled"):
+            for key in ("provider", "api_base", "model", "enabled", "tool_mode"):
                 if key in llm and llm[key] is not None:
                     llm_patch[key] = llm[key]
+            if "tool_mode" in llm_patch:
+                from .agent_tools import normalize_tool_mode
+
+                try:
+                    llm_patch["tool_mode"] = normalize_tool_mode(
+                        llm_patch["tool_mode"]
+                    )
+                except ValueError as exc:
+                    return {"error": str(exc)}
             # api_key is write-only: an empty string means "keep it".
             if llm.get("api_key"):
                 llm_patch["api_key"] = llm["api_key"]
             if "api_key_clear" in llm and llm["api_key_clear"]:
                 llm_patch["api_key"] = ""
             if llm_patch:
-                patch["llm"] = llm_patch
+                # tool_mode is a user-level emergency control, not project
+                # provenance. Keeping it out of project.json lets the user
+                # tighten permissions even when no project exists or the
+                # current project state rejects ordinary edits.
+                project_llm_patch = {
+                    key: value for key, value in llm_patch.items() if key != "tool_mode"
+                }
+                if project_llm_patch:
+                    patch["llm"] = project_llm_patch
                 note_parts.append(
                     "大模型接入：" + (f"启用 {llm_patch.get('model', '')}" if llm_patch.get("enabled") else "更新")
                 )
                 # 大模型接入同样是用户级、跨项目共用的：同步写入全局配置并
                 # 持久化（API Key 经 DPAPI 加密），这样任何项目、重启后都生效。
                 save_llm(
-                    {k: v for k, v in llm_patch.items() if k in ("enabled", "provider", "api_base", "model", "api_key")}
+                    {
+                        k: v
+                        for k, v in llm_patch.items()
+                        if k
+                        in (
+                            "enabled",
+                            "provider",
+                            "api_base",
+                            "model",
+                            "api_key",
+                            "tool_mode",
+                        )
+                    }
                 )
+                global_llm_saved = True
 
         container = payload.get("container")
         if isinstance(container, dict):
@@ -1107,6 +1149,15 @@ def create_app(
             patch["container"] = container_patch
             note_parts.append("下游容器配置")
 
+        if not patch and global_llm_saved:
+            editable_source = session.config or {
+                "server": load_connection(),
+                "llm": load_llm(),
+            }
+            return {
+                "state": session.state,
+                "config": _editable_config(editable_source),
+            }
         if not patch:
             return {"error": "没有可保存的字段。"}
         if session.config is not None:
@@ -1544,6 +1595,10 @@ def create_app(
                 # 卡片还要绑定 project.json + 用户级共享连接的不可变指纹；
                 # 返回值只含摘要和公开标识，绝不把密码/API key 放进图状态。
                 approval_context_reader=_read_approval_context,
+                # This callback deliberately reads the user store at every
+                # graph boundary. A card parked in a durable checkpoint cannot
+                # retain broader authority after the user tightens the mode.
+                tool_mode_reader=_live_llm_tool_mode,
             )
             if resume is not None:
                 from langgraph.types import Command
@@ -1836,7 +1891,7 @@ def create_app(
         - ``read_project_state``  → 只读 ``ProjectSession``；
         - ``browse_remote_samples`` → 复用 ``_scan_remote_samples``（只读 SSH）；
         - ``refresh_project_status`` / ``get_project_report`` → 复用
-          ``session.refresh_status`` / ``session.report``（只读）；
+          ``session.refresh_status`` / ``session.report``（会更新会话/生成文件）；
         - ``write_project_config``  → 复用 ``_write_project_session``（与按钮同一条链路）；
         - ``edit_samples`` / ``edit_reference`` / ``edit_connection``
           / ``configure_pipeline`` / ``set_run_resources`` / ``set_diffexp_reference``
@@ -1852,7 +1907,12 @@ def create_app(
             RISK_READ,
             normalize_write_arguments,
             risk_of,
+            tool_mode_block,
         )
+
+        blocked = tool_mode_block(name, _live_llm_tool_mode())
+        if blocked is not None:
+            return blocked
 
         session = _session_for(project_dir)
         # Workspace 里项目目录就是 root / project_id，所以目录名即 project_id。
@@ -2331,8 +2391,45 @@ def create_app(
 
     def _rule_intent_requires_confirmation(intent: Any) -> bool:
         """Only genuinely read-only rule intents may run without LangGraph."""
+        from .agent_tools import requires_confirmation
+
+        return requires_confirmation(_rule_intent_tool_name(intent))
+
+    def _rule_intent_tool_name(intent: Any) -> str:
+        """Map deterministic fallback actions onto the same tool policy."""
+        return {
+            "browse_samples": "browse_remote_samples",
+            "status": "read_project_state",
+            # Rule summary only formats session.summary_lines(); unlike the
+            # model's get_project_report tool it does not generate a file.
+            "summary": "read_project_state",
+            "deg_status": "read_project_state",
+            "help": "read_project_state",
+            "new": "write_project_config",
+            "edit": "configure_pipeline",
+            "rollback": "rollback_changes",
+            "plan": "generate_plan",
+            "confirm": "confirm_contract",
+            "run": "run_analysis",
+        }.get(str(getattr(intent, "action", "") or ""), "unknown_rule_action")
+
+    def _rule_intent_mode_block(
+        session: ProjectSession, intent: Any
+    ) -> dict[str, Any] | None:
+        """Apply the live kill switch before any rule fallback side effect."""
+        from .agent_tools import tool_mode_block
+
         action = str(getattr(intent, "action", "") or "")
-        return action not in {"browse_samples", "status", "summary", "deg_status", "help"}
+        blocked = tool_mode_block(_rule_intent_tool_name(intent), _live_llm_tool_mode())
+        if blocked is None:
+            return None
+        return {
+            **blocked,
+            "state": session.state,
+            "via": "blocked",
+            "action": action,
+            "reply": blocked["error"],
+        }
 
     def _confirmation_required_result(session: ProjectSession, intent: Any) -> dict[str, Any]:
         """Refuse risky fallback actions when no durable resume path exists."""
@@ -2415,6 +2512,10 @@ def create_app(
         # 工具在拿到人工批准前一律不执行（见 chat_graph.node_guardrail）。
         # 需要模型自主调工具的对话走 /api/chat/stream（chat.html 有批准入口）。
         intent = route_intent(text)
+        if intent is not None:
+            blocked = _rule_intent_mode_block(session, intent)
+            if blocked is not None:
+                return blocked
         if intent is not None and intent.action == "browse_samples":
             return _browse_samples_reply(session, intent, config, connection_config)
 
@@ -2613,7 +2714,27 @@ def create_app(
             #    写盘/执行动作没有 durable resume 路径，必须明确拒绝并引导用户
             #    回到正常工具图或结构化工作台，不能因模型失败而绕过确认门禁。
             if not llm_handled:
-                if intent is not None and _rule_intent_requires_confirmation(intent):
+                blocked = (
+                    _rule_intent_mode_block(session, intent)
+                    if intent is not None
+                    else None
+                )
+                if blocked is not None:
+                    via = "blocked"
+                    reply = str(blocked["reply"])
+                    payload_extra = {
+                        "blocked": True,
+                        "error_code": blocked["error_code"],
+                        "tool_mode": blocked["tool_mode"],
+                        "action": blocked["action"],
+                    }
+                    yield step(
+                        "tool",
+                        f"权限模式阻止操作：{intent_label}",
+                        "failed",
+                        reply,
+                    )
+                elif intent is not None and _rule_intent_requires_confirmation(intent):
                     blocked = _confirmation_required_result(session, intent)
                     via = str(blocked["via"])
                     reply = str(blocked["reply"])
@@ -3550,6 +3671,9 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - surface session errors
             return {"error": str(exc)}
 
+    # Internal test/integration hook. It is intentionally not an HTTP route;
+    # direct callers still cross _run_tool's live permission check.
+    app.state.llm_tool_executor = _run_tool
     return app
 
 

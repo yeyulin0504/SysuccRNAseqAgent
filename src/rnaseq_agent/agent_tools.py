@@ -76,6 +76,86 @@ RISK_READ = "read"
 RISK_WRITE = "write"
 RISK_EXECUTE = "execute"
 
+# -- 全局工具权限模式 -------------------------------------------------------
+
+#: 完全关闭模型工具。大模型仍可回答问题，但 provider 请求里不再带 tools。
+TOOL_MODE_DISABLED = "disabled"
+#: 只允许真正的只读工具。
+TOOL_MODE_READ_ONLY = "read_only"
+#: 允许只读与经过人工确认的写配置工具，不允许执行分析。
+TOOL_MODE_APPROVED_WRITE = "approved_write"
+#: 允许全部已声明工具；写入与执行仍必须经过原有人工确认。
+TOOL_MODE_APPROVED_EXECUTE = "approved_execute"
+
+TOOL_MODES = (
+    TOOL_MODE_DISABLED,
+    TOOL_MODE_READ_ONLY,
+    TOOL_MODE_APPROVED_WRITE,
+    TOOL_MODE_APPROVED_EXECUTE,
+)
+DEFAULT_TOOL_MODE = TOOL_MODE_APPROVED_EXECUTE
+
+_MODE_RISKS = {
+    TOOL_MODE_DISABLED: frozenset(),
+    TOOL_MODE_READ_ONLY: frozenset({RISK_READ}),
+    TOOL_MODE_APPROVED_WRITE: frozenset({RISK_READ, RISK_WRITE}),
+    TOOL_MODE_APPROVED_EXECUTE: frozenset({RISK_READ, RISK_WRITE, RISK_EXECUTE}),
+}
+
+
+def normalize_tool_mode(value: Any) -> str:
+    """Return a canonical tool mode, defaulting only when the field is absent.
+
+    Missing settings preserve compatibility with installations created before
+    the kill switch. An explicit unknown value is rejected: silently mapping a
+    typo to the broadest mode would turn a configuration error into privilege
+    escalation.
+    """
+    if value is None:
+        return DEFAULT_TOOL_MODE
+    if not isinstance(value, str):
+        raise ValueError(
+            f"tool_mode 必须是字符串且为以下值之一：{', '.join(TOOL_MODES)}。"
+        )
+    text = value.strip()
+    if text not in TOOL_MODES:
+        raise ValueError(
+            f"tool_mode 必须是以下值之一：{', '.join(TOOL_MODES)}；收到 {text!r}。"
+        )
+    return text
+
+
+def tool_allowed(name: str, mode: Any) -> bool:
+    """Whether ``name`` may cross the tool boundary under ``mode``.
+
+    Unknown names inherit :func:`risk_of`'s highest-risk classification and
+    therefore can pass this *mode* layer only in ``approved_execute``. They are
+    still rejected by normal schema/argument validation afterwards.
+    """
+    try:
+        canonical = normalize_tool_mode(mode)
+    except ValueError:
+        return False
+    return risk_of(name) in _MODE_RISKS[canonical]
+
+
+def tool_mode_block(name: str, mode: Any) -> dict[str, Any] | None:
+    """Return a structured denial payload, or ``None`` when the mode allows it."""
+    try:
+        canonical = normalize_tool_mode(mode)
+    except ValueError:
+        canonical = TOOL_MODE_DISABLED
+    if tool_allowed(name, canonical):
+        return None
+    return {
+        "ok": False,
+        "blocked": True,
+        "error_code": "llm_tool_mode_blocked",
+        "tool_mode": canonical,
+        "tool": name,
+        "error": f"LLM 工具权限模式 {canonical} 不允许调用 {name}，操作未执行。",
+    }
+
 # -- 确认粒度 ---------------------------------------------------------------
 
 #: 不需要确认，直接执行。
@@ -395,19 +475,21 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         description=(
             "读取项目当前的真实运行进度（提交了哪些作业、跑到哪一步、有没有失败）。"
             "启动分析之后想知道「跑到哪了」就调用它，不要凭上次的答复猜测。"
+            "该操作会把最新状态写回本地会话，因此需要确认。"
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        risk=RISK_READ,
+        risk=RISK_WRITE,
     ),
     "get_project_report": ToolSpec(
         name="get_project_report",
         label="生成项目报告",
         description=(
             "汇总项目的分析结果摘要（各阶段产物、差异表达结果、QC 结论）。"
-            "用户问「结果怎么样 / 报告给我看看」时调用。只读，不修改任何东西。"
+            "用户问「结果怎么样 / 报告给我看看」时调用。该操作会生成报告文件，"
+            "因此需要确认。"
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        risk=RISK_READ,
+        risk=RISK_WRITE,
     ),
     "edit_samples": ToolSpec(
         name="edit_samples",
@@ -533,9 +615,13 @@ TOOL_SPECS: dict[str, ToolSpec] = {
 }
 
 
-def tool_schemas() -> list[dict[str, Any]]:
-    """All tools in the shape the provider expects, for the ``tools`` field."""
-    return [spec.as_openai_schema() for name, spec in sorted(TOOL_SPECS.items())]
+def tool_schemas(mode: Any = DEFAULT_TOOL_MODE) -> list[dict[str, Any]]:
+    """Tools exposed to the provider under the current permission mode."""
+    return [
+        spec.as_openai_schema()
+        for name, spec in sorted(TOOL_SPECS.items())
+        if tool_allowed(name, mode)
+    ]
 
 
 def risk_of(name: str) -> str:

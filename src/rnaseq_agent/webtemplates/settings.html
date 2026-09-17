@@ -118,6 +118,14 @@
     <div class="row">
       <div><label>API Key <span class="muted" id="llmKeyState"></span></label>
         <input id="llmKey" type="password" placeholder="sk-..."></div>
+      <div><label>LLM 工具权限</label>
+        <select id="llmToolMode">
+          <option value="disabled">关闭全部工具</option>
+          <option value="read_only">仅只读工具</option>
+          <option value="approved_write">只读 + 确认后写配置</option>
+          <option value="approved_execute" selected>只读 + 确认后写入/执行</option>
+        </select>
+      </div>
       <div><label>&nbsp;</label>
         <label style="display:flex;align-items:center;gap:6px;margin-top:10px;font-weight:400">
           <input type="checkbox" id="llmEnabled" style="width:auto"> 启用大模型对话
@@ -188,6 +196,7 @@ function load() {
     document.getElementById("llmModel").value = c.llm.model || "";
     document.getElementById("llmProvider").value = c.llm.provider || "";
     document.getElementById("llmEnabled").checked = !!c.llm.enabled;
+    document.getElementById("llmToolMode").value = c.llm.tool_mode || "approved_execute";
     document.getElementById("llmKeyState").textContent = c.llm.api_key_set ? "（已设置）" : "（未设置）";
     if (c.container) {
       document.getElementById("ctrEnabled").checked = !!c.container.enabled;
@@ -231,6 +240,7 @@ async function saveLlm() {
     api_base: document.getElementById("llmBase").value.trim(),
     model: document.getElementById("llmModel").value.trim(),
     enabled: document.getElementById("llmEnabled").checked,
+    tool_mode: document.getElementById("llmToolMode").value,
   };
   Object.keys(llm).forEach(k => { if (llm[k] === "") delete llm[k]; });
   const key = document.getElementById("llmKey").value.trim();

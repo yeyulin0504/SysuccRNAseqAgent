@@ -20,6 +20,10 @@ import pytest
 
 from rnaseq_agent import chat_graph as cg
 from rnaseq_agent.agent_tools import (
+    TOOL_MODE_APPROVED_EXECUTE,
+    TOOL_MODE_APPROVED_WRITE,
+    TOOL_MODE_DISABLED,
+    TOOL_MODE_READ_ONLY,
     POLICY_BATCH,
     POLICY_NEVER,
     POLICY_SOLO,
@@ -36,6 +40,7 @@ from rnaseq_agent.agent_tools import (
     requires_confirmation,
     risk_of,
     split_calls_for_round,
+    tool_allowed,
     tool_schemas,
     validate_call,
 )
@@ -92,6 +97,7 @@ def _graph(
     approval_context_reader=None,
     clock=None,
     approval_ttl_seconds=900,
+    tool_mode_reader=None,
 ):
     """Build the chat graph with a scripted model and a recording executor.
 
@@ -119,6 +125,7 @@ def _graph(
         approval_context_reader=approval_context_reader,
         clock=clock,
         approval_ttl_seconds=approval_ttl_seconds,
+        tool_mode_reader=tool_mode_reader,
     )
     return graph, recorded, fake
 
@@ -174,6 +181,29 @@ def _assert_all_declared_tool_calls_are_answered(messages: list[dict]) -> None:
 
 
 class TestToolContract:
+    def test_tool_schema_exposure_follows_the_permission_mode(self) -> None:
+        def names(mode: str) -> set[str]:
+            return {item["function"]["name"] for item in tool_schemas(mode)}
+
+        assert names(TOOL_MODE_DISABLED) == set()
+        assert names(TOOL_MODE_READ_ONLY) == {
+            name for name, spec in TOOL_SPECS.items() if spec.risk == RISK_READ
+        }
+        assert names(TOOL_MODE_READ_ONLY) == {
+            "read_project_state",
+            "browse_remote_samples",
+        }
+        assert names(TOOL_MODE_APPROVED_WRITE) == {
+            name for name, spec in TOOL_SPECS.items() if spec.risk in {RISK_READ, RISK_WRITE}
+        }
+        assert names(TOOL_MODE_APPROVED_EXECUTE) == set(TOOL_SPECS)
+
+    def test_unknown_tools_need_the_highest_permission_mode(self) -> None:
+        assert not tool_allowed("invent_a_tool", TOOL_MODE_DISABLED)
+        assert not tool_allowed("invent_a_tool", TOOL_MODE_READ_ONLY)
+        assert not tool_allowed("invent_a_tool", TOOL_MODE_APPROVED_WRITE)
+        assert tool_allowed("invent_a_tool", TOOL_MODE_APPROVED_EXECUTE)
+
     def test_every_tool_requiring_confirmation_is_write_or_execute(self) -> None:
         """守卫的唯一真源：写盘与执行必须确认，只读必须放行。"""
         for name, spec in TOOL_SPECS.items():
@@ -204,7 +234,14 @@ class TestToolContract:
     def test_connection_tool_never_exposes_credentials_or_auth_controls(self) -> None:
         schema = next(s for s in tool_schemas() if s["function"]["name"] == "edit_connection")
         properties = schema["function"]["parameters"]["properties"]
-        assert {"password", "private_key", "api_key", "auth_mode", "shell"}.isdisjoint(
+        assert {
+            "password",
+            "private_key",
+            "api_key",
+            "auth_mode",
+            "shell",
+            "tool_mode",
+        }.isdisjoint(
             properties
         )
 
@@ -423,6 +460,49 @@ class TestDescribeCall:
 
 
 class TestChatGraphToolLoop:
+    @pytest.mark.parametrize(
+        ("mode", "tool_name", "arguments", "executed", "interrupts"),
+        [
+            (TOOL_MODE_DISABLED, "read_project_state", {}, False, False),
+            (TOOL_MODE_READ_ONLY, "read_project_state", {}, True, False),
+            (TOOL_MODE_READ_ONLY, "set_run_resources", {"threads": 16}, False, False),
+            (TOOL_MODE_APPROVED_WRITE, "set_run_resources", {"threads": 16}, False, True),
+            (TOOL_MODE_APPROVED_WRITE, "run_analysis", {}, False, False),
+            (TOOL_MODE_APPROVED_EXECUTE, "run_analysis", {}, False, True),
+        ],
+    )
+    def test_guardrail_enforces_the_live_permission_matrix(
+        self,
+        monkeypatch,
+        tmp_path,
+        mode,
+        tool_name,
+        arguments,
+        executed,
+        interrupts,
+    ) -> None:
+        turns = [{"tool_calls": [_tool_call("c1", tool_name, arguments)]}]
+        if not interrupts:
+            turns.append({"content": "已处理。"})
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            turns,
+            checkpointer=_memory_checkpointer() if interrupts else None,
+            tool_mode_reader=lambda: mode,
+        )
+
+        result = graph.invoke(
+            _initial(tmp_path, "处理"),
+            config={"configurable": {"thread_id": f"matrix-{mode}-{tool_name}"}},
+        )
+
+        assert bool(recorded) is executed
+        assert bool(result.get("__interrupt__")) is interrupts
+        if not executed and not interrupts:
+            tool_messages = [m for m in fake.seen_messages[-1] if m.get("role") == "tool"]
+            assert tool_messages
+            assert mode in tool_messages[0]["content"]
+
     def test_read_only_tool_runs_without_confirmation(self, monkeypatch, tmp_path) -> None:
         graph, recorded, _ = _graph(
             monkeypatch,
@@ -524,6 +604,59 @@ class TestChatGraphConfirmation:
         assert payload["calls"][0]["name"] == "write_project_config"
         assert payload["calls"][0]["risk"] == RISK_WRITE
         assert "S1" in payload["calls"][0]["description"]
+
+    def test_switching_to_a_stricter_mode_invalidates_a_waiting_card(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from langgraph.types import Command
+
+        live = {"mode": TOOL_MODE_APPROVED_WRITE}
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "没有执行。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            tool_mode_reader=lambda: live["mode"],
+        )
+        config = {"configurable": {"thread_id": "tighten-on-resume"}}
+        first = graph.invoke(_initial(tmp_path, "改成 16 线程"), config=config)
+
+        live["mode"] = TOOL_MODE_READ_ONLY
+        graph.invoke(Command(resume=_approval_decision(first, approved=True)), config=config)
+
+        assert recorded == []
+        tool_messages = [m for m in fake.seen_messages[-1] if m.get("role") == "tool"]
+        assert TOOL_MODE_READ_ONLY in tool_messages[0]["content"]
+
+    def test_execute_rechecks_mode_after_confirmation(self, monkeypatch, tmp_path) -> None:
+        from langgraph.types import Command
+
+        reads = iter(
+            [
+                TOOL_MODE_APPROVED_WRITE,
+                TOOL_MODE_APPROVED_WRITE,
+                TOOL_MODE_APPROVED_WRITE,
+                TOOL_MODE_READ_ONLY,
+            ]
+        )
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "没有执行。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            tool_mode_reader=lambda: next(reads, TOOL_MODE_READ_ONLY),
+        )
+        config = {"configurable": {"thread_id": "tighten-at-execute"}}
+        first = graph.invoke(_initial(tmp_path, "改成 16 线程"), config=config)
+        graph.invoke(Command(resume=_approval_decision(first, approved=True)), config=config)
+
+        assert recorded == []
+        tool_messages = [m for m in fake.seen_messages[-1] if m.get("role") == "tool"]
+        assert TOOL_MODE_READ_ONLY in tool_messages[0]["content"]
 
     def test_confirmation_card_binds_the_exact_server_context_without_secrets(
         self, monkeypatch, tmp_path
