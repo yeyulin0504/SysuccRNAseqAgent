@@ -136,7 +136,7 @@ def _connect_paramiko_with_deadline(
     deadline: float,
 ) -> None:
     remaining = _remaining_remote_time(deadline)
-    result_queue: queue.Queue[Exception | None] = queue.Queue(maxsize=1)
+    result_queue: queue.Queue[BaseException | None] = queue.Queue(maxsize=1)
     abandoned = threading.Event()
 
     def connect() -> None:
@@ -153,8 +153,8 @@ def _connect_paramiko_with_deadline(
                 look_for_keys=False,
                 sock=connection,
             )
-            result: Exception | None = None
-        except Exception as exc:
+            result: BaseException | None = None
+        except BaseException as exc:
             result = exc
         if abandoned.is_set():
             client.close()
@@ -178,18 +178,93 @@ def _connect_paramiko_with_deadline(
     )
     worker.start()
     try:
-        result = result_queue.get(timeout=_remaining_remote_time(deadline))
-    except queue.Empty as exc:
+        try:
+            result = result_queue.get(timeout=_remaining_remote_time(deadline))
+        except queue.Empty as exc:
+            raise CommandTimeoutError(
+                f"Remote command exceeded the "
+                f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+            ) from exc
+        if result is not None:
+            raise result
+        _remaining_remote_time(deadline)
+        return
+    except BaseException:
         abandoned.set()
         client.close()
         connection.close()
-        raise CommandTimeoutError(
-            f"Remote command exceeded the "
-            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
-        ) from exc
-    if result is not None:
-        raise result
-    _remaining_remote_time(deadline)
+        raise
+
+
+def _prepare_paramiko_client_with_deadline(paramiko: Any, deadline: float) -> Any:
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+    abandoned = threading.Event()
+    client_lock = threading.Lock()
+    client_holder: list[Any] = []
+
+    def close_client() -> None:
+        with client_lock:
+            client = client_holder[0] if client_holder else None
+        if client is not None:
+            client.close()
+
+    def prepare() -> None:
+        client = None
+        try:
+            client = paramiko.SSHClient()
+            with client_lock:
+                client_holder.append(client)
+            if abandoned.is_set():
+                client.close()
+                return
+            client.load_system_host_keys()
+            if abandoned.is_set():
+                client.close()
+                return
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            if abandoned.is_set():
+                client.close()
+                return
+            result = (True, client)
+        except BaseException as exc:
+            if client is not None:
+                client.close()
+            result = (False, exc)
+        if abandoned.is_set():
+            if client is not None:
+                client.close()
+            return
+        try:
+            result_queue.put_nowait(result)
+        except queue.Full:
+            pass
+        if abandoned.is_set() and client is not None:
+            client.close()
+
+    worker = threading.Thread(
+        target=prepare,
+        name="rnaseq-agent-paramiko-prepare",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        try:
+            succeeded, result = result_queue.get(
+                timeout=_remaining_remote_time(deadline)
+            )
+        except queue.Empty as exc:
+            raise CommandTimeoutError(
+                f"Remote command exceeded the "
+                f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+            ) from exc
+        if not succeeded:
+            raise result
+        _remaining_remote_time(deadline)
+        return result
+    except BaseException:
+        abandoned.set()
+        close_client()
+        raise
 
 
 class RemoteTransport(Protocol):
@@ -325,11 +400,10 @@ class ParamikoTransport:
             ) from exc
         if deadline is None:
             deadline = time.monotonic() + REMOTE_COMMAND_TIMEOUT_SECONDS
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        client = None
         connection = None
         try:
+            client = _prepare_paramiko_client_with_deadline(paramiko, deadline)
             connection = _connect_remote_socket(self.host, self.port, deadline)
             _connect_paramiko_with_deadline(
                 client,
@@ -341,11 +415,12 @@ class ParamikoTransport:
                 deadline=deadline,
             )
             _remaining_remote_time(deadline)
-        except Exception as exc:
-            client.close()
+        except BaseException as exc:
+            if client is not None:
+                client.close()
             if connection is not None:
                 connection.close()
-            if "known_hosts" in str(exc):
+            if isinstance(exc, Exception) and "known_hosts" in str(exc):
                 raise RuntimeError(
                     "服务器主机指纹尚未被本机信任。请先在终端手动执行一次 "
                     f"`ssh {self.user}@{self.host}`，核对并接受主机指纹后再测试。"

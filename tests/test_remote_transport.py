@@ -21,6 +21,7 @@ from rnaseq_agent.remote_transport import (
     REMOTE_COMMAND_TIMEOUT_SECONDS,
     ParamikoTransport,
     SystemSSHTransport,
+    _connect_paramiko_with_deadline,
     create_remote_transport,
 )
 from rnaseq_agent.ssh_auth import (
@@ -519,6 +520,202 @@ def test_paramiko_connection_time_counts_toward_total_deadline(monkeypatch) -> N
     assert client.closed is True
 
 
+def test_paramiko_host_key_loading_obeys_total_deadline(monkeypatch) -> None:
+    class UnexpectedSocket:
+        def settimeout(self, timeout: float) -> None:
+            raise AssertionError("late TCP socket must not receive a timeout")
+
+        def close(self) -> None:
+            pass
+
+    class DelayedHostKeyClient:
+        def __init__(self) -> None:
+            self.loader_exited = threading.Event()
+            self.close_count = 0
+            self.policy_called = False
+            self.connect_called = False
+            self.exec_called = False
+
+        def load_system_host_keys(self) -> None:
+            try:
+                time.sleep(0.12)
+            finally:
+                self.loader_exited.set()
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            self.policy_called = True
+
+        def connect(self, **kwargs) -> None:
+            self.connect_called = True
+
+        def exec_command(self, *args, **kwargs):
+            self.exec_called = True
+            raise AssertionError("expired client must not execute a command")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = DelayedHostKeyClient()
+    socket_calls: list[tuple[object, ...]] = []
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+
+    def record_socket(*args):
+        socket_calls.append(args)
+        return UnexpectedSocket()
+
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(socket, "socket", record_socket)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    transport = ParamikoTransport(
+        {**SERVER, "host": "192.0.2.10"},
+        SSHCredential(mode="password", password="secret"),
+    )
+    started = time.monotonic()
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    elapsed = time.monotonic() - started
+    close_count_at_deadline = client.close_count
+    assert elapsed < 0.10
+    assert client.loader_exited.wait(1)
+    assert close_count_at_deadline >= 1
+    assert client.policy_called is False
+    assert socket_calls == []
+    assert client.connect_called is False
+    assert client.exec_called is False
+
+
+def test_paramiko_abandons_nonreturning_host_key_loader(monkeypatch) -> None:
+    class UnexpectedSocket:
+        def settimeout(self, timeout: float) -> None:
+            raise AssertionError("late TCP socket must not receive a timeout")
+
+        def close(self) -> None:
+            pass
+
+    class BlockingHostKeyClient:
+        def __init__(self) -> None:
+            self.loader_entered = threading.Event()
+            self.release_loader = threading.Event()
+            self.loader_exited = threading.Event()
+            self.close_count = 0
+            self.policy_called = False
+            self.connect_called = False
+            self.exec_called = False
+
+        def load_system_host_keys(self) -> None:
+            self.loader_entered.set()
+            try:
+                self.release_loader.wait()
+            finally:
+                self.loader_exited.set()
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            self.policy_called = True
+
+        def connect(self, **kwargs) -> None:
+            self.connect_called = True
+
+        def exec_command(self, *args, **kwargs):
+            self.exec_called = True
+            raise AssertionError("abandoned client must not execute a command")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = BlockingHostKeyClient()
+    socket_calls: list[tuple[object, ...]] = []
+    result: list[BaseException | None] = []
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+
+    def record_socket(*args):
+        socket_calls.append(args)
+        return UnexpectedSocket()
+
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(socket, "socket", record_socket)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    transport = ParamikoTransport(
+        {**SERVER, "host": "192.0.2.10"},
+        SSHCredential(mode="password", password="secret"),
+    )
+
+    def execute() -> None:
+        try:
+            transport.execute("printf ok")
+        except BaseException as exc:
+            result.append(exc)
+        else:
+            result.append(None)
+
+    worker = threading.Thread(target=execute, daemon=True)
+    worker.start()
+    try:
+        assert client.loader_entered.wait(0.5)
+        worker.join(0.10)
+        finished_within_budget = not worker.is_alive()
+        close_count_at_deadline = client.close_count
+        socket_calls_at_deadline = list(socket_calls)
+    finally:
+        client.release_loader.set()
+        assert client.loader_exited.wait(1)
+        worker.join(1)
+
+    assert finished_within_budget
+    assert len(result) == 1
+    assert isinstance(result[0], CommandTimeoutError)
+    assert close_count_at_deadline >= 1
+    assert client.close_count >= 1
+    assert client.policy_called is False
+    assert socket_calls_at_deadline == []
+    assert socket_calls == []
+    assert client.connect_called is False
+    assert client.exec_called is False
+
+
+def test_paramiko_closes_client_and_maps_host_key_loader_error(monkeypatch) -> None:
+    class FailingHostKeyClient:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def load_system_host_keys(self) -> None:
+            raise RuntimeError("cannot read known_hosts")
+
+        def set_missing_host_key_policy(self, policy) -> None:
+            raise AssertionError("policy setup must not follow loader failure")
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = FailingHostKeyClient()
+    fake_paramiko = SimpleNamespace(
+        SSHClient=lambda: client,
+        RejectPolicy=lambda: object(),
+    )
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+    monkeypatch.setattr(
+        socket,
+        "socket",
+        lambda *args: pytest.fail("TCP setup must not follow loader failure"),
+    )
+    transport = ParamikoTransport(
+        {**SERVER, "host": "192.0.2.10"},
+        SSHCredential(mode="password", password="secret"),
+    )
+
+    with pytest.raises(RuntimeError, match="服务器主机指纹"):
+        transport._connect(time.monotonic() + 1)
+
+    assert client.closed is True
+
+
 def test_paramiko_dns_resolution_obeys_total_deadline(monkeypatch) -> None:
     import paramiko
 
@@ -824,6 +1021,138 @@ def test_paramiko_abandons_nonreturning_handshake_without_late_success(monkeypat
     assert elapsed < 0.10
     assert len(result) == 1
     assert isinstance(result[0], CommandTimeoutError)
+    assert client.close_count >= 1
+    assert connection.closed is True
+    assert client.exec_called is False
+
+
+@pytest.mark.parametrize("interruption_type", [KeyboardInterrupt, SystemExit])
+def test_paramiko_handshake_wait_interruption_closes_owned_resources(
+    monkeypatch,
+    interruption_type: type[BaseException],
+) -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class BlockingClient:
+        def __init__(self) -> None:
+            self.connect_entered = threading.Event()
+            self.release_connect = threading.Event()
+            self.connect_exited = threading.Event()
+            self.close_count = 0
+
+        def connect(self, **kwargs) -> None:
+            self.connect_entered.set()
+            try:
+                self.release_connect.wait()
+            finally:
+                self.connect_exited.set()
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = BlockingClient()
+    connection = FakeSocket()
+
+    def interrupt_wait(result_queue, timeout=None):
+        assert client.connect_entered.wait(0.5)
+        raise interruption_type()
+
+    monkeypatch.setattr("rnaseq_agent.remote_transport.queue.Queue.get", interrupt_wait)
+    try:
+        with pytest.raises(interruption_type):
+            _connect_paramiko_with_deadline(
+                client,
+                connection,
+                hostname="192.0.2.10",
+                port=22,
+                username="researcher",
+                password="secret",
+                deadline=time.monotonic() + 1,
+            )
+        close_count_at_interruption = client.close_count
+        socket_closed_at_interruption = connection.closed
+    finally:
+        client.release_connect.set()
+        assert client.connect_exited.wait(1)
+
+    assert close_count_at_interruption >= 1
+    assert socket_closed_at_interruption is True
+
+
+def test_paramiko_handshake_publication_interruption_abandons_result(monkeypatch) -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class SuccessfulClient:
+        def __init__(self) -> None:
+            self.close_count = 0
+            self.exec_called = False
+
+        def connect(self, **kwargs) -> None:
+            pass
+
+        def exec_command(self, *args, **kwargs):
+            self.exec_called = True
+            raise AssertionError("interrupted client must not execute a command")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    client = SuccessfulClient()
+    connection = FakeSocket()
+    publication_entered = threading.Event()
+    release_publication = threading.Event()
+    publication_exited = threading.Event()
+    original_put_nowait = __import__("queue").Queue.put_nowait
+
+    def controlled_put(result_queue, result) -> None:
+        publication_entered.set()
+        try:
+            release_publication.wait()
+            original_put_nowait(result_queue, result)
+        finally:
+            publication_exited.set()
+
+    def interrupt_at_publication(result_queue, timeout=None):
+        assert publication_entered.wait(0.5)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(
+        "rnaseq_agent.remote_transport.queue.Queue.put_nowait",
+        controlled_put,
+    )
+    monkeypatch.setattr(
+        "rnaseq_agent.remote_transport.queue.Queue.get",
+        interrupt_at_publication,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _connect_paramiko_with_deadline(
+                client,
+                connection,
+                hostname="192.0.2.10",
+                port=22,
+                username="researcher",
+                password="secret",
+                deadline=time.monotonic() + 1,
+            )
+        close_count_at_interruption = client.close_count
+        socket_closed_at_interruption = connection.closed
+    finally:
+        release_publication.set()
+        assert publication_exited.wait(1)
+
+    assert close_count_at_interruption >= 1
+    assert socket_closed_at_interruption is True
     assert client.close_count >= 1
     assert connection.closed is True
     assert client.exec_called is False
