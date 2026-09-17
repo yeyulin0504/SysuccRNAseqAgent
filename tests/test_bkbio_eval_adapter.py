@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 import time
 import tomllib
 
 import pytest
 
-from rnaseq_agent.analysis_contract import verify_project_contract
+from rnaseq_agent.analysis_contract import canonical_sha256, sha256_file, verify_project_contract
 from rnaseq_agent.bkbio_eval_adapter import (
+    AdapterExecutionError,
     AdapterInputError,
+    AdapterNotEvaluableError,
     AdapterUnavailableError,
     EvalInputs,
+    _build_project_config,
     _ensure_runtime_available,
     _install_runtime_credential,
     _restore_runtime_credential,
+    _verify_manifests,
+    _verify_summary,
     _validate_groups,
+    main,
     read_eval_inputs,
     run_case,
 )
@@ -116,6 +123,7 @@ def test_real_counts_stage_loads_init_commands_and_uses_configured_container() -
         "apptainer exec --cleanenv /containers/rnaseq-downstream.sif Rscript "
         "scripts/diffexp_counts_deseq2.R"
     ) in script
+    assert "command -v Rscript" not in script
     assert 'echo "diffexp requested but Rscript is not available" >&2\n  exit 127' in script
 
 
@@ -125,13 +133,13 @@ def test_runtime_probe_applies_server_init_commands(monkeypatch: pytest.MonkeyPa
     class ProbeTransport:
         def execute(self, command: str) -> CommandResult:
             commands.append(command)
-            return CommandResult(["ssh"], 0, "native=1 container=0\n", "")
+            return CommandResult(["ssh"], 0, "mode=native|R=4.5.2|DESeq2=1.46.0|jsonlite=2.0.0\n", "")
 
     monkeypatch.setattr(
         "rnaseq_agent.bkbio_eval_adapter.create_remote_transport",
         lambda config: ProbeTransport(),
     )
-    _ensure_runtime_available(
+    runtime = _ensure_runtime_available(
         {
             "server": {"init_commands": ["module load R/4.5", "source /opt/conda.sh"]},
             "container": {"enabled": False},
@@ -141,6 +149,129 @@ def test_runtime_probe_applies_server_init_commands(monkeypatch: pytest.MonkeyPa
     assert commands
     assert commands[0].index("module load R/4.5") < commands[0].index("command -v Rscript")
     assert commands[0].index("source /opt/conda.sh") < commands[0].index("command -v Rscript")
+    assert runtime == {
+        "mode": "native",
+        "r_version": "4.5.2",
+        "deseq2_version": "1.46.0",
+        "jsonlite_version": "2.0.0",
+    }
+
+
+def test_container_runtime_never_falls_back_to_host_r(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[str] = []
+
+    class ProbeTransport:
+        def execute(self, command: str) -> CommandResult:
+            commands.append(command)
+            return CommandResult(["ssh"], 0, "mode=container|R=4.5.2|DESeq2=1.46.0|jsonlite=2.0.0\n", "")
+
+    monkeypatch.setattr("rnaseq_agent.bkbio_eval_adapter.create_remote_transport", lambda config: ProbeTransport())
+    runtime = _ensure_runtime_available(
+        {"server": {"init_commands": []}, "container": {"enabled": True, "engine": "apptainer", "image_path": "/x.sif"}}
+    )
+
+    assert runtime["mode"] == "container"
+    assert "native=1" not in commands[0]
+
+
+@pytest.mark.parametrize("digest", [None, "", "latest", "sha256:1234"])
+def test_release_mode_rejects_missing_or_invalid_container_digest(digest: str | None) -> None:
+    with pytest.raises(AdapterUnavailableError, match="digest"):
+        _ensure_runtime_available(
+            {
+                "server": {"init_commands": []},
+                "container": {
+                    "enabled": True,
+                    "engine": "apptainer",
+                    "image_path": "/x.sif",
+                    "digest": digest,
+                },
+                "evaluation": {"release_mode": True},
+            }
+        )
+
+
+def test_release_mode_rejects_unverifiable_container_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProbeTransport:
+        def execute(self, command: str) -> CommandResult:
+            return CommandResult(["ssh"], 0, "0" * 64 + "  /x.sif\n", "")
+
+    monkeypatch.setattr(
+        "rnaseq_agent.bkbio_eval_adapter.create_remote_transport",
+        lambda config: ProbeTransport(),
+    )
+    with pytest.raises(AdapterUnavailableError, match="digest"):
+        _ensure_runtime_available(
+            {
+                "server": {"init_commands": []},
+                "container": {
+                    "enabled": True,
+                    "engine": "apptainer",
+                    "image_path": "/x.sif",
+                    "digest": "sha256:" + "a" * 64,
+                },
+                "evaluation": {"release_mode": True},
+            }
+        )
+
+
+def test_same_remote_credential_override_is_serialized() -> None:
+    host = "serialized-target.example.test"
+    user = "serialized-user"
+    config = {"server": {"host": host, "user": user, "auth_mode": "password"}}
+    first_connection = {"auth_mode": "password", "password": "first"}
+    second_connection = {"auth_mode": "password", "password": "second"}
+    clear_ssh_credential(host, user)
+    first = _install_runtime_credential(config, first_connection)
+    started = threading.Event()
+    acquired = threading.Event()
+    second: list[object] = []
+
+    def install_second() -> None:
+        started.set()
+        second.append(_install_runtime_credential(config, second_connection))
+        acquired.set()
+
+    worker = threading.Thread(target=install_second, daemon=True)
+    worker.start()
+    assert started.wait(1)
+    assert not acquired.wait(0.1)
+    _restore_runtime_credential(config, first)
+    assert acquired.wait(1)
+    try:
+        assert get_ssh_credential(host, user).password == "second"
+    finally:
+        _restore_runtime_credential(config, second[0])
+        worker.join(timeout=1)
+
+
+def test_project_template_server_uses_a_non_secret_allowlist(tmp_path: Path) -> None:
+    staged = tmp_path / "counts.tsv"
+    staged.write_text(COUNTS, encoding="utf-8")
+    inputs = read_eval_inputs(_case_inputs(tmp_path), condition_column="condition")
+    config = _build_project_config(
+        tmp_path,
+        "eval_case",
+        staged,
+        inputs,
+        {"fdr_threshold": 0.05, "log2fc_threshold": 1.0},
+        reference="control",
+        connection=_connection(tmp_path),
+        template={
+            "server": {
+                "init_commands": ["module load R"],
+                "token": "secret",
+                "api_token": "secret",
+                "password": "secret",
+                "passphrase": "secret",
+                "private_key": "secret",
+            }
+        },
+    )
+    assert config["server"]["init_commands"] == ["module load R"]
+    assert not ({"token", "api_token", "password", "passphrase", "private_key"} & set(config["server"]))
 
 
 def _write_case(
@@ -171,6 +302,14 @@ def _write_case(
         encoding="utf-8",
     )
     return inputs, params, tmp_path / "result.json"
+
+
+def _case_inputs(tmp_path: Path) -> Path:
+    inputs = tmp_path / "case-inputs"
+    inputs.mkdir()
+    (inputs / "counts.tsv").write_text(COUNTS, encoding="utf-8")
+    (inputs / "coldata.tsv").write_text(COLDATA, encoding="utf-8")
+    return inputs
 
 
 def _connection(tmp_path: Path) -> dict[str, object]:
@@ -206,6 +345,9 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
         time.sleep(1.05)
         assert verify_project_contract(config_path).ok
         assert "password" not in config["server"]
+        assert "token" not in config["server"]
+        assert "passphrase" not in config["server"]
+        assert "private_key" not in config["server"]
         assert config["samples"]["counts_path"].endswith("counts_matrix.tsv")
         assert config["diffexp"]["reference_condition"] == "control"
         assert config["diffexp"]["padj_cutoff"] == 0.05
@@ -223,29 +365,39 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
                     "formula": "~ condition",
                     "reference_condition": "control",
                     "treatment_condition": "treated",
+                    "padj_cutoff": 0.05,
+                    "log2fc_cutoff": 1.0,
                     "tested_genes": 4,
                     "significant_padj_0.05_lfc1": 2,
                 }
             ),
             encoding="utf-8",
         )
-        save_json(
-            attempt / "run_manifest.json",
-            {"manifest_id": "sha256:run", "body": {"fingerprints": {"inputs_sha256": "inputs"}}},
-        )
-        save_json(
-            attempt / "result_manifest.json",
-            {"manifest_id": "sha256:result", "body": {"fingerprints": {"files_sha256": "files"}}},
-        )
+        snapshot = attempt / "project.snapshot.json"
+        save_json(snapshot, {"run": {"id": run_id}})
+        run_body = {"run_id": run_id, "fingerprints": {"project_snapshot_sha256": sha256_file(snapshot), "inputs_sha256": "inputs"}}
+        save_json(attempt / "run_manifest.json", {"schema_version": 1, "manifest_id": f"sha256:{canonical_sha256(run_body)}", "body": run_body})
+        files = [{"path": "diffexp/deseq2_results.tsv", "sha256": sha256_file(diffexp / "deseq2_results.tsv")}]
+        result_body = {"run_id": run_id, "fingerprints": {"files_sha256": canonical_sha256(files)}, "files": files}
+        save_json(attempt / "result_manifest.json", {"schema_version": 1, "manifest_id": f"sha256:{canonical_sha256(result_body)}", "body": result_body})
+        (inputs / "counts.tsv").write_text("mutated after staging\n", encoding="utf-8")
         config["status"] = {"state": "stage_completed", "run_id": run_id, "stage": "counts"}
         save_json(config_path, config)
         return RunOutcome("stage_completed", "Stage counts completed.", config_path.parent)
 
     monkeypatch.setattr("rnaseq_agent.run_agent.run_stage_project", fake_remote_counts_stage)
-    monkeypatch.setattr("rnaseq_agent.bkbio_eval_adapter._ensure_runtime_available", lambda config: None)
+    monkeypatch.setattr(
+        "rnaseq_agent.bkbio_eval_adapter._ensure_runtime_available",
+        lambda config: {
+            "mode": "native",
+            "r_version": "4.5.2",
+            "deseq2_version": "1.46.0",
+            "jsonlite_version": "2.0.0",
+        },
+    )
     template = tmp_path / "template.json"
     template.write_text(
-        json.dumps({"server": {"password": "template-password-must-not-persist"}}),
+        json.dumps({"server": {"password": "x", "token": "x", "passphrase": "x", "private_key": "x"}}),
         encoding="utf-8",
     )
 
@@ -289,15 +441,170 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
     artifact = out.parent / result["artifacts"]["deseq2_results"]
     assert artifact.read_text(encoding="utf-8") == DESEQ2_RESULTS
     assert result["provenance"]["contract_id"].startswith("sha256:")
-    assert result["provenance"]["run_manifest_id"] == "sha256:run"
-    assert result["provenance"]["result_manifest_id"] == "sha256:result"
+    assert result["provenance"]["run_manifest_id"].startswith("sha256:")
+    assert result["provenance"]["result_manifest_id"].startswith("sha256:")
     assert result["provenance"]["requested_design"] == "~ condition"
     assert result["provenance"]["executed_design"] == "~ condition"
-    assert result["provenance"]["limitations"] == []
-
+    assert result["provenance"]["limitations"] == ["smoke/non_release"]
+    assert result["provenance"]["runtime"]["mode"] == "native"
     project_dir = Path(result["provenance"]["project_dir"])
+    assert result["provenance"]["input_counts_sha256"] == sha256_file(
+        project_dir / "uploads" / "counts_matrix.tsv"
+    )
+
     assert load_json(project_dir / "session.json")["state"] == "stage_completed"
     assert load_json(project_dir / "project.json")["study"]["design"] == "independent_two_group"
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("formula", "~ batch + condition"),
+        ("reference_condition", "treated"),
+        ("treatment_condition", "control"),
+        ("contrast", "control_vs_treated"),
+        ("padj_cutoff", 0.1),
+        ("log2fc_cutoff", 2.0),
+    ],
+)
+def test_summary_must_exactly_match_frozen_analysis_contract(
+    field: str,
+    bad_value: object,
+) -> None:
+    summary = {
+        "formula": "~ condition",
+        "reference_condition": "control",
+        "treatment_condition": "treated",
+        "contrast": "treated_vs_control",
+        "padj_cutoff": 0.05,
+        "log2fc_cutoff": 1.0,
+    }
+    summary[field] = bad_value
+    with pytest.raises(AdapterExecutionError, match=field):
+        _verify_summary(
+            summary,
+            {"diffexp": {"formula": "~ condition", "reference_condition": "control", "padj_cutoff": 0.05, "lfc_cutoff": 1.0}},
+            reference="control",
+            contrast="treated",
+        )
+
+
+def test_summary_rejects_non_condition_formula_even_if_config_matches() -> None:
+    formula = "~ batch + condition"
+    with pytest.raises(AdapterExecutionError, match="formula"):
+        _verify_summary(
+            {
+                "formula": formula,
+                "reference_condition": "control",
+                "treatment_condition": "treated",
+                "contrast": "treated_vs_control",
+                "padj_cutoff": 0.05,
+                "log2fc_cutoff": 1.0,
+            },
+            {
+                "diffexp": {
+                    "formula": formula,
+                    "reference_condition": "control",
+                    "padj_cutoff": 0.05,
+                    "lfc_cutoff": 1.0,
+                }
+            },
+            reference="control",
+            contrast="treated",
+        )
+
+
+def _valid_manifest_fixture(root: Path, *, run_id: str = "run-1") -> tuple[Path, Path]:
+    attempt = root / "attempt"
+    de_path = attempt / "downloads" / "extracted" / "diffexp" / "deseq2_results.tsv"
+    de_path.parent.mkdir(parents=True)
+    de_path.write_text(DESEQ2_RESULTS, encoding="utf-8")
+    snapshot = attempt / "project.snapshot.json"
+    save_json(snapshot, {"run": {"id": run_id}})
+    run_body = {
+        "run_id": run_id,
+        "fingerprints": {"project_snapshot_sha256": sha256_file(snapshot)},
+    }
+    save_json(
+        attempt / "run_manifest.json",
+        {
+            "schema_version": 1,
+            "manifest_id": f"sha256:{canonical_sha256(run_body)}",
+            "body": run_body,
+        },
+    )
+    files = [{"path": "diffexp/deseq2_results.tsv", "sha256": sha256_file(de_path)}]
+    result_body = {
+        "run_id": run_id,
+        "fingerprints": {"files_sha256": canonical_sha256(files)},
+        "files": files,
+    }
+    save_json(
+        attempt / "result_manifest.json",
+        {
+            "schema_version": 1,
+            "manifest_id": f"sha256:{canonical_sha256(result_body)}",
+            "body": result_body,
+        },
+    )
+    return attempt, de_path
+
+
+@pytest.mark.parametrize("filename", ["run_manifest.json", "result_manifest.json"])
+def test_missing_manifests_fail_closed(tmp_path: Path, filename: str) -> None:
+    attempt, de_path = _valid_manifest_fixture(tmp_path)
+    (attempt / filename).unlink()
+    with pytest.raises(AdapterExecutionError, match=filename):
+        _verify_manifests(attempt, "run-1", de_path)
+
+
+@pytest.mark.parametrize("filename", ["run_manifest.json", "result_manifest.json"])
+def test_corrupt_manifest_fails_closed(tmp_path: Path, filename: str) -> None:
+    attempt, de_path = _valid_manifest_fixture(tmp_path)
+    (attempt / filename).write_text("{broken", encoding="utf-8")
+    with pytest.raises(AdapterExecutionError, match=filename):
+        _verify_manifests(attempt, "run-1", de_path)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    [
+        "run_schema",
+        "run_manifest_id",
+        "run_id",
+        "snapshot_hash",
+        "result_schema",
+        "result_manifest_id",
+        "files_hash",
+        "result_file_hash",
+    ],
+)
+def test_forged_manifests_fail_closed(tmp_path: Path, forgery: str) -> None:
+    attempt, de_path = _valid_manifest_fixture(tmp_path)
+    run_path = attempt / "run_manifest.json"
+    result_path = attempt / "result_manifest.json"
+    path = run_path if forgery.startswith("run_") or forgery == "snapshot_hash" else result_path
+    payload = load_json(path)
+    if forgery.endswith("schema"):
+        payload["schema_version"] = 999
+    elif forgery.endswith("manifest_id"):
+        payload["manifest_id"] = "sha256:" + "0" * 64
+    elif forgery == "run_id":
+        payload["body"]["run_id"] = "other-run"
+        payload["manifest_id"] = f"sha256:{canonical_sha256(payload['body'])}"
+    elif forgery == "snapshot_hash":
+        payload["body"]["fingerprints"]["project_snapshot_sha256"] = "0" * 64
+        payload["manifest_id"] = f"sha256:{canonical_sha256(payload['body'])}"
+    elif forgery == "files_hash":
+        payload["body"]["fingerprints"]["files_sha256"] = "0" * 64
+        payload["manifest_id"] = f"sha256:{canonical_sha256(payload['body'])}"
+    elif forgery == "result_file_hash":
+        payload["body"]["files"][0]["sha256"] = "0" * 64
+        payload["body"]["fingerprints"]["files_sha256"] = canonical_sha256(payload["body"]["files"])
+        payload["manifest_id"] = f"sha256:{canonical_sha256(payload['body'])}"
+    save_json(path, payload)
+    with pytest.raises(AdapterExecutionError):
+        _verify_manifests(attempt, "run-1", de_path)
 
 
 def test_read_eval_inputs_rejects_coldata_that_does_not_cover_every_count_column(
@@ -326,7 +633,7 @@ def test_run_case_rejects_designs_outside_the_real_condition_only_pipeline(
     """Silently downgrading paired/multifactor L1 inputs to ~condition must fail."""
     inputs, params, out = _write_case(tmp_path, design=design, paired=paired)
 
-    with pytest.raises(AdapterInputError, match="NOT_EVALUABLE.*~ condition"):
+    with pytest.raises(AdapterNotEvaluableError, match="~ condition"):
         run_case(
             inputs,
             params,
@@ -335,6 +642,25 @@ def test_run_case_rejects_designs_outside_the_real_condition_only_pipeline(
             connection=_connection(tmp_path),
         )
 
+    assert not out.exists()
+
+
+def test_cli_writes_strict_not_evaluable_result_for_unsupported_design(tmp_path: Path) -> None:
+    inputs, params, out = _write_case(tmp_path, design="~ patient + condition", paired=True)
+    exit_code = main(["--inputs", str(inputs), "--params", str(params), "--out", str(out), "--case-id", "tcga"])
+    assert exit_code == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert set(payload) == {"schema", "analyzer", "status", "reason_code", "message"}
+    assert payload["status"] == "NOT_EVALUABLE"
+    assert payload["reason_code"] == "unsupported_design"
+    assert not (tmp_path / ".rnaseq-agent-eval").exists()
+
+
+def test_cli_keeps_malformed_input_nonzero(tmp_path: Path) -> None:
+    params = tmp_path / "params.json"
+    params.write_text("{}", encoding="utf-8")
+    out = tmp_path / "result.json"
+    assert main(["--inputs", str(tmp_path / "missing"), "--params", str(params), "--out", str(out)]) != 0
     assert not out.exists()
 
 

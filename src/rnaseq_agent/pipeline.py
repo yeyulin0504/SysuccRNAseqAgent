@@ -358,24 +358,26 @@ def _rscript_stage_block(
     label: str,
     required_packages: tuple[str, ...],
 ) -> str:
-    """Run Rscript from PATH or the configured container, else fail the stage."""
+    """Run Rscript through the configured runtime, else fail the stage."""
     package_check = " && ".join(
         f"requireNamespace('{package}', quietly=TRUE)" for package in required_packages
     )
     probe = f'Rscript -e "if (!({package_check})) quit(status=1)"'
     container = container_config(config)
-    container_branch = ""
     if container["enabled"]:
         engine = shell_quote(container["engine"])
         image = shell_quote(container["image_path"])
         wrapped_probe = f'{wrap_command(config, "Rscript")} -e "if (!({package_check})) quit(status=1)"'
-        container_branch = f"""elif command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && \\
+        return f"""if command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && \\
   {wrapped_probe} >/dev/null 2>&1; then
   {wrap_command(config, 'Rscript')} {arguments}
-"""
+else
+  echo "{label} requested but Rscript is not available" >&2
+  exit 127
+fi"""
     return f"""if command -v Rscript >/dev/null 2>&1 && {probe} >/dev/null 2>&1; then
   Rscript {arguments}
-{container_branch}else
+else
   echo "{label} requested but Rscript is not available" >&2
   exit 127
 fi"""

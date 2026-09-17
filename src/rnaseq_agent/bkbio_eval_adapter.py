@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from importlib import metadata
 from pathlib import Path
+from threading import Lock
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -43,6 +44,8 @@ from .storage import load_json
 RESULT_SCHEMA = "bkbio-eval/analyzer-result@1"
 ANALYZER_NAME = "sysu-rnaseq-agent"
 PROJECT_TEMPLATE_ENV = "RNASEQ_AGENT_EVAL_PROJECT_TEMPLATE"
+_CREDENTIAL_LOCKS: dict[tuple[str, str], Lock] = {}
+_CREDENTIAL_LOCKS_GUARD = Lock()
 
 
 class AdapterError(RuntimeError):
@@ -51,6 +54,14 @@ class AdapterError(RuntimeError):
 
 class AdapterInputError(AdapterError):
     """The evaluator input cannot be represented by the real product path."""
+
+
+class AdapterNotEvaluableError(AdapterInputError):
+    """A valid evaluator case is outside the frozen product capability."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class AdapterUnavailableError(AdapterError):
@@ -149,7 +160,7 @@ def run_case(
 
     credential = _install_runtime_credential(config, shared_connection)
     try:
-        _ensure_runtime_available(config)
+        runtime = _ensure_runtime_available(config)
         session = ProjectSession(project_dir)
         gate = session.new_project(config)
         if gate.verdict != PASS:
@@ -201,6 +212,7 @@ def run_case(
         contrast=contrast,
         config=live_config,
         case_id=case_id,
+        runtime=runtime,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
@@ -243,6 +255,18 @@ def main(argv: list[str] | None = None) -> int:
             case_id=args.case_id,
             project_template=Path(args.project_template) if args.project_template else None,
         )
+    except AdapterNotEvaluableError as exc:
+        result = {
+            "schema": RESULT_SCHEMA,
+            "analyzer": ANALYZER_NAME,
+            "status": "NOT_EVALUABLE",
+            "reason_code": exc.reason_code,
+            "message": str(exc),
+        }
+        out_path = Path(args.out).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return 0
     except AdapterUnavailableError as exc:
         print(f"Adapter unavailable: {exc}", file=sys.stderr)
         return 3
@@ -361,8 +385,9 @@ def _validate_supported_design(params: Mapping[str, Any]) -> None:
     if not isinstance(paired, bool):
         raise AdapterInputError("params.paired must be a JSON boolean")
     if paired or re.sub(r"\s+", "", requested).lower() != "~condition":
-        raise AdapterInputError(
-            "NOT_EVALUABLE: the real SYSU RNA-seq Agent DESeq2 gate currently supports only "
+        raise AdapterNotEvaluableError(
+            "unsupported_design",
+            "the real SYSU RNA-seq Agent DESeq2 gate currently supports only "
             "independent, unpaired design '~ condition'; paired or multifactor designs are not "
             "silently downgraded"
         )
@@ -466,9 +491,9 @@ def _build_project_config(
     connection: Mapping[str, Any],
     template: Mapping[str, Any],
 ) -> dict[str, Any]:
-    server = deepcopy(template.get("server", {})) if isinstance(template.get("server"), dict) else {}
-    server.pop("password", None)
-    server.pop("password_protected", None)
+    raw_server = template.get("server", {}) if isinstance(template.get("server"), dict) else {}
+    allowed_server_fields = set(SHARED_FIELDS) | {"init_commands", "key_path"}
+    server = {key: deepcopy(value) for key, value in raw_server.items() if key in allowed_server_fields}
     for key in SHARED_FIELDS:
         value = connection.get(key)
         if value not in (None, "", []):
@@ -534,6 +559,7 @@ def _build_project_config(
         "execution": {"mode": "free", "skill_id": "", "contract_file": "analysis_contract.json"},
         "polling": deepcopy(template.get("polling") or {"interval_seconds": 5, "timeout_hours": 4}),
         "notification": {"email_enabled": False},
+        "evaluation": deepcopy(template.get("evaluation") or {"release_mode": False}),
     }
     return config
 
@@ -541,91 +567,152 @@ def _build_project_config(
 def _install_runtime_credential(
     config: Mapping[str, Any],
     connection: Mapping[str, Any],
-) -> tuple[str, str, Any] | None:
+) -> tuple[str, str, Any, Lock] | None:
     server = config["server"]
     host = str(server.get("host") or "")
     user = str(server.get("user") or "")
     mode = normalize_auth_mode(
         str(connection.get("auth_mode") or server.get("auth_mode") or "key")
     )
-    previous = get_ssh_credential(host, user)
-    password = str(connection.get("password") or "")
-    if mode == "password":
-        if not password:
-            raise AdapterUnavailableError(
-                f"password authentication is configured for {user}@{host}, but no decrypted password is available"
-            )
-        set_ssh_credential(host, user, mode="password", password=password)
-        return host, user, previous
+    identity = (host.strip(), user.strip())
+    with _CREDENTIAL_LOCKS_GUARD:
+        credential_lock = _CREDENTIAL_LOCKS.setdefault(identity, Lock())
+    credential_lock.acquire()
+    try:
+        previous = get_ssh_credential(host, user)
+        password = str(connection.get("password") or "")
+        if mode == "password":
+            if not password:
+                raise AdapterUnavailableError(
+                    f"password authentication is configured for {user}@{host}, "
+                    "but no decrypted password is available"
+                )
+            set_ssh_credential(host, user, mode="password", password=password)
+            return host, user, previous, credential_lock
 
-    key_path = str(connection.get("key_path") or server.get("key_path") or "")
-    set_ssh_credential(host, user, mode=mode, key_path=key_path)
-    return host, user, previous
+        key_path = str(connection.get("key_path") or server.get("key_path") or "")
+        set_ssh_credential(host, user, mode=mode, key_path=key_path)
+        return host, user, previous, credential_lock
+    except Exception:
+        credential_lock.release()
+        raise
 
 
 def _restore_runtime_credential(
     config: Mapping[str, Any],
-    credential: tuple[str, str, Any] | None,
+    credential: tuple[str, str, Any, Lock] | None,
 ) -> None:
     del config
     if credential is None:
         return
-    host, user, previous = credential
-    set_ssh_credential(
-        host,
-        user,
-        mode=previous.mode,
-        password=previous.password,
-        key_path=previous.key_path,
-    )
-
-
-def _ensure_runtime_available(config: Mapping[str, Any]) -> None:
-    """Check that the remote target can load DESeq2/jsonlite without writing state."""
-    package_check = (
-        "requireNamespace('DESeq2', quietly=TRUE) && "
-        "requireNamespace('jsonlite', quietly=TRUE)"
-    )
-    r_probe = f'Rscript -e "if (!({package_check})) quit(status=1)"'
-    parts = [
-        "set -e",
-        *[
-            str(command).strip()
-            for command in config.get("server", {}).get("init_commands", [])
-            if str(command).strip()
-        ],
-        "native=0",
-        "container=0",
-        (
-            "if command -v Rscript >/dev/null 2>&1 && "
-            f"{r_probe} >/dev/null 2>&1; then native=1; fi"
-        ),
-    ]
-    container = container_config(dict(config))
-    if container["enabled"] and container["image_path"]:
-        engine = shell_quote(container["engine"])
-        image = shell_quote(container["image_path"])
-        wrapped_probe = (
-            f'{wrap_command(dict(config), "Rscript")} '
-            f'-e "if (!({package_check})) quit(status=1)"'
-        )
-        parts.append(
-            f"if command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && "
-            f"{wrapped_probe} >/dev/null 2>&1; then container=1; fi"
-        )
-    parts.append("printf 'native=%s container=%s\\n' \"$native\" \"$container\"")
+    host, user, previous, credential_lock = credential
     try:
-        result = create_remote_transport(dict(config)).execute("; ".join(parts))
+        set_ssh_credential(
+            host,
+            user,
+            mode=previous.mode,
+            password=previous.password,
+            key_path=previous.key_path,
+        )
+    finally:
+        credential_lock.release()
+
+
+def _ensure_runtime_available(config: Mapping[str, Any]) -> dict[str, str]:
+    """Select and identify the one configured remote DESeq2/jsonlite runtime."""
+    config_dict = dict(config)
+    container = container_config(config_dict)
+    release_mode = bool(config.get("evaluation", {}).get("release_mode", False))
+    raw_container = config.get("container", {})
+    declared_digest = ""
+    if isinstance(raw_container, Mapping):
+        declared_digest = str(
+            raw_container.get("digest") or raw_container.get("image_digest") or ""
+        ).strip()
+
+    if release_mode:
+        if not container["enabled"]:
+            raise AdapterUnavailableError(
+                "release mode requires an enabled container with a verifiable digest"
+            )
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", declared_digest):
+            raise AdapterUnavailableError(
+                "release mode requires container.digest in sha256:<64 hex> form"
+            )
+
+    init_commands = [
+        str(command).strip()
+        for command in config.get("server", {}).get("init_commands", [])
+        if str(command).strip()
+    ]
+    try:
+        transport = create_remote_transport(config_dict)
+        if release_mode:
+            image = shell_quote(container["image_path"])
+            digest_result = transport.execute(
+                "; ".join(["set -e", *init_commands, f"sha256sum {image}"])
+            )
+            actual_digest = digest_result.stdout.strip().split(maxsplit=1)[0].lower()
+            if (
+                digest_result.returncode != 0
+                or actual_digest != declared_digest.removeprefix("sha256:").lower()
+            ):
+                raise AdapterUnavailableError(
+                    "configured container digest could not be verified against the remote image"
+                )
+
+        package_check = (
+            "requireNamespace('DESeq2', quietly=TRUE) && "
+            "requireNamespace('jsonlite', quietly=TRUE)"
+        )
+        expected_mode = "container" if container["enabled"] else "native"
+        r_expression = (
+            f"if (!({package_check})) quit(status=1); "
+            f'cat(paste0("mode={expected_mode}|R=", as.character(getRversion()), '
+            '"|DESeq2=", as.character(packageVersion("DESeq2")), '
+            '"|jsonlite=", as.character(packageVersion("jsonlite")), "\\n"))'
+        )
+        if container["enabled"]:
+            engine = shell_quote(container["engine"])
+            image = shell_quote(container["image_path"])
+            probe = (
+                f"command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && "
+                f"{wrap_command(config_dict, 'Rscript')} -e {shell_quote(r_expression)}"
+            )
+        else:
+            probe = (
+                "command -v Rscript >/dev/null 2>&1 && "
+                f"Rscript -e {shell_quote(r_expression)}"
+            )
+        result = transport.execute("; ".join(["set -e", *init_commands, probe]))
+    except AdapterUnavailableError:
+        raise
     except Exception as exc:  # noqa: BLE001 - normalize transport failures for the adapter CLI
         raise AdapterUnavailableError(
             f"could not probe the configured remote DESeq2 runtime: {type(exc).__name__}: {exc}"
         ) from exc
-    if "native=1" not in result.stdout and "container=1" not in result.stdout:
-        detail = result.stdout.strip() or "native=0 container=0"
-        raise AdapterUnavailableError(
-            "remote DESeq2/jsonlite runtime is unavailable "
-            f"({detail}); install the packages or provide a readable configured container image"
+
+    match = re.search(
+        r"^mode=(native|container)\|R=([^|\r\n]+)\|DESeq2=([^|\r\n]+)\|jsonlite=([^|\r\n]+)$",
+        result.stdout,
+        flags=re.MULTILINE,
+    )
+    if result.returncode != 0 or match is None or match.group(1) != expected_mode:
+        detail = (
+            result.stdout.strip()
+            or result.stderr.strip()
+            or f"mode={expected_mode} unavailable"
         )
+        raise AdapterUnavailableError(
+            "remote DESeq2/jsonlite runtime is unavailable or unverifiable "
+            f"({detail})"
+        )
+    return {
+        "mode": match.group(1),
+        "r_version": match.group(2),
+        "deseq2_version": match.group(3),
+        "jsonlite_version": match.group(4),
+    }
 
 
 def _build_result(
@@ -643,7 +730,17 @@ def _build_result(
     contrast: str,
     config: Mapping[str, Any],
     case_id: str,
+    runtime: Mapping[str, str],
 ) -> dict[str, Any]:
+    try:
+        summary = load_json(summary_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AdapterExecutionError(f"could not read DESeq2 summary: {exc}") from exc
+    if not isinstance(summary, dict):
+        raise AdapterExecutionError("DESeq2 summary must contain a JSON object")
+    _verify_summary(summary, config, reference=reference, contrast=contrast)
+    run_manifest, result_manifest = _verify_manifests(attempt_dir, run_id, de_path)
+
     table, row_order = _read_deseq2_results(de_path)
     expected_genes = set(inputs.gene_ids)
     actual_genes = set(table)
@@ -684,9 +781,6 @@ def _build_result(
     )
 
     top_gene = next((gene for gene in row_order if table[gene]["padj"] is not None), None)
-    summary = load_json(summary_path)
-    run_manifest = _load_optional_json(attempt_dir / "run_manifest.json")
-    result_manifest = _load_optional_json(attempt_dir / "result_manifest.json")
     artifact_rel = de_path.resolve().relative_to(out_path.parent.resolve()).as_posix()
     container = dict(config.get("container", {}))
     container_provenance = {
@@ -699,6 +793,10 @@ def _build_result(
     }
     requested_design = str(params.get("design") or "~ condition").strip()
     created_at = str(contract.get("created_at") or "")
+    staged_counts = Path(str(config.get("samples", {}).get("counts_path") or "")).resolve()
+    if not staged_counts.is_file():
+        raise AdapterExecutionError(f"staged counts input is missing: {staged_counts}")
+    release_mode = bool(config.get("evaluation", {}).get("release_mode", False))
 
     return {
         "schema": RESULT_SCHEMA,
@@ -750,13 +848,14 @@ def _build_result(
             "agent_version": _agent_version(),
             "git_commit": _git_commit(),
             "container": container_provenance,
+            "runtime": dict(runtime),
             "requested_design": requested_design,
             "executed_design": summary.get("formula", "~ condition"),
-            "input_counts_sha256": sha256_file(inputs.counts_path),
+            "input_counts_sha256": sha256_file(staged_counts),
             "deseq2_results_sha256": sha256_file(de_path),
             "run_manifest_id": run_manifest.get("manifest_id", ""),
             "result_manifest_id": result_manifest.get("manifest_id", ""),
-            "limitations": [],
+            "limitations": [] if release_mode else ["smoke/non_release"],
         },
     }
 
@@ -800,14 +899,114 @@ def _optional_float(raw: Any, *, column: str, line_no: int) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def _load_optional_json(path: Path) -> dict[str, Any]:
+def _verify_summary(
+    summary: Mapping[str, Any],
+    config: Mapping[str, Any],
+    *,
+    reference: str,
+    contrast: str,
+) -> None:
+    diffexp = config.get("diffexp", {})
+    if not isinstance(diffexp, Mapping):
+        raise AdapterExecutionError("frozen diffexp configuration is invalid")
+    if diffexp.get("formula") != "~ condition":
+        raise AdapterExecutionError(
+            "frozen diffexp formula must be exactly '~ condition'"
+        )
+    configured_reference = diffexp.get("reference_condition")
+    if configured_reference != reference:
+        raise AdapterExecutionError(
+            "frozen diffexp reference_condition differs from the evaluator request"
+        )
+    expected = {
+        "formula": diffexp.get("formula"),
+        "reference_condition": reference,
+        "treatment_condition": contrast,
+        "contrast": f"{contrast}_vs_{reference}",
+        "padj_cutoff": diffexp.get("padj_cutoff"),
+        "log2fc_cutoff": diffexp.get("lfc_cutoff"),
+    }
+    for field, expected_value in expected.items():
+        if field not in summary or summary[field] != expected_value:
+            raise AdapterExecutionError(
+                f"DESeq2 summary {field} does not match the frozen analysis contract: "
+                f"expected {expected_value!r}, found {summary.get(field)!r}"
+            )
+
+
+def _verify_manifests(
+    attempt_dir: Path,
+    run_id: str,
+    de_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    run_manifest = _load_required_manifest(attempt_dir / "run_manifest.json")
+    result_manifest = _load_required_manifest(attempt_dir / "result_manifest.json")
+    run_body = run_manifest["body"]
+    result_body = result_manifest["body"]
+    for filename, body in (
+        ("run_manifest.json", run_body),
+        ("result_manifest.json", result_body),
+    ):
+        if body.get("run_id") != run_id:
+            raise AdapterExecutionError(
+                f"{filename} run_id does not match completed attempt {run_id!r}"
+            )
+
+    snapshot_path = attempt_dir / "project.snapshot.json"
+    if not snapshot_path.is_file():
+        raise AdapterExecutionError(f"project snapshot is missing: {snapshot_path}")
+    run_fingerprints = run_body.get("fingerprints")
+    if not isinstance(run_fingerprints, dict):
+        raise AdapterExecutionError("run_manifest.json fingerprints must be an object")
+    if run_fingerprints.get("project_snapshot_sha256") != sha256_file(snapshot_path):
+        raise AdapterExecutionError(
+            "run_manifest.json project_snapshot_sha256 does not match project.snapshot.json"
+        )
+
+    files = result_body.get("files")
+    result_fingerprints = result_body.get("fingerprints")
+    if not isinstance(files, list) or not isinstance(result_fingerprints, dict):
+        raise AdapterExecutionError(
+            "result_manifest.json requires files and fingerprints"
+        )
+    if result_fingerprints.get("files_sha256") != canonical_sha256(files):
+        raise AdapterExecutionError(
+            "result_manifest.json files_sha256 does not match its files inventory"
+        )
+    de_entries = [
+        item
+        for item in files
+        if isinstance(item, dict) and item.get("path") == "diffexp/deseq2_results.tsv"
+    ]
+    if len(de_entries) != 1:
+        raise AdapterExecutionError(
+            "result_manifest.json must inventory diffexp/deseq2_results.tsv exactly once"
+        )
+    if de_entries[0].get("sha256") != sha256_file(de_path):
+        raise AdapterExecutionError(
+            "result_manifest.json DESeq2 result hash does not match the downloaded artifact"
+        )
+    return run_manifest, result_manifest
+
+
+def _load_required_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {}
+        raise AdapterExecutionError(f"required manifest is missing: {path.name}")
     try:
         payload = load_json(path)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AdapterExecutionError(f"could not read {path.name}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise AdapterExecutionError(f"{path.name} must contain a JSON object")
+    if payload.get("schema_version") != 1:
+        raise AdapterExecutionError(f"{path.name} has an unsupported schema_version")
+    body = payload.get("body")
+    if not isinstance(body, dict):
+        raise AdapterExecutionError(f"{path.name} body must be an object")
+    expected_id = f"sha256:{canonical_sha256(body)}"
+    if payload.get("manifest_id") != expected_id:
+        raise AdapterExecutionError(f"{path.name} manifest_id is not recomputable")
+    return payload
 
 
 def _agent_version() -> str:
