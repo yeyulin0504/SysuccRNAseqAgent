@@ -93,6 +93,7 @@ from .connection_store import (
     save_llm,
 )
 from .ssh_auth import get_ssh_credential, normalize_auth_mode, set_ssh_credential
+from .ssh_identity import validate_ssh_patch
 from .workspace import Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
@@ -1042,15 +1043,24 @@ def create_app(
         """Edit connection (server.*) or LLM settings through the audited session."""
         _guard(request)
         payload = await request.json()
+        server = payload.get("server")
+        server_patch: dict[str, Any] = {}
+        if isinstance(server, dict):
+            allowed = {"host", "user", "port", "scheduler", "threads", "memory_gb", "remote_base_dir", "remote_workdir", "auth_mode"}
+            server_patch = {
+                key: value
+                for key, value in server.items()
+                if key in allowed and value is not None
+            }
+            identity_problems = validate_ssh_patch(server_patch)
+            if identity_problems:
+                return {"error": "；".join(identity_problems)}
         session = _session_for(_legacy_dir_for(request, payload))
         patch: dict[str, Any] = {}
         note_parts: list[str] = []
         global_llm_saved = False
 
-        server = payload.get("server")
         if isinstance(server, dict):
-            allowed = {"host", "user", "port", "scheduler", "threads", "memory_gb", "remote_base_dir", "remote_workdir", "auth_mode"}
-            server_patch = {k: v for k, v in server.items() if k in allowed and v is not None}
             if server_patch:
                 # threads / memory_gb arrive as numbers from the form.
                 if "threads" in server_patch:
@@ -1058,7 +1068,10 @@ def create_app(
                 if "memory_gb" in server_patch:
                     server_patch["memory_gb"] = int(server_patch["memory_gb"])
                 if "port" in server_patch:
-                    server_patch["port"] = int(server_patch["port"])
+                    if server_patch["port"] == "":
+                        server_patch.pop("port")
+                    else:
+                        server_patch["port"] = int(server_patch["port"])
                 if "auth_mode" in server_patch:
                     # 前端按钮值为 'pass'：落盘前归一化为规范的 'password'。
                     server_patch["auth_mode"] = normalize_auth_mode(server_patch["auth_mode"])

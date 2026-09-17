@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import socket
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
-from .execution import CommandResult, run_command
+from .execution import (
+    CommandOutputLimitError,
+    CommandResult,
+    CommandTimeoutError,
+    run_command,
+    run_command_bounded,
+)
 from .shell import remote_path
 from .ssh_auth import SSHCredential, get_ssh_credential
+from .ssh_identity import normalize_ssh_identity
 
 
 REMOTE_COMMAND_TIMEOUT_SECONDS = 120
@@ -22,7 +30,8 @@ class RemoteTransport(Protocol):
 
 def create_remote_transport(config: dict[str, Any]) -> RemoteTransport:
     server = config["server"]
-    credential = get_ssh_credential(server["host"], server["user"])
+    identity = normalize_ssh_identity(server)
+    credential = get_ssh_credential(identity.host, identity.user)
     if credential.mode == "password":
         if not credential.password:
             raise RuntimeError(
@@ -31,11 +40,6 @@ def create_remote_transport(config: dict[str, Any]) -> RemoteTransport:
             )
         return ParamikoTransport(server, credential)
     return SystemSSHTransport(server, credential)
-
-
-def _server_port(server: dict[str, Any]) -> int:
-    value = server.get("port") or 22
-    return int(value)
 
 
 def test_server_connection(config: dict[str, Any]) -> CommandResult:
@@ -61,9 +65,10 @@ def probe_server_environment(config: dict[str, Any]) -> dict[str, str]:
 
 class SystemSSHTransport:
     def __init__(self, server: dict[str, Any], credential: SSHCredential) -> None:
-        self.host = str(server["host"])
-        self.user = str(server["user"])
-        self.port = _server_port(server)
+        identity = normalize_ssh_identity(server)
+        self.host = identity.host
+        self.user = identity.user
+        self.port = identity.port
         self.target = f"{self.user}@{self.host}"
         self.credential = credential
 
@@ -87,7 +92,19 @@ class SystemSSHTransport:
         return options
 
     def execute(self, remote_command: str) -> CommandResult:
-        return run_command(["ssh", *self._ssh_options(), self.target, remote_command])
+        return run_command_bounded(
+            [
+                "ssh",
+                *self._ssh_options(),
+                "-l",
+                self.user,
+                "--",
+                self.host,
+                remote_command,
+            ],
+            timeout_seconds=REMOTE_COMMAND_TIMEOUT_SECONDS,
+            max_capture_bytes=MAX_REMOTE_CAPTURE_BYTES,
+        )
 
     def upload(self, local_paths: Sequence[Path], remote_dir: str) -> CommandResult:
         sources = [str(path).replace("\\", "/") for path in local_paths]
@@ -95,8 +112,9 @@ class SystemSSHTransport:
             [
                 "scp",
                 *self._scp_options(),
+                "--",
                 *sources,
-                f"{self.target}:{remote_path(remote_dir)}/",
+                f"{self.user}@{self._scp_host()}:{remote_path(remote_dir)}/",
             ]
         )
 
@@ -105,18 +123,25 @@ class SystemSSHTransport:
             [
                 "scp",
                 *self._scp_options(),
-                f"{self.target}:{remote_file}",
+                "--",
+                f"{self.user}@{self._scp_host()}:{remote_file}",
                 str(local_path).replace("\\", "/"),
             ]
         )
 
+    def _scp_host(self) -> str:
+        if ":" in self.host and not (self.host.startswith("[") and self.host.endswith("]")):
+            return f"[{self.host}]"
+        return self.host
+
 
 class ParamikoTransport:
     def __init__(self, server: dict[str, Any], credential: SSHCredential) -> None:
-        self.host = str(server["host"])
-        self.user = str(server["user"])
+        identity = normalize_ssh_identity(server)
+        self.host = identity.host
+        self.user = identity.user
         self.password = credential.password
-        self.port = _server_port(server)
+        self.port = identity.port
         self.target = f"{self.user}@{self.host}"
 
     def _connect(self):
@@ -152,25 +177,33 @@ class ParamikoTransport:
         return client
 
     def execute(self, remote_command: str) -> CommandResult:
-        with self._connect() as client:
-            _, stdout, stderr = client.exec_command(
-                remote_command,
-                timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
-            )
-            stdout.channel.settimeout(REMOTE_COMMAND_TIMEOUT_SECONDS)
-            stdout_bytes = stdout.read(MAX_REMOTE_CAPTURE_BYTES + 1)
-            stderr_bytes = stderr.read(MAX_REMOTE_CAPTURE_BYTES + 1)
-            if (
-                len(stdout_bytes) > MAX_REMOTE_CAPTURE_BYTES
-                or len(stderr_bytes) > MAX_REMOTE_CAPTURE_BYTES
-            ):
-                stdout.channel.close()
-                raise RuntimeError(
-                    "Remote command output exceeded the safe capture limit."
+        try:
+            with self._connect() as client:
+                _, stdout, stderr = client.exec_command(
+                    remote_command,
+                    timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
                 )
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-            returncode = stdout.channel.recv_exit_status()
+                stdout.channel.settimeout(REMOTE_COMMAND_TIMEOUT_SECONDS)
+                stdout_bytes = stdout.read(MAX_REMOTE_CAPTURE_BYTES + 1)
+                if len(stdout_bytes) > MAX_REMOTE_CAPTURE_BYTES:
+                    stdout.channel.close()
+                    raise CommandOutputLimitError(
+                        "Remote command output exceeded the safe capture limit."
+                    )
+                remaining = MAX_REMOTE_CAPTURE_BYTES - len(stdout_bytes)
+                stderr_bytes = stderr.read(remaining + 1)
+                if len(stdout_bytes) + len(stderr_bytes) > MAX_REMOTE_CAPTURE_BYTES:
+                    stdout.channel.close()
+                    raise CommandOutputLimitError(
+                        "Remote command output exceeded the safe capture limit."
+                    )
+                stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+                returncode = stdout.channel.recv_exit_status()
+        except (socket.timeout, TimeoutError) as exc:
+            raise CommandTimeoutError(
+                f"Remote command exceeded the {REMOTE_COMMAND_TIMEOUT_SECONDS}-second time limit."
+            ) from exc
         result = CommandResult(
             command=["ssh", self.target, remote_command],
             returncode=returncode,

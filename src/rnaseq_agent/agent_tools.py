@@ -69,6 +69,7 @@ from typing import Any
 
 from .config_intake import expand_conditions
 from .safety import identifier_error, relative_filename_error
+from .ssh_identity import validate_ssh_patch
 
 # -- 风险分级 ---------------------------------------------------------------
 
@@ -785,6 +786,7 @@ def validate_call(name: str, arguments: dict[str, Any]) -> list[str]:
     if name == "edit_connection":
         if not any(key in arguments for key in CONNECTION_FIELDS):
             problems.append("至少要给出一个要修改的连接字段。")
+        problems.extend(validate_ssh_patch(arguments))
 
     return problems
 

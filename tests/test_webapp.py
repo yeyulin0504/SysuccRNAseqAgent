@@ -243,6 +243,103 @@ class TestWebApp:
         assert result["state"] == "drafting"
         assert result["config"]["server"]["host"] == "10.30.24.1"
 
+    @pytest.mark.parametrize(
+        "server",
+        [
+            {"host": "-oProxyCommand=calc", "user": "alice", "port": 22},
+            {"host": "good.example", "user": "-Fbad", "port": 22},
+            {"host": "bad host", "user": "alice", "port": 22},
+            {"host": " good.example", "user": "alice", "port": 22},
+            {"host": "alice@evil", "user": "alice", "port": 22},
+            {"host": "good.example", "user": "alice;id", "port": 22},
+            {"host": "good.example", "user": "alice ", "port": 22},
+            {"host": "good.example", "user": "alice", "port": 0},
+            {"host": "good.example", "user": "alice", "port": 65536},
+            {"host": "good.example", "user": "alice", "port": True},
+            {"host": "good.example", "user": "alice", "port": 22.0},
+        ],
+    )
+    def test_config_endpoint_rejects_invalid_connection_before_persistence(
+        self, client, monkeypatch, server: dict
+    ) -> None:
+        import rnaseq_agent.webapp as webapp_module
+        from unittest.mock import MagicMock
+
+        token = _token(client)
+        save_connection = MagicMock()
+        set_credential = MagicMock()
+        monkeypatch.setattr(webapp_module, "save_connection", save_connection)
+        monkeypatch.setattr(webapp_module, "set_ssh_credential", set_credential)
+
+        result = client.post(
+            "/api/config",
+            json={
+                "server": {
+                    **server,
+                    "auth_mode": "password",
+                    "password": "test-only-secret",
+                }
+            },
+            headers=_headers(token),
+        ).json()
+
+        assert "error" in result
+        assert save_connection.call_count == 0
+        assert set_credential.call_count == 0
+
+    def test_invalid_connection_is_rejected_before_restoring_stored_credentials(
+        self, client, monkeypatch
+    ) -> None:
+        import rnaseq_agent.webapp as webapp_module
+        from rnaseq_agent.connection_store import save_connection as persist_connection
+        from unittest.mock import MagicMock
+
+        token = _token(client)
+        persist_connection(
+            {
+                "host": "stored.example",
+                "user": "stored_user",
+                "port": 22,
+                "auth_mode": "key",
+            }
+        )
+        save_connection = MagicMock()
+        set_credential = MagicMock()
+        monkeypatch.setattr(webapp_module, "save_connection", save_connection)
+        monkeypatch.setattr(webapp_module, "set_ssh_credential", set_credential)
+
+        result = client.post(
+            "/api/config",
+            json={"server": {"host": "-oProxyCommand=calc"}},
+            headers=_headers(token),
+        ).json()
+
+        assert "error" in result
+        save_connection.assert_not_called()
+        set_credential.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "server",
+        [
+            {"host": "hpc.example.edu", "user": "alice", "port": 22},
+            {"host": "192.0.2.10", "user": "alice_1", "port": "2222"},
+            {"host": "[2001:db8::1]", "user": "alice.dev", "port": None},
+            {"host": "2001:db8::1", "user": "alice-dev", "port": ""},
+        ],
+    )
+    def test_config_endpoint_accepts_valid_connection_identity(
+        self, client, server: dict
+    ) -> None:
+        token = _token(client)
+
+        result = client.post(
+            "/api/config",
+            json={"server": server},
+            headers=_headers(token),
+        ).json()
+
+        assert "error" not in result
+
     def test_saving_unchanged_config_is_idempotent(self, client) -> None:
         token = _token(client)
         _new_project(client, token)

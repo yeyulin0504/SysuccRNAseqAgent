@@ -368,6 +368,43 @@ class TestValidateCall:
         problems = validate_call("rm_rf", {})
         assert any("不存在" in item for item in problems), problems
 
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"host": "-oProxyCommand=calc"},
+            {"host": "bad host"},
+            {"host": " good.example"},
+            {"host": "alice@evil"},
+            {"user": "-Fbad"},
+            {"user": "alice;id"},
+            {"user": "alice "},
+            {"port": 0},
+            {"port": 65536},
+            {"port": True},
+            {"port": 22.0},
+        ],
+    )
+    def test_edit_connection_rejects_invalid_ssh_identity_patch(
+        self, arguments: dict
+    ) -> None:
+        problems = validate_call("edit_connection", arguments)
+
+        assert problems, arguments
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"host": "hpc.example.edu"},
+            {"host": "192.0.2.10", "user": "alice_1", "port": 2222},
+            {"host": "[2001:db8::1]", "user": "alice.dev"},
+            {"host": "2001:db8::1", "user": "alice-dev"},
+        ],
+    )
+    def test_edit_connection_accepts_valid_ssh_identity_patch(
+        self, arguments: dict
+    ) -> None:
+        assert validate_call("edit_connection", arguments) == []
+
 
 class TestNormalizeWriteArguments:
     def test_cycles_partial_grouping(self) -> None:
