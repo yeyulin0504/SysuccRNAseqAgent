@@ -38,17 +38,23 @@ LLM 行为测试使用脚本化 fake model，验证工具协议和权限，不�
 - 确认卡片读取全局连接覆盖后的真实旧值；
 - 每个工具至少有图层契约测试；关键工具有 web 端点测试；
 - `set_diffexp_reference` 与 `set_cms_options` 覆盖真实落盘和科学门禁；
-- `browse_remote_samples`、`rollback_changes`、`record_qc_decision` 覆盖真实路由；
+- `browse_remote_samples`、`rollback_changes` 覆盖真实路由；QC 决策只覆盖
+  `/graph/resume` durable checkpoint，不作为普通 LLM 工具测试；
+- 非流式、无 LLM、LLM 失败和图构建失败四种 fallback 都不能无确认执行副作用；
 - 全套 pytest 通过，偶发 Windows 临时目录竞态需重跑确认后单独记录。
 
 任务 #139（分组名按样本顺序循环展开）和 #140（链特异性 `unknown`）已经有实现
 与自动测试，应在外部任务表中核实并关闭。任务 #138 是否关闭，应以全量工具端点
 覆盖和本文件第一阶段验收为准。
 
-截至 2026-09-16，本阶段的代码缺陷与覆盖缺口已处理：tool-call 协议覆盖批准、
+截至 2026-09-17，本阶段的代码缺陷与覆盖缺口已处理：tool-call 协议覆盖批准、
 拒绝、整组非法以及部分非法/部分合法；resume 采用 fail-closed；共享连接旧值按真实
-生效配置渲染；交付中列出的五个零覆盖工具均增加了 web 端点测试。主项目验证结果
-为 `549 passed, 1 skipped, 6 subtests passed`。
+生效配置渲染；交付中列出的读取、回滚、差异分析和 CMS 工具均增加了 web 端点
+测试；普通 LLM 工具不再暴露 QC 决策；所有规则 fallback 对副作用 fail closed。
+Adapter 与 durable tool approval 合入后的主项目验证结果为
+`640 passed, 1 skipped, 1 warning, 6 subtests passed`。其中普通工具批准已覆盖：可见
+`approval_id` 绑定、规范化参数签名、配置漂移、过期、跨项目/线程、并发双击、崩溃
+重放 fail closed，以及 claim 不保存原始参数。
 
 ## 第二阶段：建立真实 Adapter
 

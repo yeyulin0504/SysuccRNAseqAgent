@@ -1,5 +1,14 @@
 # LLM 工具循环 — 交接说明
 
+> 2026-09-17 更新：本文列出的 P0-1、P0-2、P1-1 和五个端点覆盖缺口已在后续
+> 提交中处理。普通 LLM 工具中的 `record_qc_decision` 又在 `840bf97` 中移除，
+> QC 现在只走与真实 run/attempt 绑定的 durable `/graph/resume` checkpoint；同一
+> 提交还让非流式、无 LLM、LLM 失败和图构建失败的规则 fallback 对所有副作用
+> fail closed。`95365b1` 进一步把普通工具批准绑定到具体卡片、规范化参数和项目
+> 指纹，并加入同线程锁与 durable `O_EXCL` claim，解决并发双击和崩溃重放。当前规范以
+> `docs/llm_tool_permission_model.md` 和
+> `docs/testing_and_evaluation_roadmap.md` 为准，下面内容保留为历史问题记录。
+
 > 日期：2026-09-16
 > 分支：`wizard`（领先 `master` 15 个提交）
 > 相关提交：`d63fc50`（本轮）、`c74eac2`（上一轮）
