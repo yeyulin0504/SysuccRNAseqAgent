@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rnaseq_agent.pipeline import STAGE_COUNTS
 from rnaseq_agent.result_manifest import create_result_manifest
 from rnaseq_agent.storage import load_json
 
@@ -32,6 +33,30 @@ def _write(root: Path, relative_path: str, content: bytes) -> None:
 
 
 class ResultManifestTests(unittest.TestCase):
+    def test_counts_stage_requires_only_enabled_conditional_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            extracted = root / "extracted"
+            config = _config()
+            config["samples"]["items"] = []
+            config["pipeline"] = {
+                "diffexp": {"enabled": True},
+                "cms": {"enabled": False},
+            }
+            _write(extracted, "status/completed.flag", b"")
+            _write(extracted, "status/state.txt", b"completed\n")
+            _write(extracted, "diffexp/deseq2_results.tsv", b"gene\tpadj\nG1\t0.01\n")
+            _write(extracted, "diffexp/deseq2_summary.json", b"{}\n")
+
+            summary = create_result_manifest(
+                config,
+                extracted,
+                root / "result_manifest.json",
+                stage=STAGE_COUNTS,
+            )
+
+            self.assertTrue(summary.ok, summary.errors)
+
     def test_hashes_files_and_accepts_complete_expected_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

@@ -80,6 +80,8 @@ LLM tool permission model: [docs/llm_tool_permission_model.md](docs/llm_tool_per
 
 Testing and numerical evaluation roadmap: [docs/testing_and_evaluation_roadmap.md](docs/testing_and_evaluation_roadmap.md)
 
+Real `bkbio-eval` counts adapter: [docs/bkbio_eval_adapter.md](docs/bkbio_eval_adapter.md)
+
 From this repository without installation:
 
 ```powershell

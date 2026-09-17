@@ -27,7 +27,6 @@ anything itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 from .capability import GateResult, NOT_EVALUABLE, PASS
@@ -164,7 +163,6 @@ def diffexp_design_of(config: dict[str, Any]) -> dict[str, Any]:
         "batches_declared": bool(
             any(sample.get("batch") for sample in samples)
         ),
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
@@ -241,7 +239,22 @@ dds <- DESeqDataSetFromMatrix(
   colData = coldata,
   design = ~ condition
 )
-dds <- DESeq(dds, quiet = TRUE)
+dds <- tryCatch(
+  DESeq(dds, quiet = TRUE),
+  error = function(e) {{
+    if (!grepl(
+      "all gene-wise dispersion estimates are within 2 orders of magnitude",
+      conditionMessage(e),
+      fixed = TRUE
+    )) {{
+      stop(e)
+    }}
+    fallback_dds <- estimateSizeFactors(dds)
+    fallback_dds <- estimateDispersionsGeneEst(fallback_dds)
+    dispersions(fallback_dds) <- mcols(fallback_dds)$dispGeneEst
+    nbinomWaldTest(fallback_dds)
+  }}
+)
 res <- results(dds, contrast = c("condition", {trt_r}, {ref_r}))
 res <- res[order(res$padj), ]
 res_df <- as.data.frame(res)

@@ -327,7 +327,8 @@ def run_stage_project(
         run_config["run"] = snapshot_payload.get("run", run_config["run"])
 
     snapshot_path = attempt_dir / "project.snapshot.json"
-    save_json(snapshot_path, run_config)
+    if not snapshot_path.is_file():
+        save_json(snapshot_path, run_config)
     _update_status(
         config_path,
         "preparing",
@@ -391,12 +392,23 @@ def run_stage_project(
             _log_event(logs_dir, "execution_policy_failed", {"run_id": run_id, "stage": stage, "message": str(exc)})
             raise
         _record_policy_verification(config_path, policy)
-
         remote_scripts = _prepare_stage_scripts(run_config, config_path, attempt_dir, logs_dir, stage)
-        support_files = [*remote_scripts, snapshot_path]
         manifest_path = attempt_dir / "run_manifest.json"
-        if manifest_path.is_file():
-            support_files.append(manifest_path)
+        if not manifest_path.is_file():
+            run_config["execution"].update(
+                {key: value for key, value in policy.items() if value}
+            )
+            save_json(snapshot_path, run_config)
+            manifest_path = _write_run_manifest(
+                config,
+                run_config,
+                config_path,
+                snapshot_path,
+                remote_scripts,
+                policy,
+                attempt_dir,
+            )
+        support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
 
         submit_result = _submit_stage_job(run_config, stage, logs_dir, transport)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .container import wrap_command
+from .container import container_config, wrap_command
 from .shell import shell_quote
 from .safety import identifier_error, relative_filename_error
 
@@ -329,7 +329,7 @@ def _script_header(config: dict[str, Any], stage_name: str) -> str:
 set -euo pipefail
 umask 077
 
-WORKDIR="${{RNASEQ_RUN_WORKDIR:-$PWD}}"
+{prefix}WORKDIR="${{RNASEQ_RUN_WORKDIR:-$PWD}}"
 INPUTDIR="${{RNASEQ_INPUT_DIR:-$WORKDIR/raw}}"
 mkdir -p "$WORKDIR"/{{logs,scripts,status}}
 chmod 700 "$WORKDIR" "$WORKDIR"/{{logs,scripts,status}}
@@ -349,6 +349,36 @@ echo "running" > status/state.txt
 date -Is > status/started_at.txt
 
 """
+
+
+def _rscript_stage_block(
+    config: dict[str, Any],
+    *,
+    arguments: str,
+    label: str,
+    required_packages: tuple[str, ...],
+) -> str:
+    """Run Rscript from PATH or the configured container, else fail the stage."""
+    package_check = " && ".join(
+        f"requireNamespace('{package}', quietly=TRUE)" for package in required_packages
+    )
+    probe = f'Rscript -e "if (!({package_check})) quit(status=1)"'
+    container = container_config(config)
+    container_branch = ""
+    if container["enabled"]:
+        engine = shell_quote(container["engine"])
+        image = shell_quote(container["image_path"])
+        wrapped_probe = f'{wrap_command(config, "Rscript")} -e "if (!({package_check})) quit(status=1)"'
+        container_branch = f"""elif command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && \\
+  {wrapped_probe} >/dev/null 2>&1; then
+  {wrap_command(config, 'Rscript')} {arguments}
+"""
+    return f"""if command -v Rscript >/dev/null 2>&1 && {probe} >/dev/null 2>&1; then
+  Rscript {arguments}
+{container_branch}else
+  echo "{label} requested but Rscript is not available" >&2
+  exit 127
+fi"""
 
 
 def _script_footer(config: dict[str, Any], stage_name: str) -> str:
@@ -669,29 +699,32 @@ cat > diffexp/colData.tsv <<'RNA_AGENT_COLDATA_EOF'
 """.strip()
         ]
         if pipeline.get("diffexp", {}).get("enabled"):
+            diffexp_command = _rscript_stage_block(
+                config,
+                arguments=(
+                    "scripts/diffexp_counts_deseq2.R counts_matrix.tsv "
+                    "diffexp/colData.tsv diffexp/deseq2"
+                ),
+                label="diffexp",
+                required_packages=("DESeq2", "jsonlite"),
+            )
             blocks.append(
                 f"""
 mkdir -p diffexp
-if command -v Rscript >/dev/null 2>&1; then
-  Rscript scripts/diffexp_counts_deseq2.R counts_matrix.tsv diffexp/colData.tsv diffexp/deseq2
-elif [ -n "$RNASEQ_RSEM_IMAGE" ] && [ -x "$RNASEQ_RSEM_IMAGE" ]; then
-  {wrap_command(config, 'Rscript')} scripts/diffexp_counts_deseq2.R counts_matrix.tsv diffexp/colData.tsv diffexp/deseq2
-else
-  echo "diffexp requested but Rscript is not available; skipping DE stage." >&2
-fi
+{diffexp_command}
 """.strip()
             )
         if pipeline.get("cms", {}).get("enabled"):
+            cms_command = _rscript_stage_block(
+                config,
+                arguments="scripts/cms_counts_cmscaller.R counts_matrix.tsv cms/cms",
+                label="cms",
+                required_packages=("CMScaller", "jsonlite"),
+            )
             blocks.append(
                 f"""
 mkdir -p cms
-if command -v Rscript >/dev/null 2>&1; then
-  Rscript scripts/cms_counts_cmscaller.R counts_matrix.tsv cms/cms
-elif [ -n "$RNASEQ_RSEM_IMAGE" ] && [ -x "$RNASEQ_RSEM_IMAGE" ]; then
-  {wrap_command(config, 'Rscript')} scripts/cms_counts_cmscaller.R counts_matrix.tsv cms/cms
-else
-  echo "cms requested but Rscript is not available; skipping CMS stage." >&2
-fi
+{cms_command}
 """.strip()
             )
         body.extend(blocks)

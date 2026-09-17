@@ -23,6 +23,7 @@ control-plane = [
 
 [project.scripts]
 rnaseq-agent = "rnaseq_agent.cli:main"
+rnaseq-agent-bkbio-eval = "rnaseq_agent.bkbio_eval_adapter:main"
 
 [build-system]
 requires = ["setuptools>=68"]

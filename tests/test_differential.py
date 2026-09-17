@@ -19,6 +19,7 @@ from rnaseq_agent.differential import (
     diffexp_design_of,
     diffexp_is_requested,
     render_colData,
+    render_diffexp_counts_script,
     render_diffexp_script,
 )
 from rnaseq_agent.capability import NOT_EVALUABLE, PASS
@@ -214,3 +215,25 @@ class TestRenderers:
         assert "abs(res_df$log2FoldChange) >= lfc_cutoff" in script
         assert "padj_cutoff = padj_cutoff" in script
         assert "log2fc_cutoff = lfc_cutoff" in script
+
+    def test_counts_script_falls_back_only_for_degenerate_dispersion_fit(self) -> None:
+        script = render_diffexp_counts_script(_config())
+
+        error_guard = '''error = function(e) {
+    if (!grepl(
+      "all gene-wise dispersion estimates are within 2 orders of magnitude",
+      conditionMessage(e),
+      fixed = TRUE
+    )) {
+      stop(e)
+    }'''
+        assert error_guard in script
+
+        fallback_steps = [
+            "fallback_dds <- estimateSizeFactors(dds)",
+            "fallback_dds <- estimateDispersionsGeneEst(fallback_dds)",
+            "dispersions(fallback_dds) <- mcols(fallback_dds)$dispGeneEst",
+            "nbinomWaldTest(fallback_dds)",
+        ]
+        positions = [script.index(step) for step in fallback_steps]
+        assert positions == sorted(positions)

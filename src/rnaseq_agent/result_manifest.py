@@ -100,9 +100,7 @@ def _validate_required_outputs(
     )
 
     def _enabled(step: str) -> bool:
-        if stage is None:
-            return bool(config.get("pipeline", {}).get(step, {}).get("enabled"))
-        return True
+        return bool(config.get("pipeline", {}).get(step, {}).get("enabled"))
 
     paired = config.get("sequencing", {}).get("layout", "paired") == "paired"
     pipeline = config.get("pipeline", {})

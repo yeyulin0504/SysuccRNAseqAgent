@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from rnaseq_agent.analysis_contract import sha256_file
 from rnaseq_agent.execution import CommandResult
 from rnaseq_agent.pipeline import render_remote_pipeline_script
-from rnaseq_agent.run_agent import run_project
+from rnaseq_agent.run_agent import run_project, run_stage_project
 from rnaseq_agent.storage import load_json, save_json
 
 
@@ -88,6 +89,78 @@ class FakeTransport:
 
 
 class RunIsolationTests(unittest.TestCase):
+    @patch("rnaseq_agent.run_agent.create_remote_transport")
+    def test_counts_stage_creates_and_uploads_run_manifest(
+        self,
+        create_transport,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            counts_path = root / "counts.tsv"
+            counts_path.write_text(
+                "gene\tc1\tc2\tc3\tt1\tt2\tt3\nG1\t1\t2\t3\t4\t5\t6\n",
+                encoding="utf-8",
+            )
+            config = _project_config(root)
+            config["samples"] = {
+                "counts_path": str(counts_path),
+                "local_data_dir": str(root),
+                "remote_data_dir": "AUTO",
+                "items": [
+                    {"sample_id": f"c{i}", "condition": "control"}
+                    for i in range(1, 4)
+                ]
+                + [
+                    {"sample_id": f"t{i}", "condition": "treated"}
+                    for i in range(1, 4)
+                ],
+            }
+            for step in config["pipeline"].values():
+                step["enabled"] = False
+            config["pipeline"]["diffexp"] = {"enabled": True, "version": "DESeq2"}
+            config["pipeline"]["cms"] = {"enabled": False, "version": "CMScaller"}
+            config["diffexp"] = {
+                "formula": "~ condition",
+                "reference_condition": "control",
+            }
+            config["cms"] = {"run_mode": "counts"}
+            config["container"] = {"enabled": False}
+            config_path = root / "project" / "project.json"
+            save_json(config_path, config)
+
+            transport = FakeTransport()
+            create_transport.return_value = transport
+
+            outcome = run_stage_project(config_path, "counts", wait=False)
+
+            self.assertEqual(outcome.state, "submitted")
+            status = load_json(config_path)["status"]
+            manifest_path = root / "project" / "attempts" / status["run_id"] / "run_manifest.json"
+            self.assertTrue(manifest_path.is_file())
+            self.assertTrue(
+                any(
+                    path.name == "run_manifest.json"
+                    for paths, _ in transport.uploaded
+                    for path in paths
+                )
+            )
+
+            snapshot_path = manifest_path.parent / "project.snapshot.json"
+            original_snapshot = snapshot_path.read_bytes()
+            project = load_json(config_path)
+            project["project"]["title"] = "changed after the attempt started"
+            save_json(config_path, project)
+
+            second = run_stage_project(config_path, "de", wait=False)
+
+            self.assertEqual(second.state, "submitted")
+            self.assertEqual(snapshot_path.read_bytes(), original_snapshot)
+            manifest = load_json(manifest_path)
+            self.assertEqual(
+                manifest["body"]["fingerprints"]["project_snapshot_sha256"],
+                sha256_file(snapshot_path),
+            )
+
     @patch("rnaseq_agent.run_agent.create_remote_transport")
     def test_repeated_submissions_are_isolated_and_keep_stable_fingerprints(
         self,
