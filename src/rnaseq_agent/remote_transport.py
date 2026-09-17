@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import time
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
@@ -177,33 +178,82 @@ class ParamikoTransport:
         return client
 
     def execute(self, remote_command: str) -> CommandResult:
+        client = self._connect()
+        channel = None
         try:
-            with self._connect() as client:
-                _, stdout, stderr = client.exec_command(
-                    remote_command,
-                    timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
-                )
-                stdout.channel.settimeout(REMOTE_COMMAND_TIMEOUT_SECONDS)
-                stdout_bytes = stdout.read(MAX_REMOTE_CAPTURE_BYTES + 1)
-                if len(stdout_bytes) > MAX_REMOTE_CAPTURE_BYTES:
-                    stdout.channel.close()
+            deadline = time.monotonic() + REMOTE_COMMAND_TIMEOUT_SECONDS
+            _, stdout, _ = client.exec_command(
+                remote_command,
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+            channel = stdout.channel
+            stdout_capture = bytearray()
+            stderr_capture = bytearray()
+            captured_bytes = 0
+
+            def capture(target: bytearray, chunk: bytes) -> None:
+                nonlocal captured_bytes
+                if captured_bytes + len(chunk) > MAX_REMOTE_CAPTURE_BYTES:
                     raise CommandOutputLimitError(
-                        "Remote command output exceeded the safe capture limit."
+                        f"Remote command output exceeded the "
+                        f"{MAX_REMOTE_CAPTURE_BYTES}-byte capture limit."
                     )
-                remaining = MAX_REMOTE_CAPTURE_BYTES - len(stdout_bytes)
-                stderr_bytes = stderr.read(remaining + 1)
-                if len(stdout_bytes) + len(stderr_bytes) > MAX_REMOTE_CAPTURE_BYTES:
-                    stdout.channel.close()
-                    raise CommandOutputLimitError(
-                        "Remote command output exceeded the safe capture limit."
+                target.extend(chunk)
+                captured_bytes += len(chunk)
+
+            while True:
+                if time.monotonic() >= deadline:
+                    raise CommandTimeoutError(
+                        f"Remote command exceeded the "
+                        f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
                     )
-                stdout_text = stdout_bytes.decode("utf-8", errors="replace")
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-                returncode = stdout.channel.recv_exit_status()
+
+                progressed = False
+                if channel.recv_ready():
+                    if time.monotonic() >= deadline:
+                        raise CommandTimeoutError(
+                            f"Remote command exceeded the "
+                            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+                        )
+                    capture(stdout_capture, channel.recv(64 * 1024))
+                    progressed = True
+                if channel.recv_stderr_ready():
+                    if time.monotonic() >= deadline:
+                        raise CommandTimeoutError(
+                            f"Remote command exceeded the "
+                            f"{REMOTE_COMMAND_TIMEOUT_SECONDS:g}-second time limit."
+                        )
+                    capture(stderr_capture, channel.recv_stderr(64 * 1024))
+                    progressed = True
+
+                if (
+                    channel.exit_status_ready()
+                    and not channel.recv_ready()
+                    and not channel.recv_stderr_ready()
+                ):
+                    returncode = channel.recv_exit_status()
+                    break
+                if not progressed:
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+            stdout_text = bytes(stdout_capture).decode("utf-8", errors="replace")
+            stderr_text = bytes(stderr_capture).decode("utf-8", errors="replace")
+        except CommandOutputLimitError:
+            if channel is not None:
+                channel.close()
+            raise
+        except CommandTimeoutError:
+            if channel is not None:
+                channel.close()
+            raise
         except (socket.timeout, TimeoutError) as exc:
+            if channel is not None:
+                channel.close()
             raise CommandTimeoutError(
                 f"Remote command exceeded the {REMOTE_COMMAND_TIMEOUT_SECONDS}-second time limit."
             ) from exc
+        finally:
+            client.close()
         result = CommandResult(
             command=["ssh", self.target, remote_command],
             returncode=returncode,

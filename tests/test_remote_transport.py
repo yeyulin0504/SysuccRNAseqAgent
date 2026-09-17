@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import socket
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,7 @@ from rnaseq_agent.ssh_auth import (
     normalize_auth_mode,
     set_ssh_credential,
 )
+from rnaseq_agent.ssh_identity import normalize_ssh_identity
 
 
 SERVER = {
@@ -45,6 +47,17 @@ INVALID_IDENTITIES = [
     {"host": "good.example", "user": "alice", "port": 65536},
     {"host": "good.example", "user": "alice", "port": True},
     {"host": "good.example", "user": "alice", "port": 22.0},
+    {"host": "[]", "user": "alice", "port": 22},
+    {"host": ":", "user": "alice", "port": 22},
+    {"host": "1:::2", "user": "alice", "port": 22},
+    {"host": "1.2.3.999", "user": "alice", "port": 22},
+    {"host": "foo..bar", "user": "alice", "port": 22},
+    {"host": "[example.com]", "user": "alice", "port": 22},
+    {"host": ".leading", "user": "alice", "port": 22},
+    {"host": "trailing.", "user": "alice", "port": 22},
+    {"host": "-leading.example", "user": "alice", "port": 22},
+    {"host": "label-.example", "user": "alice", "port": 22},
+    {"host": f"{'a' * 64}.example", "user": "alice", "port": 22},
 ]
 
 VALID_IDENTITIES = [
@@ -165,6 +178,13 @@ def test_create_remote_transport_accepts_normalized_ssh_identity(server: dict) -
     assert transport.port == (22 if server["port"] in (None, "") else int(server["port"]))
 
 
+@pytest.mark.parametrize("host", ["[2001:db8::1]", "2001:0db8:0:0:0:0:0:1"])
+def test_normalize_ssh_identity_returns_canonical_bare_ipv6(host: str) -> None:
+    identity = normalize_ssh_identity({"host": host, "user": "alice", "port": 22})
+
+    assert identity.host == "2001:db8::1"
+
+
 class SystemSSHTransportTests(unittest.TestCase):
     @patch("rnaseq_agent.remote_transport.run_command_bounded")
     def test_key_mode_uses_batch_mode_and_private_key(
@@ -261,14 +281,81 @@ class SystemSSHTransportTests(unittest.TestCase):
         self.assertEqual(command[separator + 1], "hpc.example.edu")
         self.assertFalse(command[separator + 1].startswith("-"))
 
+    @patch("rnaseq_agent.remote_transport.run_command_bounded")
+    def test_execute_passes_bare_ipv6_host_to_ssh(
+        self,
+        run_command_bounded: MagicMock,
+    ) -> None:
+        run_command_bounded.return_value = CommandResult([], 0, "ok", "")
+        transport = SystemSSHTransport(
+            {**SERVER, "host": "[2001:db8::1]"}, SSHCredential(mode="system")
+        )
+
+        transport.execute("printf ok")
+
+        command = run_command_bounded.call_args.args[0]
+        separator = command.index("--")
+        self.assertEqual(command[separator + 1], "2001:db8::1")
+
+    @patch("rnaseq_agent.remote_transport.run_command")
+    def test_scp_brackets_normalized_ipv6_host(self, run_command: MagicMock) -> None:
+        run_command.return_value = CommandResult([], 0, "", "")
+        transport = SystemSSHTransport(
+            {**SERVER, "host": "[2001:db8::1]"}, SSHCredential(mode="system")
+        )
+
+        transport.upload([Path("sample.fastq.gz")], "/remote/raw")
+
+        command = run_command.call_args.args[0]
+        self.assertIn("researcher@[2001:db8::1]:/remote/raw/", command)
+
 
 class _FakeChannel:
-    def __init__(self, *, returncode: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        stdout_chunks: list[bytes] | None = None,
+        stderr_chunks: list[bytes] | None = None,
+        returncode: int = 0,
+        release_stdout_after_stderr: bool = False,
+        trickle: bool = False,
+    ) -> None:
+        self.stdout_chunks = list(stdout_chunks or [])
+        self.stderr_chunks = list(stderr_chunks or [])
         self.returncode = returncode
+        self.release_stdout_after_stderr = release_stdout_after_stderr
+        self.stderr_consumed = False
+        self.trickle = trickle
         self.closed = False
 
     def settimeout(self, timeout: int) -> None:
         self.timeout = timeout
+
+    def recv_ready(self) -> bool:
+        if self.trickle:
+            return True
+        if self.release_stdout_after_stderr and not self.stderr_consumed:
+            return False
+        return bool(self.stdout_chunks)
+
+    def recv(self, size: int) -> bytes:
+        if self.trickle:
+            return b"x"
+        return self.stdout_chunks.pop(0)
+
+    def recv_stderr_ready(self) -> bool:
+        return bool(self.stderr_chunks)
+
+    def recv_stderr(self, size: int) -> bytes:
+        self.stderr_consumed = True
+        return self.stderr_chunks.pop(0)
+
+    def exit_status_ready(self) -> bool:
+        return (
+            not self.trickle
+            and not self.stdout_chunks
+            and not self.stderr_chunks
+        )
 
     def recv_exit_status(self) -> int:
         return self.returncode
@@ -278,56 +365,95 @@ class _FakeChannel:
 
 
 class _FakeStream:
-    def __init__(self, payload: bytes, channel: _FakeChannel) -> None:
-        self.payload = payload
+    def __init__(self, channel: _FakeChannel) -> None:
         self.channel = channel
 
     def read(self, size: int) -> bytes:
-        return self.payload[:size]
+        raise AssertionError("Paramiko streams must be drained through the shared channel")
 
 
 class _FakeClient:
-    def __init__(self, stdout: bytes, stderr: bytes) -> None:
-        self.channel = _FakeChannel()
-        self.stdout = _FakeStream(stdout, self.channel)
-        self.stderr = _FakeStream(stderr, self.channel)
+    def __init__(self, channel: _FakeChannel) -> None:
+        self.channel = channel
+        self.stdout = _FakeStream(self.channel)
+        self.stderr = _FakeStream(self.channel)
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
         return None
 
     def exec_command(self, command: str, timeout: int):
         return None, self.stdout, self.stderr
 
+    def close(self) -> None:
+        self.closed = True
+
 
 def test_paramiko_uses_combined_output_limit(monkeypatch) -> None:
     transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
-    half = MAX_REMOTE_CAPTURE_BYTES // 2 + 1
-    client = _FakeClient(b"o" * half, b"e" * half)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.MAX_REMOTE_CAPTURE_BYTES", 10)
+    client = _FakeClient(
+        _FakeChannel(stdout_chunks=[b"o" * 6], stderr_chunks=[b"e" * 6])
+    )
     monkeypatch.setattr(transport, "_connect", lambda: client)
 
     with pytest.raises(CommandOutputLimitError):
         transport.execute("printf ok")
 
     assert client.channel.closed is True
+    assert client.closed is True
+
+
+def test_paramiko_drains_stderr_before_stdout_backpressure_can_block(monkeypatch) -> None:
+    transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
+    channel = _FakeChannel(
+        stdout_chunks=[b"stdout"],
+        stderr_chunks=[b"stderr"],
+        release_stdout_after_stderr=True,
+    )
+    client = _FakeClient(channel)
+    monkeypatch.setattr(transport, "_connect", lambda: client)
+
+    result = transport.execute("printf ok")
+
+    assert result.stdout == "stdout"
+    assert result.stderr == "stderr"
+    assert client.closed is True
+
+
+def test_paramiko_enforces_total_deadline_during_trickle_output(monkeypatch) -> None:
+    transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
+    client = _FakeClient(_FakeChannel(trickle=True))
+    monkeypatch.setattr(transport, "_connect", lambda: client)
+    monkeypatch.setattr("rnaseq_agent.remote_transport.REMOTE_COMMAND_TIMEOUT_SECONDS", 0.05)
+    started = __import__("time").monotonic()
+
+    with pytest.raises(CommandTimeoutError):
+        transport.execute("printf ok")
+
+    assert __import__("time").monotonic() - started < 1
+    assert client.channel.closed is True
+    assert client.closed is True
 
 
 def test_paramiko_maps_channel_timeout_to_typed_error(monkeypatch) -> None:
-    import socket
+    class TimeoutChannel(_FakeChannel):
+        def recv(self, size: int) -> bytes:
+            raise socket.timeout("test timeout")
 
     transport = ParamikoTransport(SERVER, SSHCredential(mode="password", password="secret"))
-    client = _FakeClient(b"", b"")
-
-    def timeout_read(size: int) -> bytes:
-        raise socket.timeout("test timeout")
-
-    client.stdout.read = timeout_read
+    client = _FakeClient(TimeoutChannel(stdout_chunks=[b"unread"]))
     monkeypatch.setattr(transport, "_connect", lambda: client)
 
     with pytest.raises(CommandTimeoutError):
         transport.execute("printf ok")
+
+    assert client.channel.closed is True
+    assert client.closed is True
 
 
 if __name__ == "__main__":

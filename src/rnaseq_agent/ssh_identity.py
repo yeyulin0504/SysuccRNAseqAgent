@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-_HOST_RE = re.compile(r"[A-Za-z0-9.:\[\]-]+")
+_DNS_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _USER_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
@@ -20,13 +21,43 @@ class SSHIdentity:
     port: int
 
 
-def _host_error(value: Any) -> str | None:
-    host = str(value or "")
+def _normalized_host(value: Any) -> tuple[str | None, str | None]:
+    if not isinstance(value, str):
+        if value in (None, ""):
+            return None, "SSH 主机不能为空。"
+        return None, "SSH 主机格式无效。"
+    host = value
     if not host:
-        return "SSH 主机不能为空。"
-    if host.startswith("-") or _HOST_RE.fullmatch(host) is None:
-        return "SSH 主机格式无效。"
-    return None
+        return None, "SSH 主机不能为空。"
+
+    if host.startswith("[") or host.endswith("]"):
+        if not (host.startswith("[") and host.endswith("]")):
+            return None, "SSH 主机格式无效。"
+        try:
+            return str(ipaddress.IPv6Address(host[1:-1])), None
+        except ipaddress.AddressValueError:
+            return None, "SSH 主机格式无效。"
+
+    if ":" in host:
+        try:
+            return str(ipaddress.IPv6Address(host)), None
+        except ipaddress.AddressValueError:
+            return None, "SSH 主机格式无效。"
+
+    if all(character.isdigit() or character == "." for character in host):
+        if len(host.split(".")) != 4:
+            return None, "SSH 主机格式无效。"
+        try:
+            return str(ipaddress.IPv4Address(host)), None
+        except ipaddress.AddressValueError:
+            return None, "SSH 主机格式无效。"
+
+    if len(host) > 253 or not host.isascii():
+        return None, "SSH 主机格式无效。"
+    labels = host.split(".")
+    if any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels):
+        return None, "SSH 主机格式无效。"
+    return host, None
 
 
 def _user_error(value: Any) -> str | None:
@@ -61,7 +92,7 @@ def validate_ssh_patch(values: Mapping[str, Any]) -> list[str]:
     """Validate only SSH identity fields present in a partial settings patch."""
     problems: list[str] = []
     if "host" in values:
-        error = _host_error(values.get("host"))
+        _, error = _normalized_host(values.get("host"))
         if error:
             problems.append(error)
     if "user" in values:
@@ -77,21 +108,18 @@ def validate_ssh_patch(values: Mapping[str, Any]) -> list[str]:
 
 def normalize_ssh_identity(server: Mapping[str, Any]) -> SSHIdentity:
     """Return a strict, process-safe SSH destination identity."""
-    problems = validate_ssh_patch(
-        {
-            "host": server.get("host"),
-            "user": server.get("user"),
-            "port": server.get("port"),
-        }
-    )
+    host, host_error = _normalized_host(server.get("host"))
+    user_error = _user_error(server.get("user"))
     port, port_error = _normalized_port(server.get("port"), default_missing=True)
-    if port_error and port_error not in problems:
-        problems.append(port_error)
+    problems = [
+        error for error in (host_error, user_error, port_error) if error is not None
+    ]
     if problems:
         raise SSHIdentityError("；".join(problems))
+    assert host is not None
     assert port is not None
     return SSHIdentity(
-        host=str(server.get("host") or ""),
+        host=host,
         user=str(server.get("user") or ""),
         port=port,
     )
