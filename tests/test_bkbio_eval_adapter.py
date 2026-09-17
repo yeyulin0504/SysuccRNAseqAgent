@@ -127,6 +127,38 @@ def test_real_counts_stage_loads_init_commands_and_uses_configured_container() -
     assert 'echo "diffexp requested but Rscript is not available" >&2\n  exit 127' in script
 
 
+def test_release_stage_rechecks_container_digest_immediately_before_rscript() -> None:
+    digest = "sha256:" + "a" * 64
+    samples = [
+        {"sample_id": f"c{i}", "condition": "control"} for i in range(1, 4)
+    ] + [{"sample_id": f"t{i}", "condition": "treated"} for i in range(1, 4)]
+    config = {
+        "server": {"threads": 2, "init_commands": []},
+        "reference": {},
+        "sequencing": {"layout": "paired"},
+        "samples": {"items": samples},
+        "pipeline": {"diffexp": {"enabled": True}, "cms": {"enabled": False}},
+        "diffexp": {"formula": "~ condition", "reference_condition": "control"},
+        "container": {
+            "enabled": True,
+            "engine": "apptainer",
+            "image_path": "/containers/release.sif",
+            "bind_paths": [],
+            "digest": digest,
+        },
+        "evaluation": {"release_mode": True},
+    }
+
+    script = render_stage_script(config, "counts")
+
+    assert "sha256sum /containers/release.sif" in script
+    assert "a" * 64 in script
+    assert "container digest mismatch before diffexp" in script
+    assert script.index("sha256sum /containers/release.sif") < script.index(
+        "apptainer exec --cleanenv /containers/release.sif Rscript"
+    )
+
+
 def test_runtime_probe_applies_server_init_commands(monkeypatch: pytest.MonkeyPatch) -> None:
     commands: list[str] = []
 
@@ -335,6 +367,7 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
 ) -> None:
     """Removing the ProjectSession path or remapping thresholds must fail this test."""
     inputs, params, out = _write_case(tmp_path)
+    secret_sentinel = "EVAL_TEMPLATE_SECRET_SENTINEL_8f65c8"
 
     def fake_remote_counts_stage(config_path: Path, stage: str, *, wait: bool = True) -> RunOutcome:
         assert stage == "counts"
@@ -352,6 +385,10 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
         assert config["diffexp"]["reference_condition"] == "control"
         assert config["diffexp"]["padj_cutoff"] == 0.05
         assert config["diffexp"]["lfc_cutoff"] == 1.0
+        for audit_name in ("project.json", "session.json", "analysis_contract.json"):
+            assert secret_sentinel not in (config_path.parent / audit_name).read_text(
+                encoding="utf-8"
+            )
 
         run_id = "test-run"
         attempt = config_path.parent / "attempts" / run_id
@@ -375,7 +412,16 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
         )
         snapshot = attempt / "project.snapshot.json"
         save_json(snapshot, {"run": {"id": run_id}})
-        run_body = {"run_id": run_id, "fingerprints": {"project_snapshot_sha256": sha256_file(snapshot), "inputs_sha256": "inputs"}}
+        contract_payload = load_json(config_path.parent / "analysis_contract.json")
+        run_inputs = contract_payload["body"]["inputs"]
+        run_body = {
+            "run_id": run_id,
+            "fingerprints": {
+                "project_snapshot_sha256": sha256_file(snapshot),
+                "inputs_sha256": canonical_sha256(run_inputs),
+            },
+            "inputs": run_inputs,
+        }
         save_json(attempt / "run_manifest.json", {"schema_version": 1, "manifest_id": f"sha256:{canonical_sha256(run_body)}", "body": run_body})
         files = [{"path": "diffexp/deseq2_results.tsv", "sha256": sha256_file(diffexp / "deseq2_results.tsv")}]
         result_body = {"run_id": run_id, "fingerprints": {"files_sha256": canonical_sha256(files)}, "files": files}
@@ -397,7 +443,34 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
     )
     template = tmp_path / "template.json"
     template.write_text(
-        json.dumps({"server": {"password": "x", "token": "x", "passphrase": "x", "private_key": "x"}}),
+        json.dumps(
+            {
+                "server": {
+                    "password": secret_sentinel,
+                    "token": secret_sentinel,
+                    "passphrase": secret_sentinel,
+                    "private_key": secret_sentinel,
+                },
+                "container": {
+                    "enabled": False,
+                    "engine": "apptainer",
+                    "image_path": "/allowed/image.sif",
+                    "image_uri": "docker://allowed/image:tag",
+                    "bind_paths": [],
+                    "registry_token": secret_sentinel,
+                    "api_key": secret_sentinel,
+                    "passphrase": secret_sentinel,
+                    "private_key": secret_sentinel,
+                },
+                "evaluation": {
+                    "release_mode": False,
+                    "registry_token": secret_sentinel,
+                    "api_key": secret_sentinel,
+                    "passphrase": secret_sentinel,
+                    "private_key": secret_sentinel,
+                },
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -454,6 +527,9 @@ def test_run_case_uses_frozen_counts_session_and_maps_real_deseq2_artifact(
 
     assert load_json(project_dir / "session.json")["state"] == "stage_completed"
     assert load_json(project_dir / "project.json")["study"]["design"] == "independent_two_group"
+    assert secret_sentinel not in out.read_text(encoding="utf-8")
+    for audit_file in project_dir.rglob("*.json"):
+        assert secret_sentinel not in audit_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -514,16 +590,45 @@ def test_summary_rejects_non_condition_formula_even_if_config_matches() -> None:
         )
 
 
-def _valid_manifest_fixture(root: Path, *, run_id: str = "run-1") -> tuple[Path, Path]:
+def _valid_manifest_fixture(
+    root: Path,
+    *,
+    run_id: str = "run-1",
+) -> tuple[Path, Path, Path, dict[str, object]]:
     attempt = root / "attempt"
+    staged_counts = root / "uploads" / "counts_matrix.tsv"
+    staged_counts.parent.mkdir(parents=True)
+    staged_counts.write_text(COUNTS, encoding="utf-8")
     de_path = attempt / "downloads" / "extracted" / "diffexp" / "deseq2_results.tsv"
     de_path.parent.mkdir(parents=True)
     de_path.write_text(DESEQ2_RESULTS, encoding="utf-8")
     snapshot = attempt / "project.snapshot.json"
     save_json(snapshot, {"run": {"id": run_id}})
+    inputs = [
+        {
+            "sample_id": "*",
+            "role": "counts",
+            "logical_name": staged_counts.name,
+            "size_bytes": staged_counts.stat().st_size,
+            "sha256": sha256_file(staged_counts),
+        }
+    ]
+    contract_body: dict[str, object] = {
+        "inputs": inputs,
+        "fingerprints": {"inputs_sha256": canonical_sha256(inputs)},
+    }
+    contract: dict[str, object] = {
+        "schema_version": 1,
+        "contract_id": f"sha256:{canonical_sha256(contract_body)}",
+        "body": contract_body,
+    }
     run_body = {
         "run_id": run_id,
-        "fingerprints": {"project_snapshot_sha256": sha256_file(snapshot)},
+        "fingerprints": {
+            "project_snapshot_sha256": sha256_file(snapshot),
+            "inputs_sha256": canonical_sha256(inputs),
+        },
+        "inputs": inputs,
     }
     save_json(
         attempt / "run_manifest.json",
@@ -547,23 +652,35 @@ def _valid_manifest_fixture(root: Path, *, run_id: str = "run-1") -> tuple[Path,
             "body": result_body,
         },
     )
-    return attempt, de_path
+    return attempt, de_path, staged_counts, contract
 
 
 @pytest.mark.parametrize("filename", ["run_manifest.json", "result_manifest.json"])
 def test_missing_manifests_fail_closed(tmp_path: Path, filename: str) -> None:
-    attempt, de_path = _valid_manifest_fixture(tmp_path)
+    attempt, de_path, staged_counts, contract = _valid_manifest_fixture(tmp_path)
     (attempt / filename).unlink()
     with pytest.raises(AdapterExecutionError, match=filename):
-        _verify_manifests(attempt, "run-1", de_path)
+        _verify_manifests(
+            attempt,
+            "run-1",
+            de_path,
+            staged_counts=staged_counts,
+            contract=contract,
+        )
 
 
 @pytest.mark.parametrize("filename", ["run_manifest.json", "result_manifest.json"])
 def test_corrupt_manifest_fails_closed(tmp_path: Path, filename: str) -> None:
-    attempt, de_path = _valid_manifest_fixture(tmp_path)
+    attempt, de_path, staged_counts, contract = _valid_manifest_fixture(tmp_path)
     (attempt / filename).write_text("{broken", encoding="utf-8")
     with pytest.raises(AdapterExecutionError, match=filename):
-        _verify_manifests(attempt, "run-1", de_path)
+        _verify_manifests(
+            attempt,
+            "run-1",
+            de_path,
+            staged_counts=staged_counts,
+            contract=contract,
+        )
 
 
 @pytest.mark.parametrize(
@@ -580,7 +697,7 @@ def test_corrupt_manifest_fails_closed(tmp_path: Path, filename: str) -> None:
     ],
 )
 def test_forged_manifests_fail_closed(tmp_path: Path, forgery: str) -> None:
-    attempt, de_path = _valid_manifest_fixture(tmp_path)
+    attempt, de_path, staged_counts, contract = _valid_manifest_fixture(tmp_path)
     run_path = attempt / "run_manifest.json"
     result_path = attempt / "result_manifest.json"
     path = run_path if forgery.startswith("run_") or forgery == "snapshot_hash" else result_path
@@ -604,7 +721,58 @@ def test_forged_manifests_fail_closed(tmp_path: Path, forgery: str) -> None:
         payload["manifest_id"] = f"sha256:{canonical_sha256(payload['body'])}"
     save_json(path, payload)
     with pytest.raises(AdapterExecutionError):
-        _verify_manifests(attempt, "run-1", de_path)
+        _verify_manifests(
+            attempt,
+            "run-1",
+            de_path,
+            staged_counts=staged_counts,
+            contract=contract,
+        )
+
+
+def test_staged_counts_mutation_after_manifest_creation_fails_closed(tmp_path: Path) -> None:
+    attempt, de_path, staged_counts, contract = _valid_manifest_fixture(tmp_path)
+    old_hash = sha256_file(staged_counts)
+    staged_counts.write_text(COUNTS + "G5\t1\t1\t1\t1\t1\t1\n", encoding="utf-8")
+    assert sha256_file(staged_counts) != old_hash
+
+    with pytest.raises(AdapterExecutionError, match="staged counts"):
+        _verify_manifests(
+            attempt,
+            "run-1",
+            de_path,
+            staged_counts=staged_counts,
+            contract=contract,
+        )
+
+
+@pytest.mark.parametrize("source", ["run_inputs_sha256", "contract_inputs_sha256", "contract_counts"])
+def test_input_evidence_hashes_must_agree(tmp_path: Path, source: str) -> None:
+    attempt, de_path, staged_counts, contract = _valid_manifest_fixture(tmp_path)
+    if source == "run_inputs_sha256":
+        path = attempt / "run_manifest.json"
+        payload = load_json(path)
+        payload["body"]["fingerprints"]["inputs_sha256"] = "0" * 64
+        payload["manifest_id"] = f"sha256:{canonical_sha256(payload['body'])}"
+        save_json(path, payload)
+    else:
+        body = contract["body"]
+        assert isinstance(body, dict)
+        if source == "contract_inputs_sha256":
+            body["fingerprints"]["inputs_sha256"] = "0" * 64
+        else:
+            body["inputs"][0]["sha256"] = "0" * 64
+            body["fingerprints"]["inputs_sha256"] = canonical_sha256(body["inputs"])
+        contract["contract_id"] = f"sha256:{canonical_sha256(body)}"
+
+    with pytest.raises(AdapterExecutionError, match="inputs|counts"):
+        _verify_manifests(
+            attempt,
+            "run-1",
+            de_path,
+            staged_counts=staged_counts,
+            contract=contract,
+        )
 
 
 def test_read_eval_inputs_rejects_coldata_that_does_not_cover_every_count_column(
@@ -656,6 +824,22 @@ def test_cli_writes_strict_not_evaluable_result_for_unsupported_design(tmp_path:
     assert not (tmp_path / ".rnaseq-agent-eval").exists()
 
 
+def test_cli_writes_not_evaluable_for_unsupported_prefilter(tmp_path: Path) -> None:
+    inputs, params, out = _write_case(tmp_path)
+    payload = json.loads(params.read_text(encoding="utf-8"))
+    payload["min_count_prefilter"] = 10
+    params.write_text(json.dumps(payload), encoding="utf-8")
+
+    exit_code = main(["--inputs", str(inputs), "--params", str(params), "--out", str(out)])
+
+    assert exit_code == 0
+    result = json.loads(out.read_text(encoding="utf-8"))
+    assert set(result) == {"schema", "analyzer", "status", "reason_code", "message"}
+    assert result["status"] == "NOT_EVALUABLE"
+    assert result["reason_code"] == "unsupported_design"
+    assert not (tmp_path / ".rnaseq-agent-eval").exists()
+
+
 def test_cli_keeps_malformed_input_nonzero(tmp_path: Path) -> None:
     params = tmp_path / "params.json"
     params.write_text("{}", encoding="utf-8")
@@ -692,8 +876,8 @@ def test_run_case_reports_missing_remote_deseq2_as_unavailable_before_execution(
     assert not (project_dirs[0] / "session.json").exists()
 
 
-@pytest.mark.parametrize("min_count_prefilter", [0.5, -0.5, 1e-9])
-def test_run_case_rejects_nonzero_fractional_prefilter(
+@pytest.mark.parametrize("min_count_prefilter", [10, 0.5, -0.5, 1e-9])
+def test_run_case_returns_not_evaluable_for_nonzero_prefilter(
     tmp_path: Path,
     min_count_prefilter: float,
 ) -> None:
@@ -702,8 +886,33 @@ def test_run_case_rejects_nonzero_fractional_prefilter(
     payload["min_count_prefilter"] = min_count_prefilter
     params.write_text(json.dumps(payload), encoding="utf-8")
 
+    with pytest.raises(AdapterNotEvaluableError, match="min_count_prefilter") as exc_info:
+        run_case(inputs, params, out, connection=_connection(tmp_path))
+    assert exc_info.value.reason_code == "unsupported_design"
+
+
+@pytest.mark.parametrize("min_count_prefilter", ["ten", [], {}, True])
+def test_run_case_keeps_malformed_prefilter_as_input_error(
+    tmp_path: Path,
+    min_count_prefilter: object,
+) -> None:
+    inputs, params, out = _write_case(tmp_path)
+    payload = json.loads(params.read_text(encoding="utf-8"))
+    payload["min_count_prefilter"] = min_count_prefilter
+    params.write_text(json.dumps(payload), encoding="utf-8")
+
     with pytest.raises(AdapterInputError, match="min_count_prefilter"):
         run_case(inputs, params, out, connection=_connection(tmp_path))
+
+
+def test_cli_keeps_malformed_prefilter_nonzero(tmp_path: Path) -> None:
+    inputs, params, out = _write_case(tmp_path)
+    payload = json.loads(params.read_text(encoding="utf-8"))
+    payload["min_count_prefilter"] = "ten"
+    params.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert main(["--inputs", str(inputs), "--params", str(params), "--out", str(out)]) != 0
+    assert not out.exists()
 
 
 def test_group_validation_requires_three_replicates_per_condition(tmp_path: Path) -> None:

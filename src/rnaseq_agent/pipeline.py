@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .container import container_config, wrap_command
@@ -368,7 +369,30 @@ def _rscript_stage_block(
         engine = shell_quote(container["engine"])
         image = shell_quote(container["image_path"])
         wrapped_probe = f'{wrap_command(config, "Rscript")} -e "if (!({package_check})) quit(status=1)"'
-        return f"""if command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && \\
+        digest_check = ""
+        evaluation = config.get("evaluation", {})
+        release_mode = bool(
+            evaluation.get("release_mode", False)
+            if isinstance(evaluation, dict)
+            else False
+        )
+        if release_mode:
+            raw_container = config.get("container", {})
+            declared_digest = str(
+                raw_container.get("digest") or raw_container.get("image_digest") or ""
+            )
+            if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", declared_digest):
+                raise ValueError(
+                    "release mode requires container.digest in sha256:<64 hex> form"
+                )
+            expected_digest = shell_quote(declared_digest.removeprefix("sha256:").lower())
+            digest_check = f"""actual_container_sha256="$(sha256sum {image} | awk '{{print $1}}')"
+if [ "$actual_container_sha256" != {expected_digest} ]; then
+  echo "container digest mismatch before {label}" >&2
+  exit 126
+fi
+"""
+        return f"""{digest_check}if command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && \\
   {wrapped_probe} >/dev/null 2>&1; then
   {wrap_command(config, 'Rscript')} {arguments}
 else

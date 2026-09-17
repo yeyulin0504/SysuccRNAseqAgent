@@ -46,6 +46,16 @@ ANALYZER_NAME = "sysu-rnaseq-agent"
 PROJECT_TEMPLATE_ENV = "RNASEQ_AGENT_EVAL_PROJECT_TEMPLATE"
 _CREDENTIAL_LOCKS: dict[tuple[str, str], Lock] = {}
 _CREDENTIAL_LOCKS_GUARD = Lock()
+_CONTAINER_TEMPLATE_FIELDS = {
+    "enabled",
+    "engine",
+    "image_uri",
+    "image_path",
+    "bind_paths",
+    "digest",
+    "image_digest",
+}
+_EVALUATION_TEMPLATE_FIELDS = {"release_mode"}
 
 
 class AdapterError(RuntimeError):
@@ -392,17 +402,20 @@ def _validate_supported_design(params: Mapping[str, Any]) -> None:
             "silently downgraded"
         )
     min_count = params.get("min_count_prefilter", 0)
-    if min_count in (None, ""):
+    if min_count is None:
         min_count = 0
+    if isinstance(min_count, bool) or not isinstance(min_count, (int, float)):
+        raise AdapterInputError("params.min_count_prefilter must be numeric")
     try:
         min_count_value = Decimal(str(min_count))
     except InvalidOperation as exc:
-        raise AdapterInputError("params.min_count_prefilter must be an integer") from exc
-    if not min_count_value.is_finite() or min_count_value != min_count_value.to_integral_value():
-        raise AdapterInputError("params.min_count_prefilter must be an integer")
+        raise AdapterInputError("params.min_count_prefilter must be numeric") from exc
+    if not min_count_value.is_finite():
+        raise AdapterInputError("params.min_count_prefilter must be finite")
     if min_count_value != 0:
-        raise AdapterInputError(
-            "NOT_EVALUABLE: the current real counts-stage contract does not expose "
+        raise AdapterNotEvaluableError(
+            "unsupported_design",
+            "the current real counts-stage contract does not expose "
             "min_count_prefilter; refusing to ignore the requested value"
         )
 
@@ -537,6 +550,26 @@ def _build_project_config(
         "lfc_cutoff": _threshold(params, "log2fc_threshold", 1.0, minimum=0.0),
     }
     cms = {**deepcopy(DEFAULT_CMS), "run_mode": "counts"}
+    raw_container = template.get("container")
+    container = (
+        {
+            key: deepcopy(value)
+            for key, value in raw_container.items()
+            if key in _CONTAINER_TEMPLATE_FIELDS
+        }
+        if isinstance(raw_container, Mapping) and raw_container
+        else deepcopy(DEFAULT_CONTAINER)
+    )
+    raw_evaluation = template.get("evaluation")
+    evaluation: dict[str, Any] = {"release_mode": False}
+    if isinstance(raw_evaluation, Mapping):
+        evaluation.update(
+            {
+                key: deepcopy(value)
+                for key, value in raw_evaluation.items()
+                if key in _EVALUATION_TEMPLATE_FIELDS
+            }
+        )
 
     config: dict[str, Any] = {
         "schema_version": 1,
@@ -555,11 +588,11 @@ def _build_project_config(
         "pipeline": pipeline,
         "diffexp": diffexp,
         "cms": cms,
-        "container": deepcopy(template.get("container") or DEFAULT_CONTAINER),
+        "container": container,
         "execution": {"mode": "free", "skill_id": "", "contract_file": "analysis_contract.json"},
         "polling": deepcopy(template.get("polling") or {"interval_seconds": 5, "timeout_hours": 4}),
         "notification": {"email_enabled": False},
-        "evaluation": deepcopy(template.get("evaluation") or {"release_mode": False}),
+        "evaluation": evaluation,
     }
     return config
 
@@ -739,7 +772,16 @@ def _build_result(
     if not isinstance(summary, dict):
         raise AdapterExecutionError("DESeq2 summary must contain a JSON object")
     _verify_summary(summary, config, reference=reference, contrast=contrast)
-    run_manifest, result_manifest = _verify_manifests(attempt_dir, run_id, de_path)
+    staged_counts = Path(str(config.get("samples", {}).get("counts_path") or "")).resolve()
+    if not staged_counts.is_file():
+        raise AdapterExecutionError(f"staged counts input is missing: {staged_counts}")
+    run_manifest, result_manifest, input_counts_sha256 = _verify_manifests(
+        attempt_dir,
+        run_id,
+        de_path,
+        staged_counts=staged_counts,
+        contract=contract,
+    )
 
     table, row_order = _read_deseq2_results(de_path)
     expected_genes = set(inputs.gene_ids)
@@ -793,9 +835,6 @@ def _build_result(
     }
     requested_design = str(params.get("design") or "~ condition").strip()
     created_at = str(contract.get("created_at") or "")
-    staged_counts = Path(str(config.get("samples", {}).get("counts_path") or "")).resolve()
-    if not staged_counts.is_file():
-        raise AdapterExecutionError(f"staged counts input is missing: {staged_counts}")
     release_mode = bool(config.get("evaluation", {}).get("release_mode", False))
 
     return {
@@ -851,7 +890,7 @@ def _build_result(
             "runtime": dict(runtime),
             "requested_design": requested_design,
             "executed_design": summary.get("formula", "~ condition"),
-            "input_counts_sha256": sha256_file(staged_counts),
+            "input_counts_sha256": input_counts_sha256,
             "deseq2_results_sha256": sha256_file(de_path),
             "run_manifest_id": run_manifest.get("manifest_id", ""),
             "result_manifest_id": result_manifest.get("manifest_id", ""),
@@ -938,7 +977,10 @@ def _verify_manifests(
     attempt_dir: Path,
     run_id: str,
     de_path: Path,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    *,
+    staged_counts: Path,
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str]:
     run_manifest = _load_required_manifest(attempt_dir / "run_manifest.json")
     result_manifest = _load_required_manifest(attempt_dir / "result_manifest.json")
     run_body = run_manifest["body"]
@@ -962,6 +1004,11 @@ def _verify_manifests(
         raise AdapterExecutionError(
             "run_manifest.json project_snapshot_sha256 does not match project.snapshot.json"
         )
+    input_counts_sha256 = _verify_input_evidence(
+        staged_counts=staged_counts,
+        contract=contract,
+        run_body=run_body,
+    )
 
     files = result_body.get("files")
     result_fingerprints = result_body.get("fingerprints")
@@ -986,7 +1033,62 @@ def _verify_manifests(
         raise AdapterExecutionError(
             "result_manifest.json DESeq2 result hash does not match the downloaded artifact"
         )
-    return run_manifest, result_manifest
+    return run_manifest, result_manifest, input_counts_sha256
+
+
+def _verify_input_evidence(
+    *,
+    staged_counts: Path,
+    contract: Mapping[str, Any],
+    run_body: Mapping[str, Any],
+) -> str:
+    contract_body = contract.get("body")
+    if contract.get("schema_version") != 1 or not isinstance(contract_body, dict):
+        raise AdapterExecutionError("Analysis Contract schema/body is invalid")
+    if contract.get("contract_id") != f"sha256:{canonical_sha256(contract_body)}":
+        raise AdapterExecutionError("Analysis Contract ID is not recomputable")
+
+    contract_inputs = contract_body.get("inputs")
+    contract_fingerprints = contract_body.get("fingerprints")
+    run_inputs = run_body.get("inputs")
+    run_fingerprints = run_body.get("fingerprints")
+    if not isinstance(contract_inputs, list) or not isinstance(contract_fingerprints, dict):
+        raise AdapterExecutionError("Analysis Contract inputs evidence is invalid")
+    if not isinstance(run_inputs, list) or not isinstance(run_fingerprints, dict):
+        raise AdapterExecutionError("run_manifest.json inputs evidence is invalid")
+    if contract_fingerprints.get("inputs_sha256") != canonical_sha256(contract_inputs):
+        raise AdapterExecutionError("Analysis Contract inputs_sha256 is not recomputable")
+    if run_fingerprints.get("inputs_sha256") != canonical_sha256(run_inputs):
+        raise AdapterExecutionError("run_manifest.json inputs_sha256 is not recomputable")
+    if run_inputs != contract_inputs:
+        raise AdapterExecutionError(
+            "run_manifest.json inputs differ from the approved Analysis Contract inputs"
+        )
+
+    counts_entries = [
+        item
+        for item in contract_inputs
+        if isinstance(item, dict) and item.get("role") == "counts"
+    ]
+    if len(counts_entries) != 1:
+        raise AdapterExecutionError(
+            "Analysis Contract must contain exactly one counts input artifact"
+        )
+    staged_hash = sha256_file(staged_counts)
+    counts_entry = counts_entries[0]
+    if counts_entry.get("sha256") != staged_hash:
+        raise AdapterExecutionError(
+            "staged counts hash differs from the Analysis Contract and run manifest"
+        )
+    if counts_entry.get("size_bytes") != staged_counts.stat().st_size:
+        raise AdapterExecutionError(
+            "staged counts size differs from the Analysis Contract and run manifest"
+        )
+    if counts_entry.get("logical_name") != staged_counts.name:
+        raise AdapterExecutionError(
+            "staged counts name differs from the Analysis Contract and run manifest"
+        )
+    return staged_hash
 
 
 def _load_required_manifest(path: Path) -> dict[str, Any]:

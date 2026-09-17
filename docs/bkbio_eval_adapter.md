@@ -61,7 +61,9 @@ python -m rnaseq_agent.bkbio_eval_adapter `
 模板可包含 `server`、`container`、`reference`、`polling` 和 `evaluation`。非默认 SSH 私钥可通过
 `server.auth_mode: key` 与 `server.key_path` 指定；Adapter 只在本次运行期间把它装入
 进程内 SSH 凭据，结束后恢复原凭据。同一 host/user 的临时凭据安装与恢复由进程锁串行
-保护，模板的 `server` 也只接收连接字段、`init_commands` 和 `key_path` 白名单。用户级共享连接中的 host、user、scheduler、资源
+保护。模板的 `server`、`container` 和 `evaluation` 都按字段白名单复制，
+`registry_token`、`api_key`、`passphrase`、`private_key` 等秘密字段不会进入项目、session、
+Analysis Contract 或结果。用户级共享连接中的 host、user、scheduler、资源
 和远程根目录会覆盖模板中的同名连接字段。若既没有完整共享连接，也没有完整模板，
 命令以退出码 `3` 报告 unavailable。远程 R/DESeq2 或容器不可用时，提交作业前的只读
 探针同样以退出码 `3` 报告 unavailable；若探针通过后真实执行仍失败，则以退出码 `5`
@@ -70,8 +72,9 @@ python -m rnaseq_agent.bkbio_eval_adapter `
 `container.enabled: true` 时，运行时探针和 counts stage 都只运行配置的容器，不会先尝试
 宿主机 R；关闭容器时才使用宿主机 R。探针记录实际模式以及 R、DESeq2、jsonlite 版本。
 `evaluation.release_mode: true` 还要求启用容器、提供 `sha256:<64 hex>` 镜像 digest，并在
-远端执行前用镜像文件的 SHA-256 核验该 digest。缺少、格式错误或无法核验的 digest 都会
-以 unavailable 拒绝执行。
+远端探针执行前用镜像文件的 SHA-256 核验该 digest。真实 counts stage 会在启动容器内
+Rscript 前再次计算并核对镜像文件 hash，缩小探针通过后镜像被替换的 TOCTOU 窗口。缺少、
+格式错误、无法核验或 stage 启动时不再匹配的 digest 都会拒绝执行。
 
 ## 首版科学边界
 
@@ -81,7 +84,7 @@ python -m rnaseq_agent.bkbio_eval_adapter `
 - `paired` 必须为 `false`；
 - 必须恰好有 reference/contrast 两组，且每组至少 3 个生物学重复；
 - `counts.tsv` 样本列必须与 `coldata.tsv` 的 `sample` 精确一致；
-- 当前真实 counts stage 未暴露 `min_count_prefilter`，因此该值必须为 `0` 或省略。
+- 当前真实 counts stage 未暴露 `min_count_prefilter`，因此该值必须为数值 `0` 或省略。
 
 paired 或多因素设计会在创建项目和远程执行之前写出严格的 `NOT_EVALUABLE` 结果并以
 退出码 `0` 返回。该结果只包含 `schema`、`analyzer`、`status`、`reason_code` 和可选
@@ -89,6 +92,10 @@ paired 或多因素设计会在创建项目和远程执行之前写出严格的 
 畸形输入仍以非零退出码失败。因此当前 `L0_smoke_synthetic` 是首轮可执行
 目标；现有 TCGA（`~ patient + condition`）和 airway（`~ cell + condition`）L1 用例
 要等主项目真实 DESeq2 流程支持相应设计后才能接入。
+
+非零数值 `min_count_prefilter` 同样属于能力不支持，使用稳定
+`reason_code: unsupported_design` 结构化拒绝并返回 `0`。字符串、数组、对象、布尔值或
+非有限值等畸形参数仍是输入错误，返回非零退出码且不写结果。
 
 `L0_smoke_synthetic` 的 8 个基因会让 DESeq2 的标准 dispersion curve 拟合报出
 `all gene-wise dispersion estimates are within 2 orders of magnitude`。主流程只对这一条
@@ -123,8 +130,10 @@ DESeq2 结果表上应用用例声明的 FDR/log2FC 阈值，不会重新计算�
 log2FC 阈值与冻结配置逐项一致。`run_manifest.json`、`result_manifest.json` 与
 `project.snapshot.json` 都是必需审计输入；Adapter 会重算 manifest ID、snapshot hash、
 文件清单 hash 和 DESeq2 结果 hash，并核对 run ID。缺失、损坏或伪造的 manifest 会关闭
-成功路径。输入 hash 来自项目已经 staging 且进入 Analysis Contract/运行清单的 counts
-文件，避免 evaluator 原始路径在 staging 后发生变化造成 TOCTOU。
+成功路径。staged counts 当前文件 hash、Analysis Contract 的唯一 counts artifact、
+contract `inputs_sha256`、run manifest 的 `inputs` 与 `inputs_sha256` 必须三方一致。结果中的
+输入 hash 使用这次核验得到的 staged hash；即使 manifest 创建后 staged 文件被替换，
+Adapter 也会 fail closed，避免 evaluator 原始路径或 staging 路径变化造成 TOCTOU。
 
 若配置只有镜像 tag/path、没有 digest，Adapter 会把 digest 记录为 `null`，不会把
 tag 或配置哈希冒充成镜像内容 digest。
