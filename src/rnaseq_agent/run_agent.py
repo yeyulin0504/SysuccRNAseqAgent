@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import platform
+import re
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -99,6 +100,19 @@ def upload_project_fastqs(config_path: Path) -> RunOutcome:
 
 
 def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
+    previous_claim_id = _current_execution_claim_id(config_path)
+    try:
+        return _run_project_claimed(config_path, wait=wait)
+    except BaseException as exc:
+        _settle_boundary_exception(
+            config_path,
+            previous_claim_id=previous_claim_id,
+            message=str(exc),
+        )
+        raise
+
+
+def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
     project_dir = config_path.parent
     claim_start = _begin_execution_claim(config_path, stage="full")
     conflict = claim_start.get("conflict")
@@ -185,7 +199,26 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
             project_message="Remote analysis job submission started; retry is blocked pending reconciliation.",
         )
         submit_result = _submit_remote_job(run_config, logs_dir, transport)
-        job_id = submit_result.stdout.strip() or "submitted"
+        job_id = _parse_scheduler_job_id(run_config, submit_result.stdout)
+        if not job_id:
+            message = (
+                "Scheduler submission returned no valid job id. The claim remains submitting; "
+                "inspect the scheduler before any retry."
+            )
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={"submitting"},
+                claim_status="submitting",
+                project_state="reconcile_required",
+                project_message=message,
+            )
+            _best_effort_log_event(
+                logs_dir,
+                "submission_reconcile_required",
+                {"run_id": run_id, "reason": "missing_or_invalid_job_id"},
+            )
+            return RunOutcome("reconcile_required", message, project_dir)
 
         _transition_execution_claim(
             config_path,
@@ -282,14 +315,14 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
             )
         _notify(run_config, final_state, message)
         return RunOutcome(final_state, message, project_dir)
-    except Exception as exc:
+    except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message)
-        _log_event(logs_dir, "run_failed", {"run_id": run_id, "message": message})
+        _best_effort_log_event(logs_dir, "run_failed", {"run_id": run_id, "message": message})
         try:
             _notify(run_config, "run_failed", message)
-        except Exception as notify_exc:
-            _log_event(logs_dir, "notify_failed", {"message": str(notify_exc)})
+        except BaseException as notify_exc:
+            _best_effort_log_event(logs_dir, "notify_failed", {"message": str(notify_exc)})
         raise
 
 
@@ -297,6 +330,25 @@ def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
 
 
 def run_stage_project(
+    config_path: Path,
+    stage: str,
+    *,
+    wait: bool = True,
+) -> RunOutcome:
+    previous_claim_id = _current_execution_claim_id(config_path)
+    try:
+        return _run_stage_project_claimed(config_path, stage, wait=wait)
+    except BaseException as exc:
+        _settle_boundary_exception(
+            config_path,
+            previous_claim_id=previous_claim_id,
+            message=str(exc),
+            stage=stage,
+        )
+        raise
+
+
+def _run_stage_project_claimed(
     config_path: Path,
     stage: str,
     *,
@@ -433,7 +485,27 @@ def run_stage_project(
             stage_status="submitting",
         )
         submit_result = _submit_stage_job(run_config, stage, logs_dir, transport)
-        job_id = submit_result.stdout.strip() or "submitted"
+        job_id = _parse_scheduler_job_id(run_config, submit_result.stdout)
+        if not job_id:
+            message = (
+                f"Stage {stage} submission returned no valid job id. The claim remains "
+                "submitting; inspect the scheduler before any retry."
+            )
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={"submitting"},
+                claim_status="submitting",
+                project_state="reconcile_required",
+                project_message=message,
+                stage_status="submitting",
+            )
+            _best_effort_log_event(
+                logs_dir,
+                "stage_submission_reconcile_required",
+                {"run_id": run_id, "stage": stage, "reason": "missing_or_invalid_job_id"},
+            )
+            return RunOutcome("reconcile_required", message, project_dir)
         submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _transition_execution_claim(
             config_path,
@@ -513,44 +585,108 @@ def run_stage_project(
         )
         _notify(run_config, final_state, message)
         return RunOutcome(final_state, message, project_dir)
-    except Exception as exc:
+    except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message, stage=stage)
-        _log_event(logs_dir, "stage_run_failed", {"run_id": run_id, "stage": stage, "message": message})
+        _best_effort_log_event(
+            logs_dir,
+            "stage_run_failed",
+            {"run_id": run_id, "stage": stage, "message": message},
+        )
         try:
             _notify(run_config, "run_failed", message)
-        except Exception as notify_exc:
-            _log_event(logs_dir, "notify_failed", {"message": str(notify_exc)})
+        except BaseException as notify_exc:
+            _best_effort_log_event(logs_dir, "notify_failed", {"message": str(notify_exc)})
         raise
 
 
 def refresh_status(config_path: Path) -> dict[str, Any]:
     config = normalize_config(load_json(config_path))
+    observed_status = config.get("status", {})
+    observed_run_id = str(observed_status.get("run_id") or "")
+    observed_claim_id = str(observed_status.get("execution_claim_id") or "")
+    observed_claims = observed_status.get("execution_claims")
+    observed_claim = (
+        observed_claims.get(observed_claim_id)
+        if isinstance(observed_claims, dict) and observed_claim_id
+        else None
+    )
+    observed_claim_status = str((observed_claim or {}).get("status") or "")
     active_config = _config_for_active_attempt(config)
     state = _read_remote_state(active_config, create_remote_transport(active_config))
     if state:
-        message = f"Remote state: {state}"
+        _apply_refresh_observation(
+            config_path,
+            observed_run_id=observed_run_id,
+            observed_claim_id=observed_claim_id,
+            observed_claim_status=observed_claim_status,
+            remote_state=state,
+        )
+    return normalize_config(load_json(config_path)).get("status", {})
+
+
+def _apply_refresh_observation(
+    config_path: Path,
+    *,
+    observed_run_id: str,
+    observed_claim_id: str,
+    observed_claim_status: str,
+    remote_state: str,
+) -> bool:
+    """Apply a remote observation only to the run and claim that were probed."""
+
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
         status = config.get("status", {})
-        claim_id = str(status.get("execution_claim_id") or "")
-        claims = status.get("execution_claims")
-        claim = claims.get(claim_id) if isinstance(claims, dict) else None
-        claim_state = str((claim or {}).get("status") or "")
-        if state in {"completed", "failed"} and claim_state in _ACTIVE_EXECUTION_CLAIM_STATUSES:
-            claim_stage = str((claim or {}).get("stage") or "")
+        if str(status.get("run_id") or "") != observed_run_id:
+            return False
+        if str(status.get("execution_claim_id") or "") != observed_claim_id:
+            return False
+
+        message = f"Remote state: {remote_state}"
+        if observed_claim_id:
+            claims = status.get("execution_claims")
+            if not isinstance(claims, dict):
+                return False
+            claim = claims.get(observed_claim_id)
+            if not isinstance(claim, dict):
+                return False
+            if str(claim.get("run_id") or "") != observed_run_id:
+                return False
+            live_claim_status = str(claim.get("status") or "")
+            if (
+                live_claim_status != observed_claim_status
+                or live_claim_status not in _ACTIVE_EXECUTION_CLAIM_STATUSES
+            ):
+                return False
+            claim_stage = str(claim.get("stage") or "")
             _transition_execution_claim(
                 config_path,
-                claim_id,
-                expected={claim_state},
-                claim_status="completed" if state == "completed" else "failed",
-                project_state=state,
+                observed_claim_id,
+                expected={live_claim_status},
+                claim_status=(
+                    "completed"
+                    if remote_state == "completed"
+                    else "failed"
+                    if remote_state == "failed"
+                    else live_claim_status
+                ),
+                project_state=remote_state,
                 project_message=message,
-                stage_status=("completed" if state == "completed" else "failed")
+                stage_status=(
+                    "completed"
+                    if remote_state == "completed"
+                    else "failed"
+                    if remote_state == "failed"
+                    else remote_state
+                )
                 if claim_stage != "full"
                 else None,
             )
-        else:
-            _update_status(config_path, state, message)
-    return normalize_config(load_json(config_path)).get("status", {})
+            return True
+
+        _update_status(config_path, remote_state, message)
+        return True
 
 
 def _upload_fastqs(
@@ -679,6 +815,23 @@ def _upload_support_files(
     )
     result = transport.execute(f"chmod 600 {uploaded}")
     _log_command(logs_dir, "Restrict support file permissions", result)
+
+
+def _parse_scheduler_job_id(config: dict[str, Any], stdout: str) -> str:
+    lines = [line.strip() for line in str(stdout or "").splitlines() if line.strip()]
+    if len(lines) != 1:
+        return ""
+    candidate = lines[0]
+    scheduler = str(config.get("server", {}).get("scheduler") or "").lower()
+    patterns = {
+        "local": r"[0-9]+",
+        "slurm": r"[0-9]+(?:;[A-Za-z0-9_.-]+)?",
+        "pbs": r"[0-9]+(?:\.[A-Za-z0-9_.-]+)?(?:\[\])?",
+    }
+    pattern = patterns.get(scheduler)
+    if not pattern or re.fullmatch(pattern, candidate) is None:
+        return ""
+    return candidate
 
 
 def _submit_remote_job(
@@ -942,6 +1095,60 @@ def _notify(config: dict[str, Any], state: str, message: str) -> None:
 
 
 _ACTIVE_EXECUTION_CLAIM_STATUSES = {"started", "submitting", "submitted"}
+_TERMINAL_EXECUTION_CLAIM_STATUSES = {"completed", "failed"}
+_KNOWN_EXECUTION_CLAIM_STATUSES = (
+    _ACTIVE_EXECUTION_CLAIM_STATUSES | _TERMINAL_EXECUTION_CLAIM_STATUSES
+)
+_LEGACY_ACTIVE_PROJECT_STATES = {
+    "preparing",
+    "validated",
+    "uploaded",
+    "submitting",
+    "submitted",
+    "running",
+    "queued",
+    "timeout",
+    "reconcile_required",
+}
+_LEGACY_ALWAYS_CONFLICT_PROJECT_STATES = {
+    "submitting",
+    "submitted",
+    "running",
+    "queued",
+    "timeout",
+    "reconcile_required",
+}
+_LEGACY_ACTIVE_STAGE_STATES = _LEGACY_ACTIVE_PROJECT_STATES | {"remote_completed"}
+
+
+def _current_execution_claim_id(config_path: Path) -> str:
+    try:
+        status = normalize_config(load_json(config_path)).get("status", {})
+    except (OSError, ValueError, TypeError):
+        return ""
+    return str(status.get("execution_claim_id") or "").strip()
+
+
+def _settle_boundary_exception(
+    config_path: Path,
+    *,
+    previous_claim_id: str,
+    message: str,
+    stage: str | None = None,
+) -> None:
+    current_claim_id = _current_execution_claim_id(config_path)
+    if not current_claim_id or current_claim_id == previous_claim_id:
+        return
+    _record_execution_exception(config_path, current_claim_id, message, stage=stage)
+
+
+def _best_effort_log_event(logs_dir: Path, event: str, payload: dict[str, Any]) -> None:
+    try:
+        _log_event(logs_dir, event, payload)
+    except BaseException:
+        pass
+
+
 def _execution_contract_id(config_path: Path, config: dict[str, Any]) -> str:
     verified = str(config.get("execution", {}).get("verified_contract_id") or "").strip()
     if verified:
@@ -985,13 +1192,105 @@ def _reconciliation_payload(*, required: bool) -> dict[str, Any]:
 
 
 def _claim_conflict_message(claim: dict[str, Any]) -> str:
+    reason = str(claim.get("reason") or "").strip()
+    reason_text = f"Reason: {reason}. " if reason else ""
     return (
         "Execution conflict: durable claim "
         f"{claim.get('claim_id', '<unknown>')} is {claim.get('status', 'active')} "
         f"for run {claim.get('run_id', '<unknown>')} stage {claim.get('stage', '<unknown>')}. "
+        f"{reason_text}"
         "Retry is fail-closed. Reconcile the scheduler and attempt artifacts manually, then "
         "mark the claim terminal before starting another execution."
     )
+
+
+def _reconciliation_conflict(status: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "claim_id": str(status.get("execution_claim_id") or "reconciliation-required"),
+        "run_id": str(status.get("run_id") or "legacy-or-unknown"),
+        "stage": str(status.get("stage") or "project"),
+        "status": "reconcile_required",
+        "reason": reason,
+    }
+
+
+def _valid_execution_claim(claim_id: str, claim: Any) -> bool:
+    if not isinstance(claim, dict):
+        return False
+    required_strings = ("claim_id", "project_id", "run_id", "stage", "created_at", "updated_at")
+    if any(
+        not isinstance(claim.get(field), str) or not claim[field].strip()
+        for field in required_strings
+    ):
+        return False
+    if claim.get("claim_id") != claim_id:
+        return False
+    if not isinstance(claim.get("contract_id"), str):
+        return False
+    status = claim.get("status")
+    if status not in _KNOWN_EXECUTION_CLAIM_STATUSES:
+        return False
+    key = claim.get("idempotency_key")
+    if not isinstance(key, str) or not key.startswith("sha256:"):
+        return False
+    reconciliation = claim.get("reconciliation")
+    return isinstance(reconciliation, dict) and isinstance(reconciliation.get("required"), bool)
+
+
+def _durable_execution_conflict(status: dict[str, Any]) -> dict[str, Any] | None:
+    pointer = str(status.get("execution_claim_id") or "").strip()
+    if "execution_claims" in status:
+        raw_claims = status.get("execution_claims")
+        if not isinstance(raw_claims, dict):
+            return _reconciliation_conflict(status, "execution_claims ledger has the wrong type")
+        for claim_id, claim in raw_claims.items():
+            if not isinstance(claim_id, str) or not _valid_execution_claim(claim_id, claim):
+                return _reconciliation_conflict(status, "execution_claims ledger contains a malformed entry")
+        if pointer and pointer not in raw_claims:
+            return _reconciliation_conflict(status, "execution_claim_id points to a missing claim")
+        for claim in raw_claims.values():
+            if claim.get("status") in _ACTIVE_EXECUTION_CLAIM_STATUSES:
+                return claim
+        if str(status.get("state") or "") in _LEGACY_ACTIVE_PROJECT_STATES:
+            return _reconciliation_conflict(
+                status,
+                "project state is active but the durable ledger has no active claim",
+            )
+    elif pointer:
+        return _reconciliation_conflict(status, "execution_claim_id exists without a claim ledger")
+
+    raw_stages = status.get("stages")
+    if raw_stages is not None:
+        if not isinstance(raw_stages, dict):
+            return _reconciliation_conflict(status, "legacy stages ledger has the wrong type")
+        for stage_name, record in raw_stages.items():
+            if not isinstance(record, dict):
+                return _reconciliation_conflict(status, f"legacy stage {stage_name!s} is malformed")
+            stage_state = str(record.get("status") or "").strip()
+            if stage_state in _LEGACY_ACTIVE_STAGE_STATES:
+                conflict = _reconciliation_conflict(
+                    status,
+                    f"legacy stage {stage_name!s} remains {stage_state}",
+                )
+                conflict["stage"] = str(stage_name)
+                return conflict
+
+    project_state = str(status.get("state") or "").strip()
+    has_execution_evidence = bool(
+        status.get("run_id")
+        or status.get("job_id")
+        or status.get("attempt_dir")
+        or status.get("remote_run_workdir")
+        or raw_stages
+    )
+    if project_state in _LEGACY_ALWAYS_CONFLICT_PROJECT_STATES or (
+        project_state in _LEGACY_ACTIVE_PROJECT_STATES and has_execution_evidence
+    ):
+        return _reconciliation_conflict(
+            status,
+            f"legacy project execution remains {project_state}",
+        )
+    return None
 
 
 def _begin_execution_claim(config_path: Path, *, stage: str) -> dict[str, Any]:
@@ -1001,6 +1300,9 @@ def _begin_execution_claim(config_path: Path, *, stage: str) -> dict[str, Any]:
     with project_state_lock(config_path):
         config = normalize_config(load_json(config_path))
         status = config.setdefault("status", {})
+        conflict = _durable_execution_conflict(status)
+        if conflict:
+            return {"conflict": conflict}
         raw_claims = status.get("execution_claims")
         claims: dict[str, dict[str, Any]] = raw_claims if isinstance(raw_claims, dict) else {}
         project_id = str(config.get("project", {}).get("id") or project_dir.name)
@@ -1030,11 +1332,6 @@ def _begin_execution_claim(config_path: Path, *, stage: str) -> dict[str, Any]:
             run_id=run_id,
             stage=stage,
         )
-
-        for claim in claims.values():
-            if claim.get("status") not in _ACTIVE_EXECUTION_CLAIM_STATUSES:
-                continue
-            return {"conflict": claim}
 
         if stage != "full" and previous.get("status") in {
             "running",
@@ -1073,6 +1370,15 @@ def _begin_execution_claim(config_path: Path, *, stage: str) -> dict[str, Any]:
         attempt_dir = project_dir / "attempts" / run_id
         project_workdir = str(config.get("server", {}).get("remote_workdir") or "").rstrip("/")
         remote_run_workdir = f"{project_workdir}/attempts/{run_id}" if project_workdir else ""
+        for stale_field in (
+            "job_id",
+            "submitted_at",
+            "manifest_file",
+            "result_manifest_file",
+            "result_files_sha256",
+            "result_validation_errors",
+        ):
+            status.pop(stale_field, None)
         status.update(
             {
                 "state": "preparing",

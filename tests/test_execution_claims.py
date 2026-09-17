@@ -102,7 +102,7 @@ class CountingTransport:
         if "nohup bash scripts/submit" in remote_command:
             with self._lock:
                 self.submission_count += 1
-                stdout = f"fake-job-{self.submission_count}\n"
+                stdout = f"{1000 + self.submission_count}\n"
         return CommandResult(["fake-ssh", remote_command], 0, stdout, "")
 
     def upload(self, local_paths, remote_dir: str) -> CommandResult:
@@ -110,6 +110,19 @@ class CountingTransport:
 
     def download(self, remote_file: str, local_path: Path) -> CommandResult:
         raise AssertionError("wait=False must not download remote results")
+
+
+class AmbiguousSubmitTransport(CountingTransport):
+    def __init__(self, submit_stdout: str) -> None:
+        super().__init__()
+        self.submit_stdout = submit_stdout
+
+    def execute(self, remote_command: str) -> CommandResult:
+        if "nohup bash scripts/submit" in remote_command:
+            with self._lock:
+                self.submission_count += 1
+            return CommandResult(["fake-ssh", remote_command], 0, self.submit_stdout, "")
+        return CommandResult(["fake-ssh", remote_command], 0, "", "")
 
 
 def _concurrent_calls(call):
@@ -341,3 +354,182 @@ def test_claim_binds_frozen_contract_identifier_when_present(tmp_path, monkeypat
 
     assert outcome.state == "submitted"
     assert _claims(config_path)[0]["contract_id"] == "sha256:frozen-contract"
+
+
+def test_full_setup_failure_after_claim_closes_started_claim(tmp_path) -> None:
+    """Leaving setup failures started would permanently block a run that never reached submit."""
+    config_path = _fastq_project(tmp_path)
+    config = load_json(config_path)
+    config["server"]["remote_workdir"] = ""
+    save_json(config_path, config)
+
+    with pytest.raises(ValueError, match="remote_workdir"):
+        run_project(config_path, wait=False)
+
+    assert _claims(config_path)[0]["status"] == "failed"
+
+
+def test_keyboard_interrupt_before_submit_closes_started_claim(tmp_path, monkeypatch) -> None:
+    """BaseException before submit is definite non-submission and must close the claim."""
+    config_path = _fastq_project(tmp_path)
+
+    def interrupt_validation(*_args, **_kwargs):
+        raise KeyboardInterrupt("operator interrupted validation")
+
+    monkeypatch.setattr("rnaseq_agent.run_agent.validate_local_fastqs", interrupt_validation)
+
+    with pytest.raises(KeyboardInterrupt, match="validation"):
+        run_project(config_path, wait=False)
+
+    assert _claims(config_path)[0]["status"] == "failed"
+
+
+def test_stage_log_failure_before_submit_closes_claim_without_masking_error(
+    tmp_path, monkeypatch
+) -> None:
+    """Best-effort audit logging must not prevent closing a definite pre-submit failure."""
+    config_path = _counts_project(tmp_path)
+
+    def broken_log(*_args, **_kwargs):
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr("rnaseq_agent.run_agent._log_event", broken_log)
+
+    with pytest.raises(OSError, match="audit disk unavailable"):
+        run_stage_project(config_path, "counts", wait=False)
+
+    assert _claims(config_path)[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("legacy_kind", ["full", "other_stage"])
+def test_legacy_active_execution_blocks_project_wide_submission(
+    tmp_path, monkeypatch, legacy_kind
+) -> None:
+    """Ignoring pre-upgrade active state would submit a second remote job during migration."""
+    config_path = _counts_project(tmp_path)
+    config = load_json(config_path)
+    if legacy_kind == "full":
+        config["status"] = {"state": "submitted"}
+    else:
+        config["status"] = {
+            "state": "confirmed",
+            "run_id": "legacy-stage-run",
+            "stages": {"counts": {"status": "submitted", "job_id": "654"}},
+        }
+    save_json(config_path, config)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+
+    outcome = (
+        run_project(config_path, wait=False)
+        if legacy_kind == "full"
+        else run_stage_project(config_path, "de", wait=False)
+    )
+
+    assert outcome.state == "conflict"
+    assert "reconcile" in outcome.message.lower()
+    assert transport.submission_count == 0
+
+
+@pytest.mark.parametrize(
+    ("ledger", "pointer"),
+    [
+        ([], "old:full:deadbeef"),
+        ({}, "old:full:deadbeef"),
+        ({"broken": {"claim_id": "broken", "status": "mystery"}}, "broken"),
+    ],
+)
+def test_malformed_claim_ledger_fails_closed(tmp_path, monkeypatch, ledger, pointer) -> None:
+    """Treating damaged durable state as empty would permit duplicate scheduler effects."""
+    config_path = _fastq_project(tmp_path)
+    config = load_json(config_path)
+    config["status"] = {
+        "state": "submitted",
+        "run_id": "old-run",
+        "execution_claim_id": pointer,
+        "execution_claims": ledger,
+    }
+    save_json(config_path, config)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+
+    outcome = run_project(config_path, wait=False)
+
+    assert outcome.state == "conflict"
+    assert "reconcile" in outcome.message.lower()
+    assert transport.submission_count == 0
+
+
+@pytest.mark.parametrize(
+    ("stage", "submit_stdout"),
+    [("full", ""), ("counts", "accepted but job id unavailable\nsecond line")],
+)
+def test_ambiguous_scheduler_stdout_stays_submitting_for_reconciliation(
+    tmp_path, monkeypatch, stage, submit_stdout
+) -> None:
+    """Inventing a job id would falsely make an ambiguous scheduler side effect replayable."""
+    config_path = _fastq_project(tmp_path) if stage == "full" else _counts_project(tmp_path)
+    transport = AmbiguousSubmitTransport(submit_stdout)
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+
+    outcome = (
+        run_project(config_path, wait=False)
+        if stage == "full"
+        else run_stage_project(config_path, stage, wait=False)
+    )
+
+    status = load_json(config_path)["status"]
+    assert outcome.state == "reconcile_required"
+    assert status["state"] == "reconcile_required"
+    assert "job_id" not in status
+    assert _claims(config_path)[0]["status"] == "submitting"
+    assert transport.submission_count == 1
+
+
+@pytest.mark.parametrize("observed_state", ["queued", "completed"])
+def test_stale_refresh_observation_cannot_overwrite_new_claim(
+    tmp_path, monkeypatch, observed_state
+) -> None:
+    """A delayed probe for claim A must be discarded after claim B becomes current."""
+    from rnaseq_agent.run_agent import _transition_execution_claim
+
+    config_path = _fastq_project(tmp_path)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+    first = run_project(config_path, wait=False)
+    assert first.state == "submitted"
+    first_status = load_json(config_path)["status"]
+    first_claim_id = first_status["execution_claim_id"]
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    def delayed_probe(*_args):
+        probe_started.set()
+        release_probe.wait(timeout=5)
+        return observed_state
+
+    monkeypatch.setattr("rnaseq_agent.run_agent._read_remote_state", delayed_probe)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_refresh = executor.submit(refresh_status, config_path)
+        assert probe_started.wait(timeout=5)
+        _transition_execution_claim(
+            config_path,
+            first_claim_id,
+            expected={"submitted"},
+            claim_status="failed",
+            project_state="failed",
+            project_message="first attempt failed",
+        )
+        second = run_project(config_path, wait=False)
+        second_status = load_json(config_path)["status"]
+        second_claim_id = second_status["execution_claim_id"]
+        release_probe.set()
+        stale_refresh.result(timeout=5)
+
+    live = load_json(config_path)["status"]
+    assert second.state == "submitted"
+    assert second_claim_id != first_claim_id
+    assert live["execution_claim_id"] == second_claim_id
+    assert live["state"] == "submitted"
+    assert live["execution_claims"][second_claim_id]["status"] == "submitted"

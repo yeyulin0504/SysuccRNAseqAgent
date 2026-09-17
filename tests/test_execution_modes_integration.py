@@ -87,7 +87,7 @@ class FakeTransport:
 
     def execute(self, remote_command: str) -> CommandResult:
         self.executed.append(remote_command)
-        stdout = "fake-job-1\n" if "nohup bash scripts/submit.sh" in remote_command else ""
+        stdout = "1001\n" if "nohup bash scripts/submit.sh" in remote_command else ""
         return CommandResult(["fake-ssh", remote_command], 0, stdout, "")
 
     def upload(self, local_paths, remote_dir: str) -> CommandResult:
