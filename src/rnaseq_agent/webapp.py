@@ -20,6 +20,7 @@ stays usable while the three-page surface is introduced.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import shlex
@@ -84,6 +85,7 @@ from .container_service import (
 from .connection_store import (
     apply_connection_to_config,
     apply_llm_to_config,
+    connection_file_path,
     llm_model_name,
     load_connection,
     load_llm,
@@ -464,6 +466,11 @@ def create_app(
     # the in-flight invoke so the HTTP layer can release while a job runs.
     _graph_runs: dict[str, dict[str, Any]] = {}
     _graph_lock = threading.Lock()
+    # The conversational graph uses one durable checkpoint per project/thread.
+    # Serialize every stream/resume touching that checkpoint so two browser
+    # clicks cannot both validate the same visible card before either consumes it.
+    _chat_graph_locks: dict[tuple[str, str], threading.Lock] = {}
+    _chat_graph_locks_guard = threading.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1497,7 +1504,7 @@ def create_app(
             return []
         return history
 
-    def _drive_chat_graph(
+    def _drive_chat_graph_unlocked(
         project_id: str,
         project_dir: Path,
         thread_id: str,
@@ -1534,10 +1541,42 @@ def create_app(
                 # 确认卡片要写「旧值 → 新值」，所以守卫节点需要读项目配置。
                 # 这个回调只读、不写，符合 guardrail「无副作用」的约束。
                 config_reader=_read_project_config,
+                # 卡片还要绑定 project.json + 用户级共享连接的不可变指纹；
+                # 返回值只含摘要和公开标识，绝不把密码/API key 放进图状态。
+                approval_context_reader=_read_approval_context,
             )
             if resume is not None:
                 from langgraph.types import Command
 
+                # Compare the browser's id with the *durable* checkpoint before
+                # issuing Command(resume).  A consumed/old/cross-thread card has
+                # no authority even if it still exists in a browser tab.
+                snapshot = graph.get_state(config)
+                approval_context = (snapshot.values or {}).get("approval_context") or {}
+                expected_id = (
+                    str(approval_context.get("approval_id") or "")
+                    if isinstance(approval_context, dict)
+                    else ""
+                )
+                supplied_id = str(resume.get("approval_id") or "")
+                waiting_confirmation = "confirmation" in tuple(snapshot.next or ())
+                if (
+                    not waiting_confirmation
+                    or not expected_id
+                    or not supplied_id
+                    or supplied_id != expected_id
+                ):
+                    outcome.update(
+                        {
+                            "reply": "这张确认卡已失效或不属于当前项目/对话，请重新发起操作。",
+                            "via": "rejected",
+                            "status": "ok",
+                            "tool_log": list(
+                                (snapshot.values or {}).get("tool_log") or []
+                            ),
+                        }
+                    )
+                    return
                 graph_input: Any = Command(resume=resume)
             else:
                 snapshot = graph.get_state(config)
@@ -1637,6 +1676,31 @@ def create_app(
                 }
             )
 
+    def _drive_chat_graph(
+        project_id: str,
+        project_dir: Path,
+        thread_id: str,
+        text: str,
+        llm_config: dict[str, Any],
+        outcome: dict[str, Any],
+        *,
+        resume: dict[str, Any] | None = None,
+    ):
+        """Serialize one project's conversational checkpoint while it streams."""
+        key = (str(project_id), str(thread_id))
+        with _chat_graph_locks_guard:
+            lock = _chat_graph_locks.setdefault(key, threading.Lock())
+        with lock:
+            yield from _drive_chat_graph_unlocked(
+                project_id,
+                project_dir,
+                thread_id,
+                text,
+                llm_config,
+                outcome,
+                resume=resume,
+            )
+
     def _read_project_config(project_dir: Path) -> dict[str, Any]:
         """Read a project's config for confirmation-card rendering. **只读**。
 
@@ -1655,6 +1719,108 @@ def create_app(
             return apply_connection_to_config(payload, load_connection())
         except Exception:  # noqa: BLE001 - card rendering must never break a turn
             return {}
+
+    def _read_approval_context(project_dir: Path) -> dict[str, Any]:
+        """Return a secret-free revision/hash for durable tool approval.
+
+        The source-file hashes make *any* project/shared-store edit invalidate a
+        waiting card, including credential replacement, while the graph state
+        receives only SHA-256 digests — never decrypted secrets or ciphertext.
+        """
+
+        def file_hash(path: Path) -> tuple[str, bool]:
+            if not path.is_file():
+                return "missing", True
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        digest.update(chunk)
+            except OSError:
+                return "unavailable", False
+            return digest.hexdigest(), True
+
+        def secret_free(value: Any) -> Any:
+            if isinstance(value, dict):
+                cleaned: dict[str, Any] = {}
+                for raw_key, item in value.items():
+                    key = str(raw_key)
+                    lowered = key.lower()
+                    if any(
+                        marker in lowered
+                        for marker in ("password", "api_key", "secret", "credential", "token")
+                    ):
+                        cleaned[key] = "<redacted>" if item not in (None, "") else ""
+                    else:
+                        cleaned[key] = secret_free(item)
+                return cleaned
+            if isinstance(value, list):
+                return [secret_free(item) for item in value]
+            return value
+
+        project_path = Path(project_dir) / "project.json"
+        shared_path = connection_file_path()
+        project_digest, project_available = file_hash(project_path)
+        shared_digest, shared_available = file_hash(shared_path)
+        session_digest, session_available = file_hash(Path(project_dir) / "session.json")
+
+        project: dict[str, Any] = {}
+        if project_path.is_file():
+            try:
+                loaded = load_json(project_path)
+                if isinstance(loaded, dict):
+                    project = loaded
+            except Exception:  # noqa: BLE001 - hash still records unreadable state
+                project = {}
+
+        contract_id = ""
+        execution = project.get("execution") if isinstance(project.get("execution"), dict) else {}
+        configured_contract = str(execution.get("contract_file") or "analysis_contract.json")
+        contract_path = Path(configured_contract)
+        if not contract_path.is_absolute():
+            contract_path = Path(project_dir) / contract_path
+        try:
+            contract = load_json(contract_path) if contract_path.is_file() else {}
+            if isinstance(contract, dict):
+                contract_id = str(contract.get("contract_id") or "")
+        except Exception:  # noqa: BLE001 - absent/corrupt contract binds as empty
+            contract_id = ""
+
+        contract_digest, contract_available = file_hash(contract_path)
+        effective_config = secret_free(_read_project_config(project_dir))
+        merged_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "project_file_sha256": project_digest,
+                    "session_file_sha256": session_digest,
+                    "contract_file_sha256": contract_digest,
+                    "shared_connection_file_sha256": shared_digest,
+                    "effective_merged_config": effective_config,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        status = project.get("status") if isinstance(project.get("status"), dict) else {}
+        return {
+            "available": all(
+                (
+                    project_available,
+                    shared_available,
+                    session_available,
+                    contract_available,
+                )
+            ),
+            "config_revision": (
+                f"project:{project_digest[:16]}|session:{session_digest[:16]}|"
+                f"contract:{contract_digest[:16]}|shared:{shared_digest[:16]}"
+            ),
+            "config_hash": f"sha256:{merged_digest}",
+            "contract_id": contract_id,
+            "run_id": str(status.get("run_id") or ""),
+        }
 
     def _run_tool(
         name: str,
@@ -2548,7 +2714,7 @@ def create_app(
         Body::
 
             {"project_id": "...", "thread_id": "main",
-             "approved": true, "note": "可选备注"}
+             "approval_id": "appr_...", "approved": true, "note": "可选备注"}
 
         Same SSE framing as ``/api/chat/stream`` (``step`` / ``delta`` /
         ``confirm`` / ``done``). The user message was already persisted by the
@@ -2559,6 +2725,9 @@ def create_app(
         approved = payload.get("approved")
         if not isinstance(approved, bool):
             return {"error": "缺少 approved（true / false）。"}
+        approval_id = str(payload.get("approval_id") or "").strip()
+        if not approval_id:
+            return {"error": "缺少浏览器确认卡上的 approval_id。"}
         note = str(payload.get("note") or "").strip()
 
         def sse(event: str, data: dict[str, Any]) -> str:
@@ -2602,7 +2771,11 @@ def create_app(
                     "",
                     llm_config,
                     outcome,
-                    resume={"approved": approved, "note": note},
+                    resume={
+                        "approval_id": approval_id,
+                        "approved": approved,
+                        "note": note,
+                    },
                 ):
                     if event == "step":
                         yield step(data["id"], data["label"], data["status"], data["detail"])

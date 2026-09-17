@@ -616,6 +616,16 @@ function showStreamError(message) {
    批准 / 拒绝 卡片，用户点击后 POST /api/chat/resume 恢复同一张图的线程。
    模型不能替用户点这个按钮——写盘与执行的决定权始终在人手上。 */
 function renderConfirmCard(payload) {
+  const previous = document.getElementById("liveConfirm");
+  if (previous) {
+    previous.removeAttribute("id");
+    const oldActs = previous.querySelector(".acts");
+    if (oldActs) oldActs.remove();
+    const replaced = document.createElement("div");
+    replaced.className = "settled";
+    replaced.textContent = "已被新的确认卡替换。";
+    previous.appendChild(replaced);
+  }
   const bubble = document.getElementById("liveReply");
   if (!bubble) return;
   const calls = Array.isArray(payload.calls) ? payload.calls : [];
@@ -638,13 +648,14 @@ function renderConfirmCard(payload) {
     </div>`;
   const approve = document.getElementById("liveConfirmApprove");
   const reject = document.getElementById("liveConfirmReject");
-  if (approve) approve.onclick = () => resolveConfirm(true);
-  if (reject) reject.onclick = () => resolveConfirm(false);
+  const approvalId = String(payload.approval_id || "");
+  if (approve) approve.onclick = () => resolveConfirm(true, approvalId);
+  if (reject) reject.onclick = () => resolveConfirm(false, approvalId);
   scrollToBottom();
 }
 
 /* 提交决定：卡片原地变成「已批准 / 已拒绝」，随后走同一套 SSE 处理。 */
-async function resolveConfirm(approved) {
+async function resolveConfirm(approved, approvalId) {
   const card = document.getElementById("liveConfirm");
   if (!card || streaming) return;
   const noteEl = document.getElementById("liveConfirmNote");
@@ -661,11 +672,11 @@ async function resolveConfirm(approved) {
   // 恢复时沿用同一轮思考块：清掉旧 id 之外的内容，让后续 step/delta 能落位。
   const live = document.getElementById("liveReply");
   if (live) live.removeAttribute("id");
-  await dispatchResume(approved, note);
+  await dispatchResume(approved, note, approvalId);
 }
 
 /* 与 /api/chat/resume 打交道：与 dispatch 共用 SSE 解析与收尾逻辑。 */
-async function dispatchResume(approved, note) {
+async function dispatchResume(approved, note, approvalId) {
   beginLiveTurn("", false);
   const hint = document.getElementById("viaHint");
   let settled = null;
@@ -676,6 +687,7 @@ async function dispatchResume(approved, note) {
       body: JSON.stringify({
         project_id: currentProject,
         thread_id: currentThread || undefined,
+        approval_id: approvalId,
         approved: approved,
         note: note,
       }),

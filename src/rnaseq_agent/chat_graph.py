@@ -20,17 +20,17 @@
 
 图结构::
 
-    START → agent ──(调工具)──→ guardrail ──(需确认)──→ [interrupt 挂起]
-              ↑                    │                          │
-              │                    └──(只读,免确认)──┐        │ resume
-              │                                      ↓        ↓
-              └──── execute ←────────────────────────┴────────┘
+    START → agent ──(调工具)──→ guardrail ──(需确认)──→ confirmation
+              ↑                    │                         │ interrupt/resume
+              │                    └──(只读,免确认)──┐       ↓
+              └──── execute ←────────────────────────┴───────┘
                        │
                        └──(还有顺延的组)──→ guardrail
 
-**关键约束：节点副作用**。``interrupt()`` 恢复时 LangGraph 会**从头重跑当前节点**，
-所以 ``guardrail`` 必须无副作用（只读 state），真实写盘只能发生在 ``execute``。
-把写盘放在 interrupt 之前的同一个节点里，用户每确认一次就会多写一次。
+**关键约束：节点副作用**。``interrupt()`` 恢复时 LangGraph 会**从头重跑当前节点**。
+因此 ``guardrail`` 只准备并持久化确认上下文，``confirmation`` 只读取该上下文并
+interrupt；两者都无项目副作用，真实写盘只能发生在 ``execute``。把随机卡号放在
+interrupt 节点或把写盘放在 interrupt 前，都会让重放改变授权或重复执行。
 
 **确认粒度**（用户 2026-09-16 定的边界「配置合并、执行单独」）由
 ``agent_tools.split_calls_for_round`` 决定：``guardrail`` **每轮只处理一组**——
@@ -44,7 +44,12 @@ langgraph 缺失时本模块不可用（``build_chat_graph`` 抛错），调用�
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import secrets
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypedDict
 
@@ -68,12 +73,14 @@ except ImportError:  # pragma: no cover - exercised only without langgraph
 
 
 from .agent_tools import (
+    CONNECTION_FIELDS,
     POLICY_NEVER,
     POLICY_SOLO,
     ToolCall,
     ToolCallAccumulator,
     confirmation_policy,
     describe_call,
+    normalize_write_arguments,
     parse_message_tool_calls,
     risk_of,
     split_calls_for_round,
@@ -96,6 +103,18 @@ ToolExecutor = Callable[[str, dict[str, Any], Path, bool], dict[str, Any]]
 #: ``ConfigReader`` 契约：``(项目目录) -> 当前配置``（读不到就返回 ``{}``）。
 #: 只用来在确认卡片上渲染「旧值 → 新值」，**必须只读**——它会跑在侧效应敏感的位置。
 ConfigReader = Callable[[Path], dict[str, Any]]
+
+#: ``ApprovalContextReader`` returns a secret-free fingerprint of every mutable
+#: server-side value that an approval must bind to.  The web implementation
+#: includes both project.json and the user-level shared connection store.
+ApprovalContextReader = Callable[[Path], dict[str, Any]]
+
+#: Increment whenever confirmation grouping or interpretation changes.  A card
+#: issued under an older policy version must be re-issued instead of being
+#: interpreted under new rules.
+CONFIRMATION_POLICY_VERSION = "tool-confirmation.v1"
+APPROVAL_CONTEXT_VERSION = 1
+DEFAULT_APPROVAL_TTL_SECONDS = 15 * 60
 
 
 class ChatState(TypedDict, total=False):
@@ -122,6 +141,10 @@ class ChatState(TypedDict, total=False):
     #: 当前这组是否已被用户拒绝。**必须记进 state**：``guardrail`` 在 resume 时
     #: 会被重跑，局部变量会丢，只有 state 里的值能带到 ``execute``。
     rejected: bool
+    #: Secret-free, durable binding prepared *before* the interrupt node.  It
+    #: survives interrupt replay and is consumed immediately after execution.
+    approval_context: dict[str, Any]
+    confirmation_card: dict[str, Any]
 
 
 SYSTEM_PROMPT = (
@@ -274,6 +297,172 @@ def chat_thread_config(project_id: str, thread_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": f"chat:{project_id}:{thread_id}"}}
 
 
+def _canonical_hash(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _normalize_call_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact JSON-safe arguments passed to the executor."""
+    raw = deepcopy(arguments)
+    if name == "write_project_config":
+        normalized = normalize_write_arguments(raw)
+        normalized["data_source"] = str(normalized.get("data_source") or "remote_path").strip()
+        normalized["fastq_dir"] = str(normalized.get("fastq_dir") or "").strip()
+        normalized["strandedness"] = str(
+            normalized.get("strandedness") or "unknown"
+        ).strip()
+        return normalized
+    if name == "edit_samples":
+        samples: list[dict[str, Any]] = []
+        for item in raw.get("samples") or []:
+            if not isinstance(item, dict):
+                continue
+            sample: dict[str, Any] = {"sample_id": str(item.get("sample_id") or "")}
+            for key in ("condition", "fastq_1", "fastq_2"):
+                if item.get(key) not in (None, ""):
+                    sample[key] = str(item[key])
+            samples.append(sample)
+        result: dict[str, Any] = {}
+        if "samples" in raw:
+            result["samples"] = samples
+        if "remove" in raw:
+            result["remove"] = [str(item) for item in (raw.get("remove") or [])]
+        return result
+    if name == "edit_connection":
+        result = {}
+        for key in CONNECTION_FIELDS:
+            if raw.get(key) is None:
+                continue
+            result[key] = (
+                int(raw[key])
+                if key in {"port", "threads", "memory_gb"}
+                else str(raw[key]).strip()
+            )
+        return result
+    if name == "edit_reference":
+        return {
+            key: str(raw[key]).strip()
+            for key in ("gtf", "genome_fasta", "star_index", "rsem_prefix")
+            if raw.get(key)
+        }
+    if name == "set_run_resources":
+        return {
+            key: int(raw[key])
+            for key in ("threads", "memory_gb")
+            if raw.get(key) is not None
+        }
+    if name == "configure_pipeline":
+        return {"step": str(raw.get("step") or "").strip(), "enabled": bool(raw.get("enabled"))}
+    if name == "set_diffexp_reference":
+        return {"reference_condition": str(raw.get("reference_condition") or "").strip()}
+    if name == "set_cms_options":
+        result = {"enabled": bool(raw.get("enabled"))}
+        if raw.get("n_perm") is not None:
+            result["n_perm"] = int(raw["n_perm"])
+        if raw.get("fdr") is not None:
+            result["fdr"] = float(raw["fdr"])
+        if str(raw.get("run_mode") or "").strip():
+            result["run_mode"] = str(raw["run_mode"]).strip()
+        return result
+    if name == "run_analysis":
+        stage = str(raw.get("stage") or "").strip()
+        return {"stage": stage} if stage else {}
+    if name == "browse_remote_samples":
+        return {"path": str(raw.get("path") or "").strip()}
+    return raw
+
+
+def _approval_description(
+    name: str,
+    arguments: dict[str, Any],
+    current: dict[str, Any],
+) -> str:
+    """Describe every argument that can change execution semantics."""
+    description = describe_call(name, arguments, current)
+    extra: list[str] = []
+    if name in {"write_project_config", "edit_samples"}:
+        for item in arguments.get("samples") or []:
+            if not isinstance(item, dict):
+                continue
+            sample_id = str(item.get("sample_id") or "（未命名）")
+            if item.get("fastq_1"):
+                extra.append(f"  {sample_id} R1：{item['fastq_1']}")
+            if item.get("fastq_2"):
+                extra.append(f"  {sample_id} R2：{item['fastq_2']}")
+    if name == "set_cms_options" and arguments.get("run_mode"):
+        old = "（默认）"
+        if isinstance(current.get("cms"), dict):
+            old = str(current["cms"].get("run_mode") or old)
+        extra.append(f"  运行模式：{old} → {arguments['run_mode']}")
+    return "\n".join([description, *extra]) if extra else description
+
+
+def _approval_claim_path(project_dir: Path, approval_id: str) -> Path:
+    """Return a path-safe durable claim filename for one approval card."""
+    digest = hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
+    return project_dir / ".approval_claims" / f"{digest}.json"
+
+
+def _write_claim_payload(path: Path, payload: dict[str, Any], *, exclusive: bool) -> None:
+    """Persist a claim before side effects, optionally using O_EXCL."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_WRONLY
+    flags |= os.O_EXCL if exclusive else os.O_TRUNC
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _secret_free(value: Any) -> Any:
+    """Return a deterministic view that never preserves credential values."""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            lowered = key.lower()
+            if any(
+                marker in lowered
+                for marker in ("password", "api_key", "secret", "credential", "token")
+            ):
+                result[key] = "<redacted>" if item not in (None, "") else ""
+            else:
+                result[key] = _secret_free(item)
+        return result
+    if isinstance(value, list):
+        return [_secret_free(item) for item in value]
+    if isinstance(value, tuple):
+        return [_secret_free(item) for item in value]
+    return value
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def build_chat_graph(
     *,
     executor: ToolExecutor,
@@ -282,6 +471,9 @@ def build_chat_graph(
     max_iterations: int = MAX_TOOL_ITERATIONS,
     timeout: float = 60.0,
     config_reader: ConfigReader | None = None,
+    approval_context_reader: ApprovalContextReader | None = None,
+    clock: Callable[[], datetime] | None = None,
+    approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS,
 ):
     """Compile the conversation graph.
 
@@ -292,6 +484,9 @@ def build_chat_graph(
     if not LANGGRAPH_AVAILABLE:  # pragma: no cover - optional dependency
         raise RuntimeError("langgraph 不可用，无法构建对话图。")
 
+    now = clock or (lambda: datetime.now(timezone.utc))
+    ttl_seconds = max(1, int(approval_ttl_seconds))
+
     def _current_config(state: ChatState) -> dict[str, Any]:
         """Read the project config for card rendering; never raises."""
         if config_reader is None:
@@ -300,6 +495,50 @@ def build_chat_graph(
             return config_reader(Path(state.get("project_dir") or "")) or {}
         except Exception:  # noqa: BLE001 - card rendering must never break the turn
             return {}
+
+    def _current_approval_snapshot(
+        state: ChatState, current_config: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Read only the secret-free fields that an approval binds to."""
+        if approval_context_reader is not None:
+            try:
+                raw = approval_context_reader(Path(state.get("project_dir") or "")) or {}
+            except Exception:  # noqa: BLE001 - unavailable context must fail closed
+                raw = {
+                    "available": False,
+                    "config_revision": "unavailable",
+                    "config_hash": "unavailable",
+                }
+        else:
+            safe = _secret_free(current_config if current_config is not None else _current_config(state))
+            digest = _canonical_hash(safe)
+            raw = {
+                "available": True,
+                "config_revision": digest,
+                "config_hash": digest,
+                "contract_id": (
+                    (safe.get("execution") or {}).get("verified_contract_id") or ""
+                    if isinstance(safe, dict)
+                    else ""
+                ),
+                "run_id": (
+                    (safe.get("status") or {}).get("run_id") or ""
+                    if isinstance(safe, dict)
+                    else ""
+                ),
+            }
+        revision = str(raw.get("config_revision") or "")
+        config_hash = str(raw.get("config_hash") or "")
+        available = raw.get("available") is not False
+        if "unavailable" in revision.lower() or "unavailable" in config_hash.lower():
+            available = False
+        return {
+            "available": available,
+            "config_revision": revision,
+            "config_hash": config_hash,
+            "contract_id": str(raw.get("contract_id") or ""),
+            "run_id": str(raw.get("run_id") or ""),
+        }
 
     def _append(state: ChatState, *new_messages: dict[str, Any]) -> list[dict[str, Any]]:
         return list(state.get("messages") or []) + list(new_messages)
@@ -330,6 +569,8 @@ def build_chat_graph(
                 "via": "llm",
                 "pending_calls": [],
                 "deferred_calls": [],
+                "approval_context": {},
+                "confirmation_card": {},
                 "reply": (
                     "我在这一轮里来回调用工具太多次了，先停在这里。\n"
                     f"当前进度：{state.get('reply') or '还没有可回报的结果'}。\n"
@@ -360,6 +601,8 @@ def build_chat_graph(
                     "error": str(payload),
                     "pending_calls": [],
                     "deferred_calls": [],
+                    "approval_context": {},
+                    "confirmation_card": {},
                     "reply": "",
                 }
 
@@ -369,15 +612,19 @@ def build_chat_graph(
         if not calls:
             # 最终答复也要落进 messages：否则下一轮对话拿不到历史，
             # 用户说「刚才那个改成 16 线程」时模型不知道「那个」是什么。
+            rejected_turn = bool(state.get("rejected"))
             return {
                 "status": "ok",
-                "via": "llm",
+                "via": "rejected" if rejected_turn else "llm",
                 "reply": content,
                 "messages": _append(
                     state, {"role": "assistant", "content": content}
                 ),
                 "pending_calls": [],
                 "deferred_calls": [],
+                "approval_context": {},
+                "confirmation_card": {},
+                "rejected": False,
                 # 最终答复已通过 writer 逐字推出；没推过（例如模型只回了空串）
                 # 时由上层整段输出，避免重复。
                 "streamed": streamed,
@@ -393,6 +640,10 @@ def build_chat_graph(
             "messages": _append(state, assistant_message),
             "pending_calls": [],
             "deferred_calls": [_pending_call(call) for call in calls],
+            "approval_context": {},
+            "confirmation_card": {},
+            "confirmed": False,
+            "rejected": False,
             "iterations": iterations + 1,
         }
 
@@ -435,17 +686,33 @@ def build_chat_graph(
             if problems:
                 rejected.append({**call, "_reason": "；".join(problems)})
             else:
-                valid.append(call)
+                try:
+                    normalized = _normalize_call_arguments(name, call.get("arguments") or {})
+                except Exception as exc:  # noqa: BLE001 - malformed args fail closed
+                    rejected.append(
+                        {
+                            **call,
+                            "_reason": f"参数规范化失败（{type(exc).__name__}）。",
+                        }
+                    )
+                    continue
+                valid.append({**call, "arguments": normalized})
         return valid, rest, rejected
 
     def node_guardrail(state: ChatState) -> ChatState:
-        """Risk gate. MUST stay side-effect free — LangGraph re-runs it on resume.
+        """Validate one group and durably prepare its approval card.
 
-        每轮只处理**一组**：``batch``（配置类）合成一张卡片，``solo``（执行类）
-        各占一张卡片。参数不合法的调用在这里挡下并回灌错误，让模型自己纠正。
+        This node is side-effect free.  Crucially, it is a separate checkpointed
+        node from ``node_confirmation``: the random approval id and timestamps are
+        created here once, then the interrupt node can replay without changing the
+        card the browser actually saw.
         """
         if not state.get("deferred_calls"):
-            return {"pending_calls": []}
+            return {
+                "pending_calls": [],
+                "approval_context": {},
+                "confirmation_card": {},
+            }
 
         # 参数校验先于确认：不合法的调用没有让人签字的必要。
         valid, rest, rejected = _split_head(state)
@@ -467,12 +734,20 @@ def build_chat_graph(
                     "deferred_calls": rest,
                     "confirmed": False,
                     "rejected": False,
+                    "approval_context": {},
+                    "confirmation_card": {},
                 }
             # 部分有效：把错误留在对话里，有效的那部分继续走确认。
             state = {**state, "messages": messages}
 
         if not valid:
-            return {"pending_calls": [], "deferred_calls": rest, "confirmed": False}
+            return {
+                "pending_calls": [],
+                "deferred_calls": rest,
+                "confirmed": False,
+                "approval_context": {},
+                "confirmation_card": {},
+            }
 
         # 只读工具直接放行；写盘/执行必须人工确认（唯一真源在 agent_tools）。
         policy = confirmation_policy(str(valid[0].get("name") or ""))
@@ -483,62 +758,153 @@ def build_chat_graph(
                 "deferred_calls": rest,
                 "confirmed": False,
                 "rejected": False,
+                "approval_context": {},
+                "confirmation_card": {},
             }
 
         current = _current_config(state)
+        snapshot = _current_approval_snapshot(state, current)
+        if not snapshot.get("available"):
+            return _reject_approval(
+                {
+                    **state,
+                    "pending_calls": valid,
+                    "deferred_calls": rest,
+                },
+                error="无法完整读取当前项目或共享配置，操作未执行。",
+            )
+        issued_at = now()
+        expires_at = issued_at + timedelta(seconds=ttl_seconds)
+        bound_calls = [
+            {
+                "call_id": str(call.get("call_id") or ""),
+                "name": str(call.get("name") or ""),
+                "arguments_hash": _canonical_hash(call.get("arguments") or {}),
+            }
+            for call in valid
+        ]
+        approval_context: dict[str, Any] = {
+            "approval_context_version": APPROVAL_CONTEXT_VERSION,
+            "approval_id": "appr_" + secrets.token_urlsafe(24),
+            "project_id": str(state.get("project_id") or ""),
+            "thread_id": str(state.get("thread_id") or ""),
+            "calls": bound_calls,
+            "policy": policy,
+            "confirmation_policy_version": CONFIRMATION_POLICY_VERSION,
+            **snapshot,
+            "issued_at": _utc_iso(issued_at),
+            "expires_at": _utc_iso(expires_at),
+        }
         cards = [
             {
                 "call_id": str(call.get("call_id") or ""),
                 "name": str(call.get("name") or ""),
+                "arguments_hash": _canonical_hash(call.get("arguments") or {}),
                 "risk": risk_of(str(call.get("name") or "")),
                 "label": tool_labels().get(str(call.get("name") or ""), str(call.get("name"))),
-                "description": describe_call(
+                "description": _approval_description(
                     str(call.get("name") or ""), call.get("arguments") or {}, current
                 ),
             }
             for call in valid
         ]
-        decision = interrupt(
+        card = {
+            **approval_context,
+            "type": "tool_confirmation",
+            "message": (
+                "以下配置改动会一起写入项目，需要你确认后才会执行。"
+                if policy != POLICY_SOLO
+                else "以下操作会真正执行，需要你单独确认。"
+            ),
+            "calls": cards,
+        }
+        return {
+            "messages": list(state.get("messages") or []),
+            "pending_calls": valid,
+            "deferred_calls": rest,
+            "approval_context": approval_context,
+            "confirmation_card": card,
+            "confirmed": False,
+            "rejected": False,
+        }
+
+    def _approval_context_error(state: ChatState) -> str:
+        context = state.get("approval_context") or {}
+        if not isinstance(context, dict) or not context.get("approval_id"):
+            return "没有可用的持久化确认上下文，操作未执行。"
+        if context.get("approval_context_version") != APPROVAL_CONTEXT_VERSION:
+            return "确认上下文版本已变化，请重新发起操作。"
+        if context.get("confirmation_policy_version") != CONFIRMATION_POLICY_VERSION:
+            return "确认策略版本已变化，请重新发起操作。"
+        if str(context.get("project_id") or "") != str(state.get("project_id") or ""):
+            return "确认卡不属于当前项目，操作未执行。"
+        if str(context.get("thread_id") or "") != str(state.get("thread_id") or ""):
+            return "确认卡不属于当前对话，操作未执行。"
+        if context.get("available") is not True:
+            return "无法读取当前项目或共享配置，操作未执行。"
+        if not str(context.get("config_revision") or ""):
+            return "无法读取当前项目配置版本，操作未执行。"
+        if not str(context.get("config_hash") or ""):
+            return "无法读取当前项目配置摘要，操作未执行。"
+        expires_at = _parse_utc(context.get("expires_at"))
+        current_time = now()
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        if expires_at is None or current_time.astimezone(timezone.utc) >= expires_at:
+            return "确认卡已过期，请重新发起操作。"
+
+        calls = list(state.get("pending_calls") or [])
+        bound = context.get("calls") or []
+        actual = [
             {
-                "type": "tool_confirmation",
-                "policy": policy,
-                "message": (
-                    "以下配置改动会一起写入项目，需要你确认后才会执行。"
-                    if policy != POLICY_SOLO
-                    else "以下操作会真正执行，需要你单独确认。"
-                ),
-                "calls": cards,
+                "call_id": str(call.get("call_id") or ""),
+                "name": str(call.get("name") or ""),
+                "arguments_hash": _canonical_hash(call.get("arguments") or {}),
             }
-        )
+            for call in calls
+        ]
+        if actual != bound:
+            return "待执行工具与确认卡不一致，操作未执行。"
+        for call in calls:
+            name = str(call.get("name") or "")
+            problems = validate_call(name, call.get("arguments") or {})
+            if problems:
+                return "执行前参数校验失败：" + "；".join(problems)
+            if confirmation_policy(name) != context.get("policy"):
+                return "工具确认策略已变化，请重新确认。"
 
-        # Fail closed: only an explicit JSON boolean true is approval.  The web
-        # endpoint validates this too, but the graph is a public API and must
-        # remain safe for CLI/tests/future callers that bypass that endpoint.
-        approved = isinstance(decision, dict) and decision.get("approved") is True
-        if approved:
-            return {
-                # A batch may contain both valid and invalid calls.  The
-                # validation errors were appended before interrupt(); resume
-                # re-runs this node, so persist that rebuilt message list in
-                # the returned state before execute handles the valid calls.
-                "messages": list(state.get("messages") or []),
-                "pending_calls": valid,
-                "deferred_calls": rest,
-                "confirmed": True,
-                "rejected": False,
-            }
+        fresh = _current_approval_snapshot(state)
+        if not fresh.get("available"):
+            return "无法读取当前项目或共享配置，操作未执行。"
+        for key in ("config_revision", "config_hash", "contract_id", "run_id"):
+            if str(fresh.get(key) or "") != str(context.get(key) or ""):
+                return "项目或共享连接配置已变化，请重新确认。"
+        return ""
 
-        # 拒绝：不能悄悄丢掉，要让模型知道并给出替代方案。同一轮里**后面的组也
-        # 一并放弃**——用户刚说了「不」，继续弹下一张卡片是在逼他重复表态。
-        note = str(decision.get("note") or "").strip() if isinstance(decision, dict) else ""
+    def _reject_approval(
+        state: ChatState,
+        *,
+        error: str,
+        note: str = "",
+        explicit_user_rejection: bool = False,
+    ) -> ChatState:
+        """Answer every abandoned tool call and consume the approval context."""
         messages = list(state.get("messages") or [])
-        for call in valid:
+        calls = list(state.get("pending_calls") or [])
+        rest = list(state.get("deferred_calls") or [])
+        primary_error = "用户拒绝了这个操作，没有执行。" if explicit_user_rejection else error
+        deferred_error = (
+            "因为同一轮前面的操作被用户拒绝，这个动作也一并放弃，没有执行。"
+            if explicit_user_rejection
+            else "因为同一轮前面的确认没有生效，这个动作也一并放弃，没有执行。"
+        )
+        for call in calls:
             messages.append(
                 _tool_error_message(
                     str(call.get("call_id") or ""),
                     {
                         "ok": False,
-                        "error": "用户拒绝了这个操作，没有执行。",
+                        "error": primary_error,
                         "user_note": note,
                     },
                 )
@@ -549,10 +915,7 @@ def build_chat_graph(
                     str(call.get("call_id") or ""),
                     {
                         "ok": False,
-                        "error": (
-                            "因为同一轮前面的操作被用户拒绝，这个动作也一并放弃，"
-                            "没有执行。"
-                        ),
+                        "error": deferred_error,
                         "user_note": note,
                     },
                 )
@@ -564,14 +927,47 @@ def build_chat_graph(
             "confirmed": False,
             "rejected": True,
             "via": "rejected",
+            "approval_context": {},
+            "confirmation_card": {},
         }
 
+    def node_confirmation(state: ChatState) -> ChatState:
+        """Wait for the exact visible card id; this node has no side effects."""
+        card = state.get("confirmation_card") or {}
+        decision = interrupt(card)
+        context = state.get("approval_context") or {}
+        supplied_id = str(decision.get("approval_id") or "") if isinstance(decision, dict) else ""
+        expected_id = str(context.get("approval_id") or "") if isinstance(context, dict) else ""
+        if not supplied_id or supplied_id != expected_id:
+            return _reject_approval(
+                state, error="确认标识缺失或与当前确认卡不一致，操作未执行。"
+            )
+        note = str(decision.get("note") or "").strip() if isinstance(decision, dict) else ""
+        if not (isinstance(decision, dict) and decision.get("approved") is True):
+            return _reject_approval(
+                state,
+                error="用户拒绝了这个操作，没有执行。",
+                note=note,
+                explicit_user_rejection=True,
+            )
+        problem = _approval_context_error(state)
+        if problem:
+            return _reject_approval(state, error=problem, note=note)
+        return {"confirmed": True, "rejected": False}
+
     def route_after_guardrail(state: ChatState) -> str:
+        if state.get("approval_context"):
+            return "confirmation"
         if state.get("pending_calls"):
             return "execute"
         if state.get("deferred_calls"):
             # 这组被参数校验整组挡下或被拒绝：继续处理队列里的下一组。
             return "guardrail"
+        return "agent"
+
+    def route_after_confirmation(state: ChatState) -> str:
+        if state.get("pending_calls") and state.get("confirmed"):
+            return "execute"
         return "agent"
 
     def node_execute(state: ChatState) -> ChatState:
@@ -589,6 +985,63 @@ def build_chat_graph(
         log = list(state.get("tool_log") or [])
         latest_reply = ""
 
+        # Validate again immediately before the only side-effecting boundary.
+        # This catches policy changes, argument/state tampering, expiry, and
+        # project/shared-config drift that happened after the card was issued.
+        for call in calls:
+            name = str(call.get("name") or "")
+            problems = validate_call(name, call.get("arguments") or {})
+            if problems:
+                return _reject_approval(
+                    state, error="执行前参数校验失败：" + "；".join(problems)
+                )
+        current_policies = {
+            confirmation_policy(str(call.get("name") or "")) for call in calls
+        }
+        needs_approval = any(policy != POLICY_NEVER for policy in current_policies)
+        if needs_approval:
+            if not approved:
+                return _reject_approval(state, error="当前工具需要确认，但没有有效批准。")
+            problem = _approval_context_error(state)
+            if problem:
+                return _reject_approval(state, error=problem)
+        elif state.get("approval_context"):
+            return _reject_approval(state, error="工具确认策略已变化，请重新发起操作。")
+
+        claim_path: Path | None = None
+        claim_payload: dict[str, Any] = {}
+        if needs_approval:
+            context = state.get("approval_context") or {}
+            approval_id = str(context.get("approval_id") or "")
+            claim_path = _approval_claim_path(project_dir, approval_id)
+            claim_payload = {
+                "claim_version": 1,
+                "status": "started",
+                "approval_id_hash": hashlib.sha256(
+                    approval_id.encode("utf-8")
+                ).hexdigest(),
+                "project_id": str(state.get("project_id") or ""),
+                "thread_id": str(state.get("thread_id") or ""),
+                "started_at": _utc_iso(now()),
+                "calls": list(context.get("calls") or []),
+            }
+            try:
+                _write_claim_payload(claim_path, claim_payload, exclusive=True)
+            except FileExistsError:
+                return _reject_approval(
+                    state,
+                    error=(
+                        "这张确认卡已经开始执行或已被使用。为避免重复副作用，"
+                        "本次没有再次执行。"
+                    ),
+                )
+            except OSError:
+                return _reject_approval(
+                    state,
+                    error="无法持久化一次性执行凭据，操作未执行。",
+                )
+
+        result_summaries: list[dict[str, Any]] = []
         for call in calls:
             name = str(call.get("name") or "")
             arguments = call.get("arguments") or {}
@@ -601,6 +1054,14 @@ def build_chat_graph(
                 }
             if not isinstance(result, dict):
                 result = {"ok": False, "error": "工具返回了非预期的结果。"}
+            result_summaries.append(
+                {
+                    "call_id": str(call.get("call_id") or ""),
+                    "name": name,
+                    "ok": bool(result.get("ok", True)),
+                    "has_reply": bool(result.get("reply")),
+                }
+            )
             log.append(
                 {
                     "name": name,
@@ -619,6 +1080,18 @@ def build_chat_graph(
                 }
             )
 
+        if claim_path is not None:
+            _write_claim_payload(
+                claim_path,
+                {
+                    **claim_payload,
+                    "status": "consumed",
+                    "completed_at": _utc_iso(now()),
+                    "results": result_summaries,
+                },
+                exclusive=False,
+            )
+
         return {
             "messages": messages,
             "pending_calls": [],
@@ -626,6 +1099,8 @@ def build_chat_graph(
             "tool_log": log,
             "confirmed": False,
             "reply": latest_reply or state.get("reply") or "",
+            "approval_context": {},
+            "confirmation_card": {},
         }
 
     def route_after_execute(state: ChatState) -> str:
@@ -637,6 +1112,7 @@ def build_chat_graph(
     builder = StateGraph(ChatState)
     builder.add_node("agent", node_agent)
     builder.add_node("guardrail", node_guardrail)
+    builder.add_node("confirmation", node_confirmation)
     builder.add_node("execute", node_execute)
     builder.add_edge(START, "agent")
     builder.add_conditional_edges(
@@ -645,7 +1121,15 @@ def build_chat_graph(
     builder.add_conditional_edges(
         "guardrail",
         route_after_guardrail,
-        {"execute": "execute", "guardrail": "guardrail", "agent": "agent"},
+        {
+            "confirmation": "confirmation",
+            "execute": "execute",
+            "guardrail": "guardrail",
+            "agent": "agent",
+        },
+    )
+    builder.add_conditional_edges(
+        "confirmation", route_after_confirmation, {"execute": "execute", "agent": "agent"}
     )
     builder.add_conditional_edges(
         "execute", route_after_execute, {"guardrail": "guardrail", "agent": "agent"}

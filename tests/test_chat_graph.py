@@ -13,6 +13,7 @@ LLM 全部 fake（不联网）：本项目的图设计要求 LLM 调用与图逻
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -79,7 +80,19 @@ class FakeLLM:
         yield ("message", {"content": content, "tool_calls": turn.get("tool_calls") or []})
 
 
-def _graph(monkeypatch, turns, *, executor=None, calls=None, max_iterations=8, checkpointer=None):
+def _graph(
+    monkeypatch,
+    turns,
+    *,
+    executor=None,
+    calls=None,
+    max_iterations=8,
+    checkpointer=None,
+    config_reader=None,
+    approval_context_reader=None,
+    clock=None,
+    approval_ttl_seconds=900,
+):
     """Build the chat graph with a scripted model and a recording executor.
 
     ``checkpointer`` 在需要 ``Command(resume=...)`` 的场景必须给：没有 checkpointer
@@ -102,6 +115,10 @@ def _graph(monkeypatch, turns, *, executor=None, calls=None, max_iterations=8, c
         llm_config={"llm": {"enabled": True, "api_base": "http://x", "api_key": "k", "model": "m"}},
         checkpointer=checkpointer,
         max_iterations=max_iterations,
+        config_reader=config_reader,
+        approval_context_reader=approval_context_reader,
+        clock=clock,
+        approval_ttl_seconds=approval_ttl_seconds,
     )
     return graph, recorded, fake
 
@@ -119,6 +136,21 @@ def _initial(project_dir: Path, text: str) -> dict:
         "project_id": "p1",
         "thread_id": "t1",
         "messages": [{"role": "user", "content": text}],
+    }
+
+
+def _approval_decision(
+    interrupted_result: dict,
+    *,
+    approved: bool,
+    note: str = "",
+    approval_id: str | None = None,
+) -> dict:
+    card = interrupted_result["__interrupt__"][0].value
+    return {
+        "approved": approved,
+        "note": note,
+        "approval_id": approval_id or card["approval_id"],
     }
 
 
@@ -493,6 +525,359 @@ class TestChatGraphConfirmation:
         assert payload["calls"][0]["risk"] == RISK_WRITE
         assert "S1" in payload["calls"][0]["description"]
 
+    def test_confirmation_card_binds_the_exact_server_context_without_secrets(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        context = {
+            "config_revision": "project:7/shared:4",
+            "config_hash": "sha256:config-snapshot",
+            "contract_id": "sha256:contract-1",
+            "run_id": "run-9",
+        }
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [{"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]}],
+            checkpointer=_memory_checkpointer(),
+            config_reader=lambda _path: {
+                "server": {"threads": 8, "password": "never-show-this"},
+                "llm": {"api_key": "sk-never-show-this"},
+            },
+            approval_context_reader=lambda _path: dict(context),
+        )
+
+        result = graph.invoke(
+            _initial(tmp_path, "线程改为 16"),
+            config={"configurable": {"thread_id": "bound-card"}},
+        )
+        card = result["__interrupt__"][0].value
+
+        assert recorded == []
+        assert card["approval_id"].startswith("appr_")
+        assert card["project_id"] == "p1"
+        assert card["thread_id"] == "t1"
+        assert card["policy"] == POLICY_BATCH
+        assert card["confirmation_policy_version"]
+        assert card["config_revision"] == context["config_revision"]
+        assert card["config_hash"] == context["config_hash"]
+        assert card["contract_id"] == context["contract_id"]
+        assert card["run_id"] == context["run_id"]
+        assert card["issued_at"]
+        assert card["expires_at"]
+        assert set(card["calls"][0]) == {
+            "call_id",
+            "name",
+            "arguments_hash",
+            "risk",
+            "label",
+            "description",
+        }
+        assert "arguments" not in card["calls"][0]
+        assert card["calls"][0]["arguments_hash"].startswith("sha256:")
+        encoded = json.dumps(card, ensure_ascii=False)
+        assert "never-show-this" not in encoded
+        assert "sk-never-show-this" not in encoded
+
+    def test_unavailable_bound_file_refuses_to_issue_a_card(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "当前项目配置不可读，没有执行。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            approval_context_reader=lambda _path: {
+                "config_revision": "project:unavailable|shared:abcd",
+                "config_hash": "sha256:composite",
+                "contract_id": "",
+                "run_id": "",
+            },
+        )
+
+        result = graph.invoke(
+            _initial(tmp_path, "线程改为 16"),
+            config={"configurable": {"thread_id": "unavailable-context"}},
+        )
+
+        assert "__interrupt__" not in result
+        assert recorded == []
+        assert result["via"] == "rejected"
+
+    def test_card_hashes_normalized_write_arguments_and_displays_fastq_fields(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from langgraph.types import Command
+
+        args = {
+            **SAMPLE_WRITE_ARGS,
+            "samples": [
+                {**SAMPLE_WRITE_ARGS["samples"][0], "condition": "control"},
+                {**SAMPLE_WRITE_ARGS["samples"][1], "condition": ""},
+            ],
+        }
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "write_project_config", args)]},
+                {"content": "已写入。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+
+        config = {"configurable": {"thread_id": "normalized-write"}}
+        first = graph.invoke(
+            _initial(tmp_path, "写入配置"),
+            config=config,
+        )
+        call = first["__interrupt__"][0].value["calls"][0]
+        normalized = normalize_write_arguments(args)
+
+        assert call["arguments_hash"] == cg._canonical_hash(normalized)
+        assert "S1_1.fastq.gz" in call["description"]
+        assert "S1_2.fastq.gz" in call["description"]
+
+        graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
+        assert recorded[0]["arguments"] == normalized
+
+    def test_card_displays_every_edit_sample_and_cms_execution_field(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        graph, _, _ = _graph(
+            monkeypatch,
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "samples",
+                            "edit_samples",
+                            {
+                                "samples": [
+                                    {
+                                        "sample_id": "S1",
+                                        "condition": "treat",
+                                        "fastq_1": "replacement_R1.fastq.gz",
+                                        "fastq_2": "replacement_R2.fastq.gz",
+                                    }
+                                ]
+                            },
+                        ),
+                        _tool_call(
+                            "cms",
+                            "set_cms_options",
+                            {"enabled": True, "n_perm": 2000, "fdr": 0.1, "run_mode": "counts"},
+                        ),
+                    ]
+                }
+            ],
+            checkpointer=_memory_checkpointer(),
+            config_reader=lambda _path: {
+                "samples": {"items": SAMPLE_WRITE_ARGS["samples"]},
+                "pipeline": {"cms": {"enabled": False}},
+                "cms": {"n_perm": 1000, "fdr": 0.05, "run_mode": "pipeline"},
+            },
+        )
+
+        first = graph.invoke(
+            _initial(tmp_path, "改样本并配置 CMS"),
+            config={"configurable": {"thread_id": "full-card-semantics"}},
+        )
+        descriptions = {
+            item["name"]: item["description"]
+            for item in first["__interrupt__"][0].value["calls"]
+        }
+
+        assert "replacement_R1.fastq.gz" in descriptions["edit_samples"]
+        assert "replacement_R2.fastq.gz" in descriptions["edit_samples"]
+        assert "counts" in descriptions["set_cms_options"]
+        assert "pipeline" in descriptions["set_cms_options"]
+
+    def test_approval_id_is_stable_when_the_interrupt_is_replayed(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        graph, _, _ = _graph(
+            monkeypatch,
+            [{"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]}],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "stable-card"}}
+        first = graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+        replayed = graph.invoke(None, config=config)
+
+        assert (
+            first["__interrupt__"][0].value["approval_id"]
+            == replayed["__interrupt__"][0].value["approval_id"]
+        )
+
+    @pytest.mark.parametrize("supplied", [None, "", "appr_forged"])
+    def test_missing_or_forged_approval_id_never_executes(
+        self, monkeypatch, tmp_path, supplied
+    ) -> None:
+        from langgraph.types import Command
+
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "没有执行失效的确认。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": f"forged-{supplied}"}}
+        graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+        decision = {"approved": True}
+        if supplied is not None:
+            decision["approval_id"] = supplied
+
+        result = graph.invoke(Command(resume=decision), config=config)
+
+        assert recorded == []
+        assert result["via"] == "rejected"
+
+    def test_approval_fails_closed_when_config_changes_while_waiting(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from langgraph.types import Command
+
+        context = {
+            "config_revision": "rev-1",
+            "config_hash": "sha256:one",
+            "contract_id": "",
+            "run_id": "",
+        }
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "配置已变化，请重新确认。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            approval_context_reader=lambda _path: dict(context),
+        )
+        config = {"configurable": {"thread_id": "drift"}}
+        first = graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+        context.update(config_revision="rev-2", config_hash="sha256:two")
+
+        result = graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
+
+        assert recorded == []
+        assert result["via"] == "rejected"
+
+    def test_expired_approval_never_executes(self, monkeypatch, tmp_path) -> None:
+        from langgraph.types import Command
+
+        now = [datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)]
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "确认已过期。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            clock=lambda: now[0],
+            approval_ttl_seconds=60,
+        )
+        config = {"configurable": {"thread_id": "expired"}}
+        first = graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+        now[0] += timedelta(seconds=61)
+
+        result = graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
+
+        assert recorded == []
+        assert result["via"] == "rejected"
+
+    def test_execute_revalidates_policy_after_approval(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from langgraph.types import Command
+
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "策略已变化，请重新确认。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "policy-drift"}}
+        first = graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+        original_policy = cg.confirmation_policy
+        monkeypatch.setattr(
+            cg,
+            "confirmation_policy",
+            lambda name: POLICY_SOLO if name == "set_run_resources" else original_policy(name),
+        )
+
+        result = graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
+
+        assert recorded == []
+        assert result["via"] == "rejected"
+
+    def test_execute_revalidates_arguments_after_approval(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from langgraph.types import Command
+
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]},
+                {"content": "参数校验规则已变化，请重新确认。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "validation-drift"}}
+        first = graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+        monkeypatch.setattr(cg, "validate_call", lambda _name, _arguments: ["新规则拒绝"])
+
+        result = graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
+
+        assert recorded == []
+        assert result["via"] == "rejected"
+
+    def test_approval_cannot_cross_chat_threads(self, monkeypatch, tmp_path) -> None:
+        from langgraph.types import Command
+
+        graph, recorded, _ = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("a", "set_run_resources", {"threads": 16})]},
+                {"tool_calls": [_tool_call("b", "set_run_resources", {"threads": 32})]},
+                {"content": "确认不属于当前对话。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+        config_a = {"configurable": {"thread_id": "thread-a"}}
+        config_b = {"configurable": {"thread_id": "thread-b"}}
+        first_a = graph.invoke(_initial(tmp_path, "16"), config=config_a)
+        first_b = graph.invoke(
+            {**_initial(tmp_path, "32"), "thread_id": "t2"}, config=config_b
+        )
+
+        result = graph.invoke(
+            Command(
+                resume=_approval_decision(
+                    first_b,
+                    approved=True,
+                    approval_id=first_a["__interrupt__"][0].value["approval_id"],
+                )
+            ),
+            config=config_b,
+        )
+
+        assert recorded == []
+        assert result["via"] == "rejected"
+
     def test_approval_executes_exactly_once(self, monkeypatch, tmp_path) -> None:
         """resume 会重跑 guardrail，所以确认后必须只执行一次、不重复写。"""
         from langgraph.types import Command
@@ -506,12 +891,71 @@ class TestChatGraphConfirmation:
             checkpointer=_memory_checkpointer(),
         )
         config = {"configurable": {"thread_id": "once"}}
-        graph.invoke(_initial(tmp_path, "你帮我执行"), config=config)
-        result = graph.invoke(Command(resume={"approved": True}), config=config)
+        first = graph.invoke(_initial(tmp_path, "你帮我执行"), config=config)
+        result = graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
 
         assert [item["name"] for item in recorded] == ["write_project_config"]
         assert recorded[0]["approved"] is True
         assert result["reply"] == "已写入。"
+        claims = list((tmp_path / ".approval_claims").glob("*.json"))
+        assert len(claims) == 1
+        claim = json.loads(claims[0].read_text(encoding="utf-8"))
+        assert claim["status"] == "consumed"
+        assert claim["calls"] == [
+            {
+                "call_id": "c1",
+                "name": "write_project_config",
+                "arguments_hash": first["__interrupt__"][0].value["calls"][0][
+                    "arguments_hash"
+                ],
+            }
+        ]
+        assert claim["results"] == [
+            {
+                "call_id": "c1",
+                "name": "write_project_config",
+                "ok": True,
+                "has_reply": True,
+            }
+        ]
+        assert set(claim["calls"][0]) == {"call_id", "name", "arguments_hash"}
+        assert "S1_1.fastq.gz" not in json.dumps(claim, ensure_ascii=False)
+
+    def test_crash_after_side_effect_claim_fails_closed_on_replay(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A crash after the executor starts must not run the same approval twice."""
+        from langgraph.types import Command
+
+        attempts: list[str] = []
+
+        def crashing_executor(name, arguments, project_dir, approved):
+            attempts.append(name)
+            raise KeyboardInterrupt("simulated process loss after side effect")
+
+        graph, _, _ = _graph(
+            monkeypatch,
+            [{"tool_calls": [_tool_call("c1", "set_run_resources", {"threads": 16})]}],
+            executor=crashing_executor,
+            checkpointer=_memory_checkpointer(),
+        )
+        config = {"configurable": {"thread_id": "crash-replay"}}
+        first = graph.invoke(_initial(tmp_path, "线程改为 16"), config=config)
+
+        with pytest.raises(KeyboardInterrupt):
+            graph.invoke(
+                Command(resume=_approval_decision(first, approved=True)), config=config
+            )
+        claims = list((tmp_path / ".approval_claims").glob("*.json"))
+        assert len(claims) == 1
+        assert json.loads(claims[0].read_text(encoding="utf-8"))["status"] == "started"
+        replayed = graph.invoke(None, config=config)
+
+        assert attempts == ["set_run_resources"]
+        assert replayed["via"] == "rejected"
+        assert json.loads(claims[0].read_text(encoding="utf-8"))["status"] == "started"
 
     def test_rejection_does_not_execute_and_tells_the_model(self, monkeypatch, tmp_path) -> None:
         from langgraph.types import Command
@@ -525,9 +969,12 @@ class TestChatGraphConfirmation:
             checkpointer=_memory_checkpointer(),
         )
         config = {"configurable": {"thread_id": "reject"}}
-        graph.invoke(_initial(tmp_path, "你帮我执行"), config=config)
+        first = graph.invoke(_initial(tmp_path, "你帮我执行"), config=config)
         result = graph.invoke(
-            Command(resume={"approved": False, "note": "分组写错了"}), config=config
+            Command(
+                resume=_approval_decision(first, approved=False, note="分组写错了")
+            ),
+            config=config,
         )
 
         assert recorded == [], "用户拒绝后不得执行"
@@ -554,8 +1001,11 @@ class TestChatGraphConfirmation:
             checkpointer=_memory_checkpointer(),
         )
         config = {"configurable": {"thread_id": "reject-queue"}}
-        graph.invoke(_initial(tmp_path, "改资源并生成计划"), config=config)
-        graph.invoke(Command(resume={"approved": False, "note": "先别改"}), config=config)
+        first = graph.invoke(_initial(tmp_path, "改资源并生成计划"), config=config)
+        graph.invoke(
+            Command(resume=_approval_decision(first, approved=False, note="先别改")),
+            config=config,
+        )
 
         assert recorded == []
         final_messages = fake.seen_messages[-1]
@@ -598,7 +1048,9 @@ class TestChatGraphConfirmation:
             checkpointer=_memory_checkpointer(),
         )
         config = {"configurable": {"thread_id": f"fail-closed-{decision!r}"}}
-        graph.invoke(_initial(tmp_path, "线程改成 16"), config=config)
+        first = graph.invoke(_initial(tmp_path, "线程改成 16"), config=config)
+        if isinstance(decision, dict) and decision.get("approved") is True:
+            decision = {**decision, "approval_id": first["__interrupt__"][0].value["approval_id"]}
         graph.invoke(Command(resume=decision), config=config)
 
         assert bool(recorded) is should_execute
@@ -624,8 +1076,10 @@ class TestChatGraphConfirmation:
             checkpointer=_memory_checkpointer(),
         )
         config = {"configurable": {"thread_id": "approve-protocol"}}
-        graph.invoke(_initial(tmp_path, "改两项配置"), config=config)
-        graph.invoke(Command(resume={"approved": True}), config=config)
+        first = graph.invoke(_initial(tmp_path, "改两项配置"), config=config)
+        graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
 
         assert [item["name"] for item in recorded] == [
             "set_run_resources",
@@ -678,7 +1132,9 @@ class TestChatGraphConfirmation:
         card = first["__interrupt__"][0].value
         assert [call["call_id"] for call in card["calls"]] == ["good"]
 
-        graph.invoke(Command(resume={"approved": True}), config=config)
+        graph.invoke(
+            Command(resume=_approval_decision(first, approved=True)), config=config
+        )
 
         assert [item["name"] for item in recorded] == ["configure_pipeline"]
         _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])

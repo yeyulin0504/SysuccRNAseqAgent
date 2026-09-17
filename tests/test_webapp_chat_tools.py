@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -169,10 +170,24 @@ def _stream(client, token: str, message: str, *, project: str = "", **extra) -> 
     return _parse_sse(resp.text)
 
 
-def _resume(client, token: str, *, project: str, approved: bool, note: str = "") -> list[dict]:
+def _resume(
+    client,
+    token: str,
+    *,
+    project: str,
+    approval_id: str,
+    approved: bool,
+    note: str = "",
+) -> list[dict]:
     resp = client.post(
         "/api/chat/resume",
-        json={"project_id": project, "thread_id": "main", "approved": approved, "note": note},
+        json={
+            "project_id": project,
+            "thread_id": "main",
+            "approval_id": approval_id,
+            "approved": approved,
+            "note": note,
+        },
         headers=_headers(token),
     )
     assert resp.status_code == 200, resp.text
@@ -229,7 +244,13 @@ class TestModelWritesConfigViaTool:
         assert done["via"] == "tool", done
 
         # 第二轮：用户批准 → 真正写盘，且只写一次。
-        events2 = _resume(client, token, project="tool_a", approved=True)
+        events2 = _resume(
+            client,
+            token,
+            project="tool_a",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "tool_a")
         assert project is not None, "批准后没有写盘"
         conditions = [s["condition"] for s in project["samples"]["items"]]
@@ -255,7 +276,14 @@ class TestModelWritesConfigViaTool:
         assert _confirm_event(events) is not None, events
 
         # 用户拒绝 → 不写盘，且模型收到「用户拒绝」这个结果。
-        events2 = _resume(client, token, project="tool_b", approved=False, note="样本表有误，先别写")
+        events2 = _resume(
+            client,
+            token,
+            project="tool_b",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=False,
+            note="样本表有误，先别写",
+        )
         assert not _session_json_exists(tmp_path, "tool_b"), "拒绝后仍然写了盘？"
 
         assert fake.seen_messages[-1][-1]["role"] == "tool"
@@ -336,7 +364,13 @@ class TestModelWritesConfigViaTool:
         events = _stream(client, token, "把样本写进项目", project="tool_e")
         assert _confirm_event(events) is not None, events
 
-        events2 = _resume(client, token, project="tool_e", approved=True)
+        events2 = _resume(
+            client,
+            token,
+            project="tool_e",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "tool_e")
         assert project is not None
 
@@ -364,14 +398,15 @@ class TestConfirmCardInChatPage:
         card = page.split("function renderConfirmCard")[1].split("async function resolveConfirm")[0]
         assert "批准执行" in card, card
         assert "拒绝" in card, card
-        assert "resolveConfirm(true)" in card, card
-        assert "resolveConfirm(false)" in card, card
+        assert "resolveConfirm(true, approvalId)" in card, card
+        assert "resolveConfirm(false, approvalId)" in card, card
 
     def test_resume_posts_the_decision(self, client) -> None:
         page = client.get("/chat").text
         resume = page.split("async function dispatchResume")[1].split("async function readSSE")[0]
         assert "/api/chat/resume" in resume, resume
         assert "approved: approved" in resume, resume
+        assert "approval_id: approvalId" in resume, resume
         # 拒绝理由要带上，模型据此给替代方案。
         assert "note: note" in resume, resume
 
@@ -396,19 +431,45 @@ class TestResumeEndpointValidation:
         _create_project(client, token, "tool_f")
         resp = client.post(
             "/api/chat/resume",
-            json={"project_id": "tool_f", "thread_id": "main", "approved": "yes"},
+            json={
+                "project_id": "tool_f",
+                "thread_id": "main",
+                "approval_id": "appr_test",
+                "approved": "yes",
+            },
             headers=_headers(token),
         )
         assert resp.status_code == 200
         body = resp.json()
         assert "approved" in body.get("error", ""), body
 
+    def test_resume_requires_the_visible_approval_id(self, client) -> None:
+        token = _token(client)
+        _create_project(client, token, "tool_missing_approval")
+        resp = client.post(
+            "/api/chat/resume",
+            json={
+                "project_id": "tool_missing_approval",
+                "thread_id": "main",
+                "approved": True,
+            },
+            headers=_headers(token),
+        )
+
+        assert resp.status_code == 200
+        assert "approval_id" in resp.json().get("error", "")
+
     def test_resume_without_model_reports_cleanly(self, client) -> None:
         token = _token(client)
         _create_project(client, token, "tool_g")
         resp = client.post(
             "/api/chat/resume",
-            json={"project_id": "tool_g", "thread_id": "main", "approved": True},
+            json={
+                "project_id": "tool_g",
+                "thread_id": "main",
+                "approval_id": "appr_missing",
+                "approved": True,
+            },
             headers=_headers(token),
         )
         assert resp.status_code == 200
@@ -416,6 +477,308 @@ class TestResumeEndpointValidation:
         events = _parse_sse(resp.text)
         done = events[-1]["data"]
         assert done["via"] == "error", done
+
+
+class TestDurableApprovalBinding:
+    def test_card_contains_bound_context_and_never_contains_saved_secrets(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.connection_store import save_connection
+
+        token = _token(client)
+        _create_project(client, token, "binding_card")
+        _seed_project(tmp_path, monkeypatch, "binding_card")
+        save_connection({"host": "shared.example", "user": "bio", "threads": 8})
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [{"tool_calls": [_tool_call("bound-1", "set_run_resources", {"threads": 16})]}]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "线程改为 16", project="binding_card")
+        card = _confirm_event(events)
+
+        assert card["approval_id"].startswith("appr_")
+        assert card["project_id"] == "binding_card"
+        assert card["thread_id"] == "main"
+        assert card["config_revision"]
+        assert card["config_hash"].startswith("sha256:")
+        assert card["calls"][0]["call_id"] == "bound-1"
+        assert card["calls"][0]["arguments_hash"].startswith("sha256:")
+        encoded = json.dumps(card, ensure_ascii=False)
+        assert "sk-1" not in encoded
+
+    def test_project_change_while_waiting_invalidates_the_card(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "binding_project_drift")
+        _seed_project(tmp_path, monkeypatch, "binding_project_drift")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("drift-1", "set_run_resources", {"threads": 16})]},
+                {"content": "确认已失效，请重新确认。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        events = _stream(client, token, "线程改为 16", project="binding_project_drift")
+        card = _confirm_event(events)
+
+        project_path = tmp_path / "binding_project_drift" / "project.json"
+        payload = json.loads(project_path.read_text(encoding="utf-8"))
+        payload["server"]["threads"] = 12
+        project_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        resumed = _resume(
+            client,
+            token,
+            project="binding_project_drift",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+
+        assert _project_json(tmp_path, "binding_project_drift")["server"]["threads"] == 12
+        assert resumed[-1]["data"]["via"] == "rejected"
+
+    def test_shared_connection_change_while_waiting_invalidates_the_card(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent.connection_store import save_connection
+
+        token = _token(client)
+        _create_project(client, token, "binding_shared_drift")
+        _seed_project(tmp_path, monkeypatch, "binding_shared_drift")
+        save_connection({"host": "first.example", "user": "bio", "threads": 8})
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call("drift-2", "configure_pipeline", {"step": "rsem", "enabled": False})
+                    ]
+                },
+                {"content": "共享连接已变化，请重新确认。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        events = _stream(client, token, "关闭 rsem", project="binding_shared_drift")
+        card = _confirm_event(events)
+        save_connection({"threads": 64})
+
+        resumed = _resume(
+            client,
+            token,
+            project="binding_shared_drift",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+
+        assert _project_json(tmp_path, "binding_shared_drift")["pipeline"]["rsem"]["enabled"] is True
+        assert resumed[-1]["data"]["via"] == "rejected"
+
+    def test_forged_and_cross_project_ids_do_not_execute(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        for project in ("binding_a", "binding_b"):
+            _create_project(client, token, project)
+            _seed_project(tmp_path, monkeypatch, project)
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("a", "set_run_resources", {"threads": 16})]},
+                {"tool_calls": [_tool_call("b", "set_run_resources", {"threads": 32})]},
+                {"content": "确认不属于当前项目。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        card_a = _confirm_event(_stream(client, token, "16", project="binding_a"))
+        _confirm_event(_stream(client, token, "32", project="binding_b"))
+
+        resumed = _resume(
+            client,
+            token,
+            project="binding_b",
+            approval_id=card_a["approval_id"],
+            approved=True,
+        )
+
+        assert _project_json(tmp_path, "binding_b")["server"]["threads"] == 8
+        assert resumed[-1]["data"]["via"] == "rejected"
+
+    def test_consumed_card_cannot_execute_twice(self, client, tmp_path, monkeypatch) -> None:
+        token = _token(client)
+        _create_project(client, token, "binding_once")
+        _seed_project(tmp_path, monkeypatch, "binding_once")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("once", "set_run_resources", {"threads": 16})]},
+                {"content": "线程已修改。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        card = _confirm_event(_stream(client, token, "16", project="binding_once"))
+        _resume(
+            client,
+            token,
+            project="binding_once",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+        changes = tmp_path / "binding_once" / "changesets.jsonl"
+        before = changes.read_text(encoding="utf-8")
+
+        second = _resume(
+            client,
+            token,
+            project="binding_once",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+
+        assert changes.read_text(encoding="utf-8") == before
+        assert second[-1]["data"]["via"] in {"rejected", "error"}
+
+    def test_concurrent_resume_executes_one_approval_only(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        """Two simultaneous clicks must serialize and execute the card once."""
+        from rnaseq_agent import webapp as webapp_module
+
+        token = _token(client)
+        project_id = "binding_concurrent"
+        _create_project(client, token, project_id)
+        _seed_project(tmp_path, monkeypatch, project_id)
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("race", "set_run_resources", {"threads": 16})]},
+                {"content": "线程已修改。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        card = _confirm_event(_stream(client, token, "线程改为 16", project=project_id))
+
+        original_build_chat_graph = cg.build_chat_graph
+        first_snapshot_entered = threading.Event()
+        second_snapshot_entered = threading.Event()
+        release_first_snapshot = threading.Event()
+        snapshot_count = 0
+        snapshot_count_lock = threading.Lock()
+
+        class BlockingGraph:
+            def __init__(self, delegate) -> None:
+                self.delegate = delegate
+
+            def get_state(self, config):
+                nonlocal snapshot_count
+                snapshot = self.delegate.get_state(config)
+                if "confirmation" in tuple(snapshot.next or ()):
+                    with snapshot_count_lock:
+                        snapshot_count += 1
+                        ordinal = snapshot_count
+                    if ordinal == 1:
+                        first_snapshot_entered.set()
+                        if not release_first_snapshot.wait(timeout=5):
+                            raise TimeoutError("test did not release the first snapshot")
+                    elif ordinal == 2:
+                        second_snapshot_entered.set()
+                return snapshot
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+        def blocking_build_chat_graph(**kwargs):
+            return BlockingGraph(original_build_chat_graph(**kwargs))
+
+        monkeypatch.setattr(cg, "build_chat_graph", blocking_build_chat_graph)
+        original_execute_intent = webapp_module.execute_intent
+        execution_count = 0
+        execution_count_lock = threading.Lock()
+
+        def counting_execute_intent(session, intent):
+            nonlocal execution_count
+            if intent.action == "edit":
+                with execution_count_lock:
+                    execution_count += 1
+            return original_execute_intent(session, intent)
+
+        monkeypatch.setattr(webapp_module, "execute_intent", counting_execute_intent)
+        responses: list[list[dict]] = []
+        errors: list[BaseException] = []
+
+        def resume_once() -> None:
+            try:
+                responses.append(
+                    _resume(
+                        client,
+                        token,
+                        project=project_id,
+                        approval_id=card["approval_id"],
+                        approved=True,
+                    )
+                )
+            except BaseException as exc:  # noqa: BLE001 - preserve worker failure
+                errors.append(exc)
+
+        first = threading.Thread(target=resume_once)
+        second = threading.Thread(target=resume_once)
+        first.start()
+        assert first_snapshot_entered.wait(timeout=5), "first request never checked the card"
+        second.start()
+        raced_into_snapshot = second_snapshot_entered.wait(timeout=1)
+        release_first_snapshot.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert errors == []
+        assert not raced_into_snapshot, "same project/thread entered graph resume concurrently"
+        assert execution_count == 1
+        assert len(responses) == 2
+        assert any(events[-1]["data"]["via"] == "rejected" for events in responses)
+        assert _project_json(tmp_path, project_id)["server"]["threads"] == 16
+
+    def test_new_card_in_the_same_thread_replaces_the_old_card(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "binding_replace")
+        _seed_project(tmp_path, monkeypatch, "binding_replace")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("old", "set_run_resources", {"threads": 16})]},
+                {"tool_calls": [_tool_call("new", "set_run_resources", {"threads": 32})]},
+                {"content": "线程已改为 32。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        old_card = _confirm_event(_stream(client, token, "16", project="binding_replace"))
+        new_card = _confirm_event(_stream(client, token, "改成 32", project="binding_replace"))
+
+        assert new_card is not None
+        assert new_card["approval_id"] != old_card["approval_id"]
+        stale = _resume(
+            client,
+            token,
+            project="binding_replace",
+            approval_id=old_card["approval_id"],
+            approved=True,
+        )
+        assert stale[-1]["data"]["via"] == "rejected"
+        assert _project_json(tmp_path, "binding_replace")["server"]["threads"] == 8
+
+        _resume(
+            client,
+            token,
+            project="binding_replace",
+            approval_id=new_card["approval_id"],
+            approved=True,
+        )
+        assert _project_json(tmp_path, "binding_replace")["server"]["threads"] == 32
 
 
 def _seed_project(tmp_path: Path, monkeypatch, project_id: str) -> None:
@@ -462,7 +825,13 @@ class TestConfirmationGrouping:
         assert [c["name"] for c in card["calls"]] == ["set_run_resources", "configure_pipeline"]
 
         # 一次批准，两条配置一起落地。
-        _resume(client, token, project="grp_a", approved=True)
+        _resume(
+            client,
+            token,
+            project="grp_a",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "grp_a")
         assert project["server"]["threads"] == 16
         assert project["pipeline"]["rsem"]["enabled"] is False
@@ -493,7 +862,13 @@ class TestConfirmationGrouping:
         assert [c["name"] for c in card["calls"]] == ["generate_plan"], card
 
         # 批准后还有第二张卡（confirm_contract 顺延到下一组）。
-        events2 = _resume(client, token, project="grp_b", approved=True)
+        events2 = _resume(
+            client,
+            token,
+            project="grp_b",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
         card2 = _confirm_event(events2)
         assert card2 is not None, events2
         assert [c["name"] for c in card2["calls"]] == ["confirm_contract"], card2
@@ -520,7 +895,14 @@ class TestConfirmationGrouping:
         events = _stream(client, token, "生成计划并冻结", project="grp_c")
         assert _confirm_event(events) is not None
 
-        events2 = _resume(client, token, project="grp_c", approved=False, note="先看看")
+        events2 = _resume(
+            client,
+            token,
+            project="grp_c",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=False,
+            note="先看看",
+        )
         assert _confirm_event(events2) is None, events2
         # 两项都没有执行：契约没被冻结。
         project = _project_json(tmp_path, "grp_c")
@@ -627,7 +1009,13 @@ class TestConnectionEditIsAlwaysSolo:
         assert cards[0]["policy"] == "batch", cards[0]
         assert [c["name"] for c in cards[0]["calls"]] == ["configure_pipeline"], cards[0]
 
-        events2 = _resume(client, token, project="conn_b", approved=True)
+        events2 = _resume(
+            client,
+            token,
+            project="conn_b",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         card2 = _confirm_event(events2)
         assert card2 is not None, events2
         assert card2["policy"] == "solo", card2
@@ -704,7 +1092,13 @@ class TestEditSamplesOnExistingSession:
         assert "control" in card["calls"][0]["description"], card
         assert "treat" in card["calls"][0]["description"], card
 
-        _resume(client, token, project="edit_a", approved=True)
+        _resume(
+            client,
+            token,
+            project="edit_a",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "edit_a")
         conditions = {s["sample_id"]: s["condition"] for s in project["samples"]["items"]}
         assert conditions["S1"] == "treat", conditions
@@ -729,7 +1123,13 @@ class TestEditSamplesOnExistingSession:
 
         events = _stream(client, token, "去掉 S4", project="edit_b")
         assert _confirm_event(events) is not None, events
-        _resume(client, token, project="edit_b", approved=True)
+        _resume(
+            client,
+            token,
+            project="edit_b",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "edit_b")
         ids = [s["sample_id"] for s in project["samples"]["items"]]
         assert ids == ["S1", "S2", "S3"], ids
@@ -759,7 +1159,13 @@ class TestEditReference:
         # 模型用的短参数名 gtf，卡片上要显示成 config 里那一位的旧值 → 新值。
         assert "/ref/gencode.v99.gtf" in card["calls"][0]["description"], card
 
-        _resume(client, token, project="ref_a", approved=True)
+        _resume(
+            client,
+            token,
+            project="ref_a",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "ref_a")
         assert project["reference"]["remote_gtf_path"] == "/ref/gencode.v99.gtf", project["reference"]
 
@@ -812,7 +1218,13 @@ class TestDiffexpAndCmsTools:
         assert card["policy"] == "batch", card
         assert "control" in card["calls"][0]["description"], card
 
-        _resume(client, token, project="diffexp_tool", approved=True)
+        _resume(
+            client,
+            token,
+            project="diffexp_tool",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "diffexp_tool")
         assert project["pipeline"]["diffexp"]["enabled"] is True
         assert project["diffexp"]["reference_condition"] == "control"
@@ -854,7 +1266,13 @@ class TestDiffexpAndCmsTools:
         description = card["calls"][0]["description"]
         assert "2000" in description and "0.1" in description, description
 
-        _resume(client, token, project="cms_tool", approved=True)
+        _resume(
+            client,
+            token,
+            project="cms_tool",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
         project = _project_json(tmp_path, "cms_tool")
         assert project["pipeline"]["cms"]["enabled"] is True
         assert project["cms"]["n_perm"] == 2000
@@ -976,7 +1394,13 @@ class TestRollbackAndQcDecisionTools:
         card = _confirm_event(events)
         assert card is not None, events
         assert card["policy"] == "batch", card
-        _resume(client, token, project="rollback_tool", approved=True)
+        _resume(
+            client,
+            token,
+            project="rollback_tool",
+            approval_id=_confirm_event(events)["approval_id"],
+            approved=True,
+        )
 
         assert _project_json(tmp_path, "rollback_tool")["server"]["threads"] == 8
         tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
