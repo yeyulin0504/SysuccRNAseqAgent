@@ -100,16 +100,7 @@ def upload_project_fastqs(config_path: Path) -> RunOutcome:
 
 
 def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
-    previous_claim_id = _current_execution_claim_id(config_path)
-    try:
-        return _run_project_claimed(config_path, wait=wait)
-    except BaseException as exc:
-        _settle_boundary_exception(
-            config_path,
-            previous_claim_id=previous_claim_id,
-            message=str(exc),
-        )
-        raise
+    return _run_project_claimed(config_path, wait=wait)
 
 
 def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
@@ -125,22 +116,27 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
     attempt_dir = project_dir / "attempts" / run_id
     logs_dir = attempt_dir / "agent_logs"
     downloads_dir = attempt_dir / "downloads"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-
-    run_config = _config_for_new_attempt(config, run_id)
-    snapshot_path = attempt_dir / "project.snapshot.json"
-    save_json(snapshot_path, run_config)
-    _log_event(
-        logs_dir,
-        "run_started",
-        {
-            "run_id": run_id,
-            "config": str(config_path),
-            "snapshot": str(snapshot_path),
-            "remote_run_workdir": run_config["server"]["remote_workdir"],
-        },
-    )
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        run_config = _config_for_new_attempt(config, run_id)
+        snapshot_path = attempt_dir / "project.snapshot.json"
+        save_json(snapshot_path, run_config)
+        _log_event(
+            logs_dir,
+            "run_started",
+            {
+                "run_id": run_id,
+                "config": str(config_path),
+                "snapshot": str(snapshot_path),
+                "remote_run_workdir": run_config["server"]["remote_workdir"],
+            },
+        )
+    except BaseException as exc:
+        message = str(exc)
+        _record_execution_exception(config_path, claim_id, message)
+        _best_effort_log_event(logs_dir, "run_failed", {"run_id": run_id, "message": message})
+        raise
     try:
         validation = validate_local_fastqs(run_config)
         if not validation.ok:
@@ -335,17 +331,11 @@ def run_stage_project(
     *,
     wait: bool = True,
 ) -> RunOutcome:
-    previous_claim_id = _current_execution_claim_id(config_path)
-    try:
-        return _run_stage_project_claimed(config_path, stage, wait=wait)
-    except BaseException as exc:
-        _settle_boundary_exception(
-            config_path,
-            previous_claim_id=previous_claim_id,
-            message=str(exc),
-            stage=stage,
-        )
-        raise
+    from .pipeline import ALL_STAGES
+
+    if stage not in ALL_STAGES:
+        raise ValueError(f"Unsupported stage: {stage!r}. Allowed: {ALL_STAGES}")
+    return _run_stage_project_claimed(config_path, stage, wait=wait)
 
 
 def _run_stage_project_claimed(
@@ -367,10 +357,7 @@ def _run_stage_project_claimed(
     re-submitted. A ``running``/``queued`` stage returns the current state
     without submitting twice.
     """
-    from .pipeline import ALL_STAGES, STAGE_QC
-
-    if stage not in ALL_STAGES:
-        raise ValueError(f"Unsupported stage: {stage!r}. Allowed: {ALL_STAGES}")
+    from .pipeline import STAGE_QC
 
     project_dir = config_path.parent
     claim_start = _begin_execution_claim(config_path, stage=stage)
@@ -388,31 +375,40 @@ def _run_stage_project_claimed(
 
     logs_dir = attempt_dir / "agent_logs"
     downloads_dir = attempt_dir / "downloads"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    downloads_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        run_config = _config_for_new_attempt(config, run_id)
+        # 保留既有 attempt：共享同一远程工作目录（stage1 的 fastp/ 供 stage2 使用）。
+        if (attempt_dir / "project.snapshot.json").is_file():
+            snapshot_payload = load_json(attempt_dir / "project.snapshot.json")
+            run_config["server"]["remote_workdir"] = snapshot_payload["server"]["remote_workdir"]
+            run_config["server"]["remote_base_dir"] = snapshot_payload["server"].get("remote_base_dir", "")
+            run_config["samples"]["remote_data_dir"] = snapshot_payload["samples"]["remote_data_dir"]
+            run_config["run"] = snapshot_payload.get("run", run_config["run"])
 
-    run_config = _config_for_new_attempt(config, run_id)
-    # 保留既有 attempt：共享同一远程工作目录（stage1 的 fastp/ 供 stage2 使用）。
-    if (attempt_dir / "project.snapshot.json").is_file():
-        snapshot_payload = load_json(attempt_dir / "project.snapshot.json")
-        run_config["server"]["remote_workdir"] = snapshot_payload["server"]["remote_workdir"]
-        run_config["server"]["remote_base_dir"] = snapshot_payload["server"].get("remote_base_dir", "")
-        run_config["samples"]["remote_data_dir"] = snapshot_payload["samples"]["remote_data_dir"]
-        run_config["run"] = snapshot_payload.get("run", run_config["run"])
-
-    snapshot_path = attempt_dir / "project.snapshot.json"
-    if not snapshot_path.is_file():
-        save_json(snapshot_path, run_config)
-    _log_event(
-        logs_dir,
-        "stage_run_started",
-        {
-            "stage": stage,
-            "run_id": run_id,
-            "config": str(config_path),
-            "remote_run_workdir": run_config["server"]["remote_workdir"],
-        },
-    )
+        snapshot_path = attempt_dir / "project.snapshot.json"
+        if not snapshot_path.is_file():
+            save_json(snapshot_path, run_config)
+        _log_event(
+            logs_dir,
+            "stage_run_started",
+            {
+                "stage": stage,
+                "run_id": run_id,
+                "config": str(config_path),
+                "remote_run_workdir": run_config["server"]["remote_workdir"],
+            },
+        )
+    except BaseException as exc:
+        message = str(exc)
+        _record_execution_exception(config_path, claim_id, message, stage=stage)
+        _best_effort_log_event(
+            logs_dir,
+            "stage_run_failed",
+            {"run_id": run_id, "stage": stage, "message": message},
+        )
+        raise
 
     try:
         # 上传本地 FASTQ 只发生在第一个 stage（qc）；后续 stage 复用远程 raw。
@@ -1119,27 +1115,6 @@ _LEGACY_ALWAYS_CONFLICT_PROJECT_STATES = {
     "reconcile_required",
 }
 _LEGACY_ACTIVE_STAGE_STATES = _LEGACY_ACTIVE_PROJECT_STATES | {"remote_completed"}
-
-
-def _current_execution_claim_id(config_path: Path) -> str:
-    try:
-        status = normalize_config(load_json(config_path)).get("status", {})
-    except (OSError, ValueError, TypeError):
-        return ""
-    return str(status.get("execution_claim_id") or "").strip()
-
-
-def _settle_boundary_exception(
-    config_path: Path,
-    *,
-    previous_claim_id: str,
-    message: str,
-    stage: str | None = None,
-) -> None:
-    current_claim_id = _current_execution_claim_id(config_path)
-    if not current_claim_id or current_claim_id == previous_claim_id:
-        return
-    _record_execution_exception(config_path, current_claim_id, message, stage=stage)
 
 
 def _best_effort_log_event(logs_dir: Path, event: str, payload: dict[str, Any]) -> None:

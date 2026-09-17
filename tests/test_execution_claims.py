@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from rnaseq_agent.execution import CommandResult
-from rnaseq_agent.run_agent import refresh_status, run_project, run_stage_project
+from rnaseq_agent.run_agent import (
+    _begin_execution_claim,
+    refresh_status,
+    run_project,
+    run_stage_project,
+)
 from rnaseq_agent.storage import load_json, save_json
 
 
@@ -533,3 +538,100 @@ def test_stale_refresh_observation_cannot_overwrite_new_claim(
     assert live["execution_claim_id"] == second_claim_id
     assert live["state"] == "submitted"
     assert live["execution_claims"][second_claim_id]["status"] == "submitted"
+
+
+def test_invalid_stage_failure_does_not_settle_foreign_started_claim(
+    tmp_path, monkeypatch
+) -> None:
+    """A caller that never acquired a claim must not close another caller's claim."""
+    from rnaseq_agent import pipeline
+
+    config_path = _fastq_project(tmp_path)
+    original_configure = __import__(
+        "rnaseq_agent.run_agent", fromlist=["_config_for_new_attempt"]
+    )._config_for_new_attempt
+    invalid_check_entered = threading.Event()
+    foreign_claim_created = threading.Event()
+    release_foreign = threading.Event()
+
+    class BlockingStages(tuple):
+        def __contains__(self, item):
+            if item == "invalid-stage":
+                invalid_check_entered.set()
+                foreign_claim_created.wait(timeout=5)
+                return False
+            return super().__contains__(item)
+
+    def block_foreign_after_claim(config: dict, run_id: str):
+        foreign_claim_created.set()
+        release_foreign.wait(timeout=5)
+        return original_configure(config, run_id)
+
+    monkeypatch.setattr(pipeline, "ALL_STAGES", BlockingStages(pipeline.ALL_STAGES))
+    monkeypatch.setattr("rnaseq_agent.run_agent._config_for_new_attempt", block_foreign_after_claim)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        invalid = executor.submit(run_stage_project, config_path, "invalid-stage", wait=False)
+        assert invalid_check_entered.wait(timeout=5)
+        foreign = executor.submit(run_project, config_path, wait=False)
+        with pytest.raises(ValueError, match="Unsupported stage"):
+            invalid.result(timeout=5)
+        assert _claims(config_path)[0]["status"] == "started"
+        release_foreign.set()
+        foreign_outcome = foreign.result(timeout=5)
+
+    assert foreign_outcome.state == "submitted"
+    assert _claims(config_path)[0]["status"] == "submitted"
+
+
+def test_full_acquire_read_failure_does_not_settle_foreign_started_claim(
+    tmp_path, monkeypatch
+) -> None:
+    """A full-run acquisition failure cannot infer ownership from the global claim pointer."""
+    config_path = _fastq_project(tmp_path)
+    original_begin = _begin_execution_claim
+    original_configure = __import__(
+        "rnaseq_agent.run_agent", fromlist=["_config_for_new_attempt"]
+    )._config_for_new_attempt
+    failed_thread_id: int | None = None
+    failed_entered = threading.Event()
+    foreign_claim_created = threading.Event()
+    release_foreign = threading.Event()
+
+    def coordinated_begin(path: Path, *, stage: str):
+        if threading.get_ident() == failed_thread_id:
+            failed_entered.set()
+            foreign_claim_created.wait(timeout=5)
+            raise OSError("claim ledger read failed before acquisition")
+        return original_begin(path, stage=stage)
+
+    def block_foreign_after_claim(config: dict, run_id: str):
+        foreign_claim_created.set()
+        release_foreign.wait(timeout=5)
+        return original_configure(config, run_id)
+
+    def failed_run():
+        nonlocal failed_thread_id
+        failed_thread_id = threading.get_ident()
+        return run_project(config_path, wait=False)
+
+    monkeypatch.setattr("rnaseq_agent.run_agent._begin_execution_claim", coordinated_begin)
+    monkeypatch.setattr("rnaseq_agent.run_agent._config_for_new_attempt", block_foreign_after_claim)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        failed_acquire = executor.submit(failed_run)
+        assert failed_entered.wait(timeout=5)
+        foreign = executor.submit(run_project, config_path, wait=False)
+        with pytest.raises(OSError, match="read failed"):
+            failed_acquire.result(timeout=5)
+        foreign_claim = _claims(config_path)[0]
+        assert foreign_claim["status"] == "started"
+        release_foreign.set()
+        foreign_outcome = foreign.result(timeout=5)
+
+    assert foreign_outcome.state == "submitted"
+    assert _claims(config_path)[0]["status"] == "submitted"
