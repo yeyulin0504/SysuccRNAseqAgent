@@ -144,6 +144,77 @@ class TestWebApp:
         assert revoked.status_code == 200
         assert revoked.json()["root"]["revoked_at"] is not None
 
+    def test_remote_data_root_approve_rejects_changed_alias_and_replayed_preview(self, client, monkeypatch):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                return CommandResult([], 0, "/srv/team\n", "", 10)
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        preview = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        ).json()
+        changed_alias = client.post(
+            "/api/settings/remote-data-roots",
+            json={
+                **preview,
+                "requested_path": "/alias/team",
+                "expected_revision": preview["browse_policy_revision"],
+            },
+            headers=_headers(token),
+        )
+        assert changed_alias.status_code == 409
+        assert changed_alias.json()["error_code"] == "REMOTE_ROOT_REVISION_CONFLICT"
+
+        approved = client.post(
+            "/api/settings/remote-data-roots",
+            json={**preview, "expected_revision": preview["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert approved.status_code == 200
+        replay = client.post(
+            "/api/settings/remote-data-roots",
+            json={**preview, "expected_revision": preview["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert replay.status_code == 409
+        assert replay.json()["error_code"] == "REMOTE_ROOT_REVISION_CONFLICT"
+
+    def test_remote_data_root_approve_rejects_changed_identity(self, client, monkeypatch):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                return CommandResult([], 0, "/srv/team\n", "", 10)
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        preview = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        ).json()
+        save_connection({"user": "bob"})
+        response = client.post(
+            "/api/settings/remote-data-roots",
+            json={**preview, "expected_revision": preview["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "REMOTE_ROOT_REVISION_CONFLICT"
+
     def test_settings_page_has_remote_root_two_step_controls(self, client):
         page = client.get("/settings").text
         for control_id in ("remoteRootPath", "previewRemoteRoot", "approveRemoteRoot", "remoteRoots"):

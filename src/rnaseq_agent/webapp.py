@@ -26,6 +26,7 @@ import secrets
 import shlex
 import socket
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -568,6 +569,13 @@ def create_app(
     # clicks cannot both validate the same visible card before either consumes it.
     _chat_graph_locks: dict[tuple[str, str], threading.Lock] = {}
     _chat_graph_locks_guard = threading.Lock()
+    # Settings previews are short-lived, server-bound capabilities. The
+    # browser must return the opaque id; exact path/identity values are checked
+    # against this in-memory record before any approval transport call.
+    _remote_root_previews: dict[str, dict[str, Any]] = {}
+    _remote_root_previews_lock = threading.Lock()
+    _remote_root_preview_ttl = 10 * 60.0
+    _remote_root_preview_limit = 128
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1339,8 +1347,31 @@ def create_app(
         except Exception:
             return _remote_root_error(REMOTE_SCAN_FAILED)
         assert policy.identity is not None
+        preview_id = secrets.token_urlsafe(24)
+        preview_record = {
+            "host": policy.identity.host,
+            "user": policy.identity.user,
+            "port": policy.identity.port,
+            "requested_path": requested_path,
+            "canonical_path": canonical,
+            "browse_policy_revision": policy.revision,
+            "expires_at": time.monotonic() + _remote_root_preview_ttl,
+        }
+        with _remote_root_previews_lock:
+            now = time.monotonic()
+            for stale_id, stale in list(_remote_root_previews.items()):
+                if float(stale.get("expires_at", 0.0)) <= now:
+                    _remote_root_previews.pop(stale_id, None)
+            while len(_remote_root_previews) >= _remote_root_preview_limit:
+                oldest_id = min(
+                    _remote_root_previews,
+                    key=lambda item: float(_remote_root_previews[item].get("expires_at", 0.0)),
+                )
+                _remote_root_previews.pop(oldest_id, None)
+            _remote_root_previews[preview_id] = preview_record
         return {
             "ok": True,
+            "preview_id": preview_id,
             "host": policy.identity.host,
             "user": policy.identity.user,
             "port": policy.identity.port,
@@ -1357,7 +1388,7 @@ def create_app(
         except Exception:
             return _remote_root_error(REMOTE_PATH_INVALID)
         allowed = {
-            "ok", "host", "user", "port", "requested_path", "canonical_path",
+            "ok", "preview_id", "host", "user", "port", "requested_path", "canonical_path",
             "browse_policy_revision", "expected_revision",
         }
         if not isinstance(payload, dict) or set(payload) != allowed:
@@ -1368,9 +1399,31 @@ def create_app(
         preview_revision = payload.get("browse_policy_revision")
         if not isinstance(expected, str) or expected != preview_revision:
             return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        if (
+            isinstance(payload.get("port"), bool)
+            or not isinstance(payload.get("port"), int)
+            or not 1 <= payload.get("port") <= 65535
+        ):
+            return _remote_root_error("REMOTE_CONNECTION_INVALID")
+        preview_id = payload.get("preview_id")
+        if not isinstance(preview_id, str) or not preview_id:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        with _remote_root_previews_lock:
+            preview_record = _remote_root_previews.get(preview_id)
+            if preview_record is None or float(preview_record.get("expires_at", 0.0)) <= time.monotonic():
+                _remote_root_previews.pop(preview_id, None)
+                return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+            bound_fields = (
+                "host", "user", "port", "requested_path", "canonical_path",
+                "browse_policy_revision",
+            )
+            if any(payload.get(field) != preview_record.get(field) for field in bound_fields):
+                return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+            # A matching preview is single-use. Consume it before re-resolving;
+            # a transport/CAS failure requires a fresh preview rather than a
+            # replay of a capability that may have gone stale.
+            _remote_root_previews.pop(preview_id, None)
         try:
-            if isinstance(payload.get("port"), bool) or not isinstance(payload.get("port"), int) or not 1 <= payload.get("port") <= 65535:
-                return _remote_root_error("REMOTE_CONNECTION_INVALID")
             requested_identity = normalize_ssh_identity(
                 {"host": payload.get("host"), "user": payload.get("user"), "port": payload.get("port")}
             )
