@@ -54,6 +54,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any, Callable, Iterator, TypedDict
 
 try:
@@ -95,6 +96,13 @@ from .agent_tools import (
     tool_schemas,
     validate_call,
 )
+from .model_context import (
+    EphemeralToolCallStore,
+    project_assistant_tool_call,
+    project_tool_arguments_for_model,
+)
+
+_EPHEMERAL_TOOL_CALL_STORE = EphemeralToolCallStore()
 
 #: 一轮对话最多允许的工具往返次数，防止模型陷入自我循环。
 MAX_TOOL_ITERATIONS = 8
@@ -643,22 +651,49 @@ def build_chat_graph(
     def _append(state: ChatState, *new_messages: dict[str, Any]) -> list[dict[str, Any]]:
         return list(state.get("messages") or []) + list(new_messages)
 
-    def _raw_call(call: ToolCall) -> dict[str, Any]:
-        """Re-shape a parsed call back into the provider's ``tool_calls`` form."""
-        return {
-            "id": call.call_id,
-            "type": "function",
-            "function": {"name": call.name, "arguments": call.raw_arguments},
-        }
+    ephemeral_store = _EPHEMERAL_TOOL_CALL_STORE
 
-    def _pending_call(call: ToolCall) -> dict[str, Any]:
+    def _raw_call(call: ToolCall, call_ref: str | None = None) -> dict[str, Any]:
+        """Re-shape a parsed call back into the provider's ``tool_calls`` form."""
+        try:
+            projected = project_assistant_tool_call(call.call_id, call.name, call.arguments)
+        except ValueError:
+            projected = {
+                "id": call.call_id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": json.dumps({"unmapped": True, "argument_hash": _canonical_hash(call.arguments)}, separators=(",", ":"))},
+                "tool_projection_version": 1,
+                "arguments_hash": _canonical_hash(call.arguments),
+            }
+        if call_ref:
+            projected["call_ref"] = call_ref
+        return projected
+
+    def _pending_call(call: ToolCall, call_ref: str | None = None) -> dict[str, Any]:
         """Plain-dict form stored in graph state (must stay JSON-serialisable)."""
-        return {
+        result = {
             "call_id": call.call_id,
             "name": call.name,
-            "arguments": call.arguments,
+            "arguments_hash": _canonical_hash(call.arguments),
+            "argument_projection": project_tool_arguments_for_model(call.name, call.arguments),
             "parse_error": call.parse_error,
         }
+        if call_ref:
+            result["call_ref"] = call_ref
+        return result
+
+    def _call_arguments(state: ChatState, call: Mapping[str, Any]) -> dict[str, Any]:
+        call_ref = str(call.get("call_ref") or "")
+        if call_ref:
+            return ephemeral_store.get(
+                call_ref,
+                project_id=str(state.get("project_id") or ""),
+                thread_id=str(state.get("thread_id") or ""),
+                call_id=str(call.get("call_id") or ""),
+                name=str(call.get("name") or ""),
+            )
+        raise ValueError("EPHEMERAL_ARGUMENT_UNAVAILABLE")
+
 
     def node_agent(state: ChatState) -> ChatState:
         """Ask the model for the next turn. Pure: no writes, no external side effects."""
@@ -691,8 +726,31 @@ def build_chat_graph(
             runtime_block = {}
             runtime_llm_config["llm"] = runtime_block
         runtime_block["tool_mode"] = _live_tool_mode()
+        provider_messages: list[dict[str, Any]] = []
+        for message in messages:
+            projected_message = dict(message)
+            calls = projected_message.get("tool_calls")
+            if isinstance(calls, list):
+                safe_calls: list[dict[str, Any]] = []
+                for item in calls:
+                    if not isinstance(item, dict):
+                        continue
+                    function = item.get("function") if isinstance(item.get("function"), dict) else {}
+                    safe_calls.append({
+                        "id": str(item.get("id") or ""),
+                        "type": "function",
+                        "function": {
+                            "name": str(function.get("name") or ""),
+                            "arguments": str(function.get("arguments") or "{}"),
+                        },
+                    })
+                projected_message["tool_calls"] = safe_calls
+            projected_message.pop("call_ref", None)
+            projected_message.pop("tool_projection_version", None)
+            projected_message.pop("arguments_hash", None)
+            provider_messages.append(projected_message)
         for kind, payload in _stream_chat_completion(
-            runtime_llm_config, messages, timeout=timeout
+            runtime_llm_config, provider_messages, timeout=timeout
         ):
             if kind == "delta":
                 streamed = True
@@ -738,8 +796,17 @@ def build_chat_graph(
                 "streamed": streamed,
             }
 
+        projected_calls: list[dict[str, Any]] = []
+        pending_calls: list[dict[str, Any]] = []
+        for call in calls:
+            try:
+                ref = ephemeral_store.put(str(state.get("project_id") or ""), str(state.get("thread_id") or ""), call.call_id, call.name, call.arguments)
+            except Exception:
+                ref = ""
+            projected_calls.append(_raw_call(call, ref or None))
+            pending_calls.append(_pending_call(call, ref or None))
         assistant_message: dict[str, Any] = {"role": "assistant", "content": content or None}
-        assistant_message["tool_calls"] = [_raw_call(call) for call in calls]
+        assistant_message["tool_calls"] = projected_calls
         # 本轮所有调用进 deferred 队列（保持模型给出的顺序），由 guardrail 按确认
         # 策略**一组一组**取出来处理。分组在这里不做：guardrail 是唯一判断风险的
         # 地方，让它自己分组，避免两处逻辑漂移。
@@ -747,7 +814,7 @@ def build_chat_graph(
             "status": "ok",
             "messages": _append(state, assistant_message),
             "pending_calls": [],
-            "deferred_calls": [_pending_call(call) for call in calls],
+            "deferred_calls": pending_calls,
             "approval_context": {},
             "confirmation_card": {},
             "confirmed": False,
@@ -791,16 +858,25 @@ def build_chat_graph(
         rejected: list[dict[str, Any]] = []
         for call in head.calls:
             name = str(call.get("name") or "")
-            blocked = tool_mode_block(name, mode)
+            try:
+                arguments = _call_arguments(state, call)
+            except Exception as exc:
+                rejected.append({**call, "_reason": "工具参数引用不可用，请重新发起调用。"})
+                continue
+            blocked = None if name == "browse_remote_samples" else tool_mode_block(name, mode)
             if blocked is not None:
                 rejected.append({**call, "_blocked": blocked})
                 continue
-            problems = validate_call(name, call.get("arguments") or {})
+            problems = validate_call(name, arguments)
             if problems:
                 rejected.append({**call, "_reason": "；".join(problems)})
             else:
                 try:
-                    normalized = _normalize_call_arguments(name, call.get("arguments") or {})
+                    normalized = _normalize_call_arguments(name, arguments)
+                    call_ref = str(call.get("call_ref") or "")
+                    if not call_ref:
+                        raise ValueError("missing ephemeral argument reference")
+                    ephemeral_store.replace(call_ref, normalized)
                 except Exception as exc:  # noqa: BLE001 - malformed args fail closed
                     rejected.append(
                         {
@@ -809,7 +885,11 @@ def build_chat_graph(
                         }
                     )
                     continue
-                valid.append({**call, "arguments": normalized})
+                valid.append({
+                    **call,
+                    "arguments_hash": _canonical_hash(normalized),
+                    "argument_projection": project_tool_arguments_for_model(name, normalized),
+                })
         return valid, rest, rejected
 
     def node_guardrail(state: ChatState) -> ChatState:
@@ -898,7 +978,7 @@ def build_chat_graph(
             {
                 "call_id": str(call.get("call_id") or ""),
                 "name": str(call.get("name") or ""),
-                "arguments_hash": _canonical_hash(call.get("arguments") or {}),
+                "arguments_hash": str(call.get("arguments_hash") or _canonical_hash(_call_arguments(state, call))),
             }
             for call in valid
         ]
@@ -919,11 +999,11 @@ def build_chat_graph(
             {
                 "call_id": str(call.get("call_id") or ""),
                 "name": str(call.get("name") or ""),
-                "arguments_hash": _canonical_hash(call.get("arguments") or {}),
+                "arguments_hash": str(call.get("arguments_hash") or _canonical_hash(_call_arguments(state, call))),
                 "risk": risk_of(str(call.get("name") or "")),
                 "label": tool_labels().get(str(call.get("name") or ""), str(call.get("name"))),
                 "description": _approval_description(
-                    str(call.get("name") or ""), call.get("arguments") or {}, current
+                    str(call.get("name") or ""), _call_arguments(state, call), current
                 ),
             }
             for call in valid
@@ -982,7 +1062,7 @@ def build_chat_graph(
             {
                 "call_id": str(call.get("call_id") or ""),
                 "name": str(call.get("name") or ""),
-                "arguments_hash": _canonical_hash(call.get("arguments") or {}),
+                "arguments_hash": str(call.get("arguments_hash") or _canonical_hash(_call_arguments(state, call))),
             }
             for call in calls
         ]
@@ -990,7 +1070,8 @@ def build_chat_graph(
             return "待执行工具与确认卡不一致，操作未执行。"
         for call in calls:
             name = str(call.get("name") or "")
-            problems = validate_call(name, call.get("arguments") or {})
+            arguments = _call_arguments(state, call)
+            problems = validate_call(name, arguments)
             if problems:
                 return "执行前参数校验失败：" + "；".join(problems)
             if confirmation_policy(name) != context.get("policy"):
@@ -1146,7 +1227,7 @@ def build_chat_graph(
         latest_reply = ""
 
         live_mode = _live_tool_mode()
-        if any(not tool_allowed(str(call.get("name") or ""), live_mode) for call in calls):
+        if any(str(call.get("name") or "") != "browse_remote_samples" and not tool_allowed(str(call.get("name") or ""), live_mode) for call in calls):
             return _reject_for_mode(state, live_mode)
 
         # Validate again immediately before the only side-effecting boundary.
@@ -1154,7 +1235,11 @@ def build_chat_graph(
         # project/shared-config drift that happened after the card was issued.
         for call in calls:
             name = str(call.get("name") or "")
-            problems = validate_call(name, call.get("arguments") or {})
+            try:
+                arguments = _call_arguments(state, call)
+            except Exception:
+                return _reject_approval(state, error="工具参数引用不可用，请重新发起调用。")
+            problems = validate_call(name, arguments)
             if problems:
                 return _reject_approval(
                     state, error="执行前参数校验失败：" + "；".join(problems)
@@ -1208,7 +1293,7 @@ def build_chat_graph(
         result_summaries: list[dict[str, Any]] = []
         for call in calls:
             name = str(call.get("name") or "")
-            arguments = call.get("arguments") or {}
+            arguments = _call_arguments(state, call)
             try:
                 execution_context = ToolExecutionContext(
                     project_id=str(state.get("project_id") or project_dir.name),
@@ -1280,6 +1365,9 @@ def build_chat_graph(
                     "content": json.dumps(provider_result, ensure_ascii=False, default=str),
                 }
             )
+            call_ref = str(call.get("call_ref") or "")
+            if call_ref:
+                ephemeral_store.delete(call_ref)
 
         if claim_path is not None:
             _write_claim_payload(

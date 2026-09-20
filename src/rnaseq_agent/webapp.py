@@ -4442,7 +4442,23 @@ def create_app(
             return {"error": str(exc)}
 
     # Internal test/integration hook. It is intentionally not an HTTP route;
-    # direct callers still cross _run_tool's live permission check.
+    # direct callers still cross _run_tool's live permission check.  All
+    # non-browse results cross the same four-channel disclosure boundary.
+    _run_tool_local = _run_tool
+    def _run_tool_disclosed(name, arguments, project_dir, approved, execution_context=None):
+        full = _run_tool_local(name, arguments, project_dir, approved, execution_context)
+        if isinstance(full, ToolExecutionResult):
+            return full
+        from .model_context import build_safe_project_summary, project_tool_result_for_log, project_tool_result_for_model
+        if name == "read_project_state" and isinstance(full, dict) and full.get("ok"):
+            full = {**full, "summary": build_safe_project_summary(project_dir)}
+        return ToolExecutionResult(
+            local=full if isinstance(full, dict) else {"ok": False, "error_code": "TOOL_RESULT_INVALID"},
+            model=project_tool_result_for_model(name, full if isinstance(full, dict) else {}),
+            log_projection=project_tool_result_for_log(name, full if isinstance(full, dict) else {}),
+            security_audit=None,
+        )
+    _run_tool = _run_tool_disclosed
     app.state.llm_tool_executor = _run_tool
     return app
 
