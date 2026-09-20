@@ -50,6 +50,18 @@ def _save_llm_worker(store_dir: Path, barrier) -> None:
     save_llm({"model": "m"}, store_dir=store_dir)
 
 
+def _transaction_contender_worker(path: str, ready, entered) -> None:
+    from rnaseq_agent.storage import locked_json_transaction
+
+    ready.set()
+
+    def mutate(current):
+        entered.set()
+        return current
+
+    locked_json_transaction(Path(path), mutate)
+
+
 @pytest.fixture
 def store_dir(tmp_path: Path) -> Path:
     return tmp_path / "conn"
@@ -64,28 +76,30 @@ class TestConnectionFilePath:
 
 
 def test_concurrent_connection_and_llm_saves_preserve_both_blocks(tmp_path, monkeypatch):
+    store = tmp_path / "store"
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(3)
-    first = context.Process(target=_save_connection_worker, args=(tmp_path, barrier))
-    second = context.Process(target=_save_llm_worker, args=(tmp_path, barrier))
+    first = context.Process(target=_save_connection_worker, args=(store, barrier))
+    second = context.Process(target=_save_llm_worker, args=(store, barrier))
     first.start(); second.start(); barrier.wait(timeout=5)
     first.join(10); second.join(10)
     assert first.exitcode == second.exitcode == 0
-    saved = json.loads((tmp_path / "connection.json").read_text("utf-8"))
+    saved = json.loads((store / "connection.json").read_text("utf-8"))
     assert saved["host"] == "h"
     assert saved["llm"]["model"] == "m"
 
 
 def test_reader_never_observes_partial_json_during_writes(tmp_path):
-    path = tmp_path / "connection.json"
-    save_connection({"host": "before"}, store_dir=tmp_path)
+    store = tmp_path / "store"
+    path = store / "connection.json"
+    save_connection({"host": "before"}, store_dir=store)
     errors: list[Exception] = []
     stop = threading.Event()
 
     def writer() -> None:
         try:
             for i in range(100):
-                save_connection({"host": f"h-{i}"}, store_dir=tmp_path)
+                save_connection({"host": f"h-{i}"}, store_dir=store)
         finally:
             stop.set()
 
@@ -108,12 +122,15 @@ def test_reader_never_observes_partial_json_during_writes(tmp_path):
 
 
 def test_corrupt_existing_document_is_rejected_unchanged(tmp_path):
-    path = tmp_path / "connection.json"
+    from rnaseq_agent.private_files import ensure_private_directory
+
+    store = tmp_path / "store"
+    path = store / "connection.json"
     raw = b"{not valid json"
-    tmp_path.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(store)
     path.write_bytes(raw)
     with pytest.raises(ConnectionStoreCorruptError):
-        save_connection({"host": "h"}, store_dir=tmp_path)
+        save_connection({"host": "h"}, store_dir=store)
     assert path.read_bytes() == raw
 
 
@@ -121,8 +138,9 @@ def test_corrupt_existing_document_is_rejected_unchanged(tmp_path):
 def test_windows_transaction_rejects_existing_broadened_connection_file(tmp_path):
     import ctypes
 
-    save_connection({"host": "before"}, store_dir=tmp_path)
-    path = tmp_path / CONNECTION_FILE_NAME
+    store = tmp_path / "store"
+    save_connection({"host": "before"}, store_dir=store)
+    path = store / CONNECTION_FILE_NAME
     before = path.read_bytes()
     adv = ctypes.windll.advapi32
     kernel = ctypes.windll.kernel32
@@ -143,7 +161,7 @@ def test_windows_transaction_rejects_existing_broadened_connection_file(tmp_path
         kernel.LocalFree(broad)
 
     with pytest.raises((OSError, PermissionError)):
-        save_connection({"host": "after"}, store_dir=tmp_path)
+        save_connection({"host": "after"}, store_dir=store)
     assert path.read_bytes() == before
 
 
@@ -151,9 +169,11 @@ def test_windows_transaction_rejects_existing_broadened_connection_file(tmp_path
 def test_atomic_transaction_failure_preserves_final_bytes_and_removes_temp(
     tmp_path: Path, monkeypatch, failure: str
 ) -> None:
-    save_connection({"host": "before"}, store_dir=tmp_path)
-    path = tmp_path / CONNECTION_FILE_NAME
+    store = tmp_path / "store"
+    save_connection({"host": "before"}, store_dir=store)
+    path = store / CONNECTION_FILE_NAME
     before = path.read_bytes()
+    observed_temp_modes: list[int] = []
 
     if failure == "dump":
         def fail_dump(*args, **kwargs):
@@ -165,21 +185,26 @@ def test_atomic_transaction_failure_preserves_final_bytes_and_removes_temp(
         monkeypatch.setattr(storage.os, "fsync", fail_fsync)
     else:
         def fail_replace(*args, **kwargs):
+            if os.name != "nt":
+                observed_temp_modes.append(stat.S_IMODE(Path(args[0]).stat().st_mode))
             raise OSError("injected replace failure")
         monkeypatch.setattr(storage.os, "replace", fail_replace)
 
     with pytest.raises(OSError):
-        save_connection({"host": "after"}, store_dir=tmp_path)
+        save_connection({"host": "after"}, store_dir=store)
 
     assert path.read_bytes() == before
-    assert not list(tmp_path.glob(f".{path.name}.*"))
+    assert not list(store.glob(f".{path.name}.*"))
+    if os.name != "nt" and failure == "replace":
+        assert observed_temp_modes == [0o600]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
 def test_windows_connection_file_has_protected_current_user_dacl(tmp_path):
     from rnaseq_agent.private_files import _read_windows_acl, _windows_sid
-    save_connection({"host": "h"}, store_dir=tmp_path)
-    path = tmp_path / CONNECTION_FILE_NAME
+    store = tmp_path / "store"
+    save_connection({"host": "h"}, store_dir=store)
+    path = store / CONNECTION_FILE_NAME
     adv = __import__("ctypes").windll.advapi32
     kernel = __import__("ctypes").windll.kernel32
     ctypes = __import__("ctypes")
@@ -199,11 +224,12 @@ def test_windows_connection_file_has_protected_current_user_dacl(tmp_path):
 def test_transaction_callback_waits_for_shared_lock(tmp_path):
     from rnaseq_agent.storage import locked_json_transaction, project_state_lock
 
-    save_connection({"host": "h"}, store_dir=tmp_path)
+    store = tmp_path / "store"
+    save_connection({"host": "h"}, store_dir=store)
     entered = threading.Event()
     ready = threading.Event()
     release = threading.Event()
-    path = tmp_path / "connection.json"
+    path = store / "connection.json"
 
     def contender() -> None:
         ready.set()
@@ -216,6 +242,47 @@ def test_transaction_callback_waits_for_shared_lock(tmp_path):
         assert not entered.wait(0.2)
     thread.join(2)
     assert entered.is_set()
+
+
+def test_transaction_callback_waits_for_shared_lock_across_processes(tmp_path):
+    from rnaseq_agent.storage import project_state_lock
+
+    store = tmp_path / "store"
+    path = store / "connection.json"
+    save_connection({"host": "h"}, store_dir=store)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    entered = context.Event()
+    process = context.Process(
+        target=_transaction_contender_worker,
+        args=(str(path), ready, entered),
+    )
+
+    with project_state_lock(path):
+        process.start()
+        assert ready.wait(5)
+        assert not entered.wait(0.5)
+    process.join(10)
+    assert process.exitcode == 0
+    assert entered.is_set()
+
+
+def test_new_connection_store_directory_is_private_and_existing_broad_directory_fails_closed(
+    tmp_path: Path,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX mode assertions are not applicable on Windows")
+    new_store = tmp_path / "new-store"
+    save_connection({"host": "h"}, store_dir=new_store)
+    assert stat.S_IMODE(new_store.stat().st_mode) == 0o700
+    assert stat.S_IMODE((new_store / CONNECTION_FILE_NAME).stat().st_mode) == 0o600
+
+    broad_store = tmp_path / "broad-store"
+    broad_store.mkdir(mode=0o755)
+    os.chmod(broad_store, 0o755)
+    with pytest.raises((OSError, PermissionError)):
+        save_connection({"host": "h"}, store_dir=broad_store)
+    assert not (broad_store / CONNECTION_FILE_NAME).exists()
 
 
 class TestSaveAndLoad:

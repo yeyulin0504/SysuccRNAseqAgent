@@ -354,6 +354,16 @@ def create_private_temp(directory: Path, prefix: str = ".tmp-") -> tuple[int, Pa
     attrs, descriptor = _windows_descriptor()
     try:
         kernel = ctypes.windll.kernel32
+        kernel.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel.CreateFileW.restype = ctypes.c_void_p
         for _ in range(100):
             candidate = directory / f"{prefix}{next(tempfile._get_candidate_names())}"
             handle = kernel.CreateFileW(str(candidate), 0xC0000000, 0, ctypes.byref(attrs), 1, 0x80, None)

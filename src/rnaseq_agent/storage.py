@@ -88,13 +88,13 @@ def locked_json_transaction(
 ) -> dict[str, Any]:
     from .private_files import (
         _absolute_without_resolving,
-        _ensure_directory_exists_no_follow,
+        ensure_private_directory,
         ensure_private_file,
     )
 
     path = _absolute_without_resolving(path)
 
-    _ensure_directory_exists_no_follow(path.parent)
+    ensure_private_directory(path.parent)
     with shared_file_lock(path):
         current = _read_json_object_or_raise(path)
         if path.exists() or path.is_symlink():

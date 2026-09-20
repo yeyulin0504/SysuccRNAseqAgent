@@ -30,6 +30,26 @@ def test_private_directory_and_file_modes_on_posix(tmp_path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def test_create_private_temp_skips_preexisting_candidate_without_overwriting(
+    tmp_path: Path, monkeypatch
+) -> None:
+    directory = tmp_path / "private"
+    ensure_private_directory(directory)
+    candidate = directory / "test-collision"
+    candidate.write_bytes(b"keep me")
+    names = iter(("collision", "replacement"))
+    monkeypatch.setattr("rnaseq_agent.private_files.tempfile._get_candidate_names", lambda: names)
+
+    handle, path = create_private_temp(directory, prefix="test-")
+    try:
+        assert path == directory / "test-replacement"
+        assert candidate.read_bytes() == b"keep me"
+        assert os.fstat(handle).st_size == 0
+    finally:
+        os.close(handle)
+        path.unlink(missing_ok=True)
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behavior")
 def test_existing_posix_private_directory_symlink_is_rejected_without_following(
     tmp_path: Path,
