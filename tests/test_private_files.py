@@ -30,6 +30,41 @@ def test_private_directory_and_file_modes_on_posix(tmp_path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behavior")
+def test_existing_posix_private_directory_symlink_is_rejected_without_following(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    os.chmod(target, 0o755)
+    link = tmp_path / "private"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises((OSError, PermissionError)):
+        ensure_private_directory(link)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behavior")
+def test_existing_posix_private_file_symlink_is_rejected_without_following(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_bytes(b"old")
+    os.chmod(target, 0o644)
+    link = tmp_path / "private.json"
+    link.symlink_to(target)
+
+    from rnaseq_agent.private_files import ensure_private_file
+
+    with pytest.raises((OSError, PermissionError)):
+        ensure_private_file(link)
+
+    assert target.read_bytes() == b"old"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
 def test_windows_private_paths_have_protected_current_user_dacl(tmp_path: Path) -> None:
     adv = ctypes.windll.advapi32
@@ -119,3 +154,32 @@ def test_windows_private_paths_have_protected_current_user_dacl(tmp_path: Path) 
 def test_windows_rejects_unprotected_inherited_directory(tmp_path: Path) -> None:
     with pytest.raises(PermissionError):
         verify_private_path(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
+def test_windows_existing_broadened_private_directory_cannot_be_repaired(
+    tmp_path: Path,
+) -> None:
+    adv = ctypes.windll.advapi32
+    kernel = ctypes.windll.kernel32
+    directory = tmp_path / "private"
+    ensure_private_directory(directory)
+
+    broad = ctypes.c_void_p()
+    assert adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        "D:(A;;GA;;;WD)", 1, ctypes.byref(broad), None
+    )
+    try:
+        broad_dacl = ctypes.c_void_p()
+        present = ctypes.c_bool()
+        defaulted = ctypes.c_bool()
+        assert adv.GetSecurityDescriptorDacl(
+            broad, ctypes.byref(present), ctypes.byref(broad_dacl), ctypes.byref(defaulted)
+        )
+        adv.SetNamedSecurityInfoW.restype = ctypes.c_ulong
+        assert adv.SetNamedSecurityInfoW(str(directory), 1, 4, None, None, broad_dacl, None) == 0
+    finally:
+        kernel.LocalFree(broad)
+
+    with pytest.raises((OSError, PermissionError)):
+        ensure_private_directory(directory)

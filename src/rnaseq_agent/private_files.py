@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -215,35 +216,140 @@ def _apply_windows_private_dacl(path: Path) -> None:
         ctypes.windll.kernel32.LocalFree(descriptor)
 
 
-def ensure_private_directory(path: Path) -> Path:
+def _absolute_without_resolving(path: Path) -> Path:
     path = Path(path)
-    if os.name == "nt" and not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        attrs, descriptor = _windows_descriptor()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _reject_symlink_or_reparse_components(path: Path) -> Path:
+    """Check existing components without resolving or following them."""
+    path = _absolute_without_resolving(path)
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        current = current / part
         try:
-            if not ctypes.windll.kernel32.CreateDirectoryW(str(path), ctypes.byref(attrs)):
-                err = ctypes.windll.kernel32.GetLastError()
-                if err != 183:
-                    raise OSError(f"CreateDirectoryW failed: {err}")
-        finally:
-            ctypes.windll.kernel32.LocalFree(descriptor)
+            info = os.lstat(current)
+        except FileNotFoundError:
+            # Nothing below a missing component exists yet.
+            break
+        except NotADirectoryError as exc:
+            raise OSError(f"private path component is not a directory: {current}") from exc
+        if stat.S_ISLNK(info.st_mode) or (
+            os.name == "nt"
+            and bool(getattr(info, "st_file_attributes", 0) & 0x400)
+        ):
+            raise OSError(f"private path contains a symlink or reparse point: {current}")
+    return path
+
+
+def _chmod_no_follow(path: Path, mode: int) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
+def _mkdir_posix_private(path: Path) -> None:
+    """Create missing components without following an existing component."""
+    path = _reject_symlink_or_reparse_components(path)
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current, 0o700)
+            except FileExistsError:
+                pass
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError(f"private path component is unsafe: {current}")
+            _chmod_no_follow(current, 0o700)
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"private path component is unsafe: {current}")
+
+
+def _ensure_directory_exists_no_follow(path: Path) -> Path:
+    """Ensure a non-private parent exists without following links."""
+    path = _reject_symlink_or_reparse_components(path)
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                pass
+            info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or (
+            os.name == "nt" and bool(getattr(info, "st_file_attributes", 0) & 0x400)
+        ) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"directory path is unsafe: {current}")
+    return path
+
+
+def _create_windows_directory(path: Path) -> None:
+    """Create missing components with a protected DACL at creation time."""
+    path = _reject_symlink_or_reparse_components(path)
+    current = Path(path.anchor) if path.anchor else Path()
+    parts = path.parts[1:] if path.anchor else path.parts
+    kernel = ctypes.windll.kernel32
+    for part in parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            attrs, descriptor = _windows_descriptor()
+            try:
+                if not kernel.CreateDirectoryW(str(current), ctypes.byref(attrs)):
+                    error = kernel.GetLastError()
+                    if error != 183:  # ERROR_ALREADY_EXISTS
+                        raise OSError(f"CreateDirectoryW failed: {error}")
+            finally:
+                kernel.LocalFree(descriptor)
+            info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400):
+            raise OSError(f"private path component is a reparse point: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"private path component is not a directory: {current}")
+
+
+def ensure_private_directory(path: Path) -> Path:
+    path = _reject_symlink_or_reparse_components(path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        if os.name == "nt":
+            _create_windows_directory(path)
+        else:
+            _mkdir_posix_private(path)
     else:
-        path.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        if not path.is_dir():
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise OSError(f"private directory is not a directory: {path}")
-        _apply_windows_private_dacl(path)
-        _read_windows_acl(path)
-    else:
-        os.chmod(path, 0o700)
+    verify_private_path(path)
     return path
 
 
 def create_private_temp(directory: Path, prefix: str = ".tmp-") -> tuple[int, Path]:
-    directory = ensure_private_directory(directory)
+    directory = _ensure_directory_exists_no_follow(directory)
     if os.name != "nt":
         fd, name = tempfile.mkstemp(prefix=prefix, dir=directory)
-        os.chmod(name, 0o600)
+        os.fchmod(fd, 0o600)
         return fd, Path(name)
     attrs, descriptor = _windows_descriptor()
     try:
@@ -260,17 +366,25 @@ def create_private_temp(directory: Path, prefix: str = ".tmp-") -> tuple[int, Pa
 
 
 def ensure_private_file(path: Path) -> Path:
-    path = Path(path)
-    ensure_private_directory(path.parent)
-    if path.exists() or path.is_symlink():
-        if os.name == "nt" and not path.is_symlink():
-            _apply_windows_private_dacl(path)
-        elif os.name != "nt" and not path.is_symlink():
-            os.chmod(path, 0o600)
+    path = _reject_symlink_or_reparse_components(path)
+    _ensure_directory_exists_no_follow(path.parent)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode) or (
+            os.name == "nt" and bool(getattr(info, "st_file_attributes", 0) & 0x400)
+        ) or not stat.S_ISREG(info.st_mode):
+            raise OSError(f"private path is not a regular file: {path}")
         verify_private_path(path)
         return path
     if os.name != "nt":
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        os.write(fd, b"\0")
         os.close(fd)
     else:
         attrs, descriptor = _windows_descriptor()
@@ -284,7 +398,13 @@ def ensure_private_file(path: Path) -> Path:
                 if error != 80:  # ERROR_FILE_EXISTS
                     raise OSError(f"CreateFileW failed: {error}")
             else:
-                kernel.CloseHandle(handle)
+                import msvcrt
+
+                fd = msvcrt.open_osfhandle(handle, os.O_RDWR)
+                try:
+                    os.write(fd, b"\0")
+                finally:
+                    os.close(fd)
         finally:
             kernel.LocalFree(descriptor)
     verify_private_path(path)
@@ -293,17 +413,24 @@ def ensure_private_file(path: Path) -> Path:
 
 def ensure_private_lock_file(path: Path) -> Path:
     """Create or repair only the lock file; never rewrite its parent ACL."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() or path.is_symlink():
-        if os.name == "nt" and not path.is_symlink():
-            _apply_windows_private_dacl(path)
-        elif os.name != "nt" and not path.is_symlink():
-            os.chmod(path, 0o600)
+    path = _reject_symlink_or_reparse_components(path)
+    _ensure_directory_exists_no_follow(path.parent)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if stat.S_ISLNK(info.st_mode) or (
+            os.name == "nt" and bool(getattr(info, "st_file_attributes", 0) & 0x400)
+        ) or not stat.S_ISREG(info.st_mode):
+            raise OSError(f"private lock path is not a regular file: {path}")
         verify_private_path(path)
         return path
     if os.name != "nt":
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
         os.close(fd)
     else:
         attrs, descriptor = _windows_descriptor()
@@ -325,7 +452,12 @@ def ensure_private_lock_file(path: Path) -> Path:
 
 
 def _verify_or_apply_windows(path: Path) -> None:
-    if not path.exists() or path.is_symlink():
+    path = _reject_symlink_or_reparse_components(path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise OSError(f"unsafe private path: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400):
         raise OSError(f"unsafe private path: {path}")
     attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
     if attributes == 0xFFFFFFFF or attributes & 0x400:
@@ -336,15 +468,21 @@ def _verify_or_apply_windows(path: Path) -> None:
 
 
 def verify_private_path(path: Path) -> None:
-    path = Path(path)
-    if not path.exists() or path.is_symlink():
+    path = _reject_symlink_or_reparse_components(path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise OSError(f"unsafe private path: {path}") from exc
+    if stat.S_ISLNK(info.st_mode):
         raise OSError(f"unsafe private path: {path}")
     if os.name != "nt":
-        mode = path.stat().st_mode
-        if path.is_dir():
+        mode = info.st_mode
+        if stat.S_ISDIR(mode):
             if mode & 0o077:
                 raise PermissionError(f"private directory is too permissive: {path}")
-        elif mode & 0o077:
+        elif stat.S_ISREG(mode) and mode & 0o077:
             raise PermissionError(f"private file is too permissive: {path}")
+        elif not stat.S_ISREG(mode):
+            raise OSError(f"unsafe private path: {path}")
         return
     _verify_or_apply_windows(path)

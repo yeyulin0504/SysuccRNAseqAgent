@@ -34,10 +34,14 @@ def _read_json_object_or_raise(path: Path) -> dict[str, Any]:
 
 
 def _atomic_replace_json(path: Path, payload: dict[str, Any]) -> None:
-    from .private_files import create_private_temp, ensure_private_directory, verify_private_path
+    from .private_files import (
+        _ensure_directory_exists_no_follow,
+        create_private_temp,
+        verify_private_path,
+    )
 
     path = Path(path)
-    ensure_private_directory(path.parent)
+    _ensure_directory_exists_no_follow(path.parent)
     if path.exists() or path.is_symlink():
         verify_private_path(path)
     fd = None
@@ -82,14 +86,23 @@ def locked_json_transaction(
     path: Path,
     mutate: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
-    path = Path(path).resolve()
-    from .private_files import ensure_private_directory, ensure_private_file
+    from .private_files import (
+        _absolute_without_resolving,
+        _ensure_directory_exists_no_follow,
+        ensure_private_file,
+    )
 
-    ensure_private_directory(path.parent)
-    if path.exists() or path.is_symlink():
-        ensure_private_file(path)
+    path = _absolute_without_resolving(path)
+
+    _ensure_directory_exists_no_follow(path.parent)
     with shared_file_lock(path):
         current = _read_json_object_or_raise(path)
+        if path.exists() or path.is_symlink():
+            # Read-only corruption classification precedes private-write ACL
+            # validation so an existing malformed document remains unchanged
+            # and reports the store error. Valid documents must still pass the
+            # no-repair private-path check before any replacement can occur.
+            ensure_private_file(path)
         updated = mutate(copy.deepcopy(current))
         if not isinstance(updated, dict):
             raise TypeError("transaction callback must return a JSON object")
@@ -120,10 +133,6 @@ class _ProjectStateLock:
 
                 ensure_private_lock_file(self._lock_path)
                 handle = self._lock_path.open("r+b")
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b"\0")
-                    handle.flush()
                 handle.seek(0)
                 self._acquire_file_lock(handle)
                 self._local.handle = handle

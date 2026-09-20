@@ -35,6 +35,7 @@ from rnaseq_agent.connection_store import (
     save_llm,
 )
 from rnaseq_agent.storage import ConnectionStoreCorruptError
+from rnaseq_agent import storage
 
 
 def _save_connection_worker(store_dir: Path, barrier) -> None:
@@ -114,6 +115,64 @@ def test_corrupt_existing_document_is_rejected_unchanged(tmp_path):
     with pytest.raises(ConnectionStoreCorruptError):
         save_connection({"host": "h"}, store_dir=tmp_path)
     assert path.read_bytes() == raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
+def test_windows_transaction_rejects_existing_broadened_connection_file(tmp_path):
+    import ctypes
+
+    save_connection({"host": "before"}, store_dir=tmp_path)
+    path = tmp_path / CONNECTION_FILE_NAME
+    before = path.read_bytes()
+    adv = ctypes.windll.advapi32
+    kernel = ctypes.windll.kernel32
+    broad = ctypes.c_void_p()
+    assert adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        "D:(A;;GA;;;WD)", 1, ctypes.byref(broad), None
+    )
+    try:
+        broad_dacl = ctypes.c_void_p()
+        present = ctypes.c_bool()
+        defaulted = ctypes.c_bool()
+        assert adv.GetSecurityDescriptorDacl(
+            broad, ctypes.byref(present), ctypes.byref(broad_dacl), ctypes.byref(defaulted)
+        )
+        adv.SetNamedSecurityInfoW.restype = ctypes.c_ulong
+        assert adv.SetNamedSecurityInfoW(str(path), 1, 4, None, None, broad_dacl, None) == 0
+    finally:
+        kernel.LocalFree(broad)
+
+    with pytest.raises((OSError, PermissionError)):
+        save_connection({"host": "after"}, store_dir=tmp_path)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["dump", "fsync", "replace"])
+def test_atomic_transaction_failure_preserves_final_bytes_and_removes_temp(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    save_connection({"host": "before"}, store_dir=tmp_path)
+    path = tmp_path / CONNECTION_FILE_NAME
+    before = path.read_bytes()
+
+    if failure == "dump":
+        def fail_dump(*args, **kwargs):
+            raise OSError("injected dump failure")
+        monkeypatch.setattr(storage.json, "dump", fail_dump)
+    elif failure == "fsync":
+        def fail_fsync(*args, **kwargs):
+            raise OSError("injected fsync failure")
+        monkeypatch.setattr(storage.os, "fsync", fail_fsync)
+    else:
+        def fail_replace(*args, **kwargs):
+            raise OSError("injected replace failure")
+        monkeypatch.setattr(storage.os, "replace", fail_replace)
+
+    with pytest.raises(OSError):
+        save_connection({"host": "after"}, store_dir=tmp_path)
+
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob(f".{path.name}.*"))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
