@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import socket
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -3918,9 +3920,36 @@ def create_app(
             updated["remote_scan_apply_receipts"] = receipts[-32:]
             return updated
 
+        def atomic_project_write(payload: dict[str, Any]) -> None:
+            project_dir.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(prefix=".project.json.", dir=str(project_dir))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, config_path)
+                temp_name = ""
+                if os.name != "nt":
+                    dir_fd = os.open(project_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+                if temp_name:
+                    try:
+                        os.unlink(temp_name)
+                    except FileNotFoundError:
+                        pass
+
         with project_state_lock(config_path):
             current = load_json(config_path) if config_path.is_file() else {}
-            save_json(config_path, mutate(current))
+            atomic_project_write(mutate(current))
 
         # A scan can be applied to a project created from the workspace page,
         # where project.json/session.json do not exist yet.  Create the normal
