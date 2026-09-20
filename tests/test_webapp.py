@@ -59,6 +59,229 @@ def _new_project(client, token: str) -> None:
 
 
 class TestWebApp:
+    def test_remote_data_root_preview_uses_bounded_resolver_without_persisting(self, client, monkeypatch, tmp_path):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+        calls = {"bounded": [], "generic": 0}
+
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                calls["bounded"].append((command, absolute_deadline, max_capture_bytes, check))
+                return CommandResult([], 0, "/srv/team\n", "", 10)
+
+            def execute(self, command):
+                calls["generic"] += 1
+                raise AssertionError("preview must not use generic execute")
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        response = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["requested_path"] == "/data/team"
+        assert body["canonical_path"] == "/srv/team"
+        assert body["host"] == "h.example"
+        assert body["user"] == "alice"
+        assert body["port"] == 22
+        assert body["browse_policy_revision"].startswith("sha256:")
+        assert len(calls["bounded"]) == 1
+        assert calls["generic"] == 0
+        assert not (tmp_path / "agent_home" / "connection.json").read_text(encoding="utf-8").__contains__("approved_data_roots")
+
+    def test_remote_data_root_approve_and_revoke_are_revision_bound(self, client, monkeypatch):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import load_browse_policy, save_connection
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                return CommandResult([], 0, "/srv/team\n", "", 10)
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        preview = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        ).json()
+        approved = client.post(
+            "/api/settings/remote-data-roots",
+            json={**preview, "expected_revision": preview["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert approved.status_code == 200
+        root = approved.json()["root"]
+        assert root["root_id"].startswith("root_")
+        listed = client.get("/api/settings/remote-data-roots", headers=_headers(token)).json()
+        assert listed["roots"][0]["canonical_path"] == "/srv/team"
+        assert listed["browse_policy_revision"] == load_browse_policy().revision
+
+        stale = client.request(
+            "DELETE",
+            f"/api/settings/remote-data-roots/{root['root_id']}",
+            json={"expected_revision": preview["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert stale.status_code == 409
+        assert stale.json()["error_code"] == "REMOTE_ROOT_REVISION_CONFLICT"
+
+        current = client.get("/api/settings/remote-data-roots", headers=_headers(token)).json()
+        revoked = client.request(
+            "DELETE",
+            f"/api/settings/remote-data-roots/{root['root_id']}",
+            json={"expected_revision": current["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert revoked.status_code == 200
+        assert revoked.json()["root"]["revoked_at"] is not None
+
+    def test_settings_page_has_remote_root_two_step_controls(self, client):
+        page = client.get("/settings").text
+        for control_id in ("remoteRootPath", "previewRemoteRoot", "approveRemoteRoot", "remoteRoots"):
+            assert f'id="{control_id}"' in page
+
+    @pytest.mark.parametrize("requested_path", ["/", "/data/../secret", "/data//reads", "relative"])
+    def test_remote_data_root_preview_rejects_invalid_path_before_transport(self, client, monkeypatch, requested_path):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda _config: (_ for _ in ()).throw(AssertionError("transport must not be created")))
+        response = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": requested_path},
+            headers=_headers(token),
+        )
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "REMOTE_PATH_INVALID"
+
+    @pytest.mark.parametrize("returncode", [44, 45])
+    def test_remote_data_root_preview_preserves_resolution_errors(self, client, monkeypatch, returncode):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                return CommandResult([], returncode, "", "", 0)
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        response = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        )
+        expected = "REMOTE_PATH_NOT_FOUND" if returncode == 44 else "REMOTE_PATH_NOT_DIRECTORY"
+        assert response.status_code in {404, 422}
+        assert response.json()["error_code"] == expected
+
+    def test_remote_data_root_preview_missing_credentials_is_connection_error(self, client, monkeypatch):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22, "auth_mode": "password"})
+        called = {"transport": 0}
+
+        def create(_config):
+            called["transport"] += 1
+            raise RuntimeError("当前选择了密码登录，但本次程序中没有临时密码")
+
+        monkeypatch.setattr(webapp, "create_remote_transport", create)
+        response = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        )
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "REMOTE_CONNECTION_INVALID"
+        assert called["transport"] == 0
+
+    def test_remote_data_root_list_does_not_disclose_other_identity(self, client, monkeypatch):
+        from rnaseq_agent.connection_store import approve_data_root, load_browse_policy, save_connection
+        from rnaseq_agent.connection_store import ApprovedDataRoot
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+        policy = load_browse_policy()
+        approve_data_root(
+            ApprovedDataRoot("root_alice", "h.example", "alice", 22, "/secret/alice", "/srv/alice", "2026-09-17T00:00:00Z", None),
+            expected_revision=policy.revision,
+        )
+        save_connection({"user": "bob"})
+        response = client.get("/api/settings/remote-data-roots", headers=_headers(token))
+        assert response.status_code == 200
+        assert response.json()["roots"] == []
+        assert "/srv/alice" not in response.text
+
+    def test_remote_data_root_revoke_cannot_target_other_identity(self, client):
+        from rnaseq_agent.connection_store import (
+            ApprovedDataRoot,
+            approve_data_root,
+            load_browse_policy,
+            save_connection,
+        )
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+        policy = load_browse_policy()
+        approve_data_root(
+            ApprovedDataRoot("root_alice", "h.example", "alice", 22, "/secret/alice", "/srv/alice", "2026-09-17T00:00:00Z", None),
+            expected_revision=policy.revision,
+        )
+        save_connection({"user": "bob"})
+        current = client.get("/api/settings/remote-data-roots", headers=_headers(token)).json()
+        response = client.request(
+            "DELETE",
+            "/api/settings/remote-data-roots/root_alice",
+            json={"expected_revision": current["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "REMOTE_ROOT_REVISION_CONFLICT"
+
+    @pytest.mark.parametrize("bad_port", [None, True, False, "", "  ", "-1", "65536", 0, -1, 65536, 65536 + 1, "-oProxyCommand=calc"])
+    def test_remote_data_root_approve_rejects_invalid_port_before_transport(self, client, monkeypatch, bad_port):
+        import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import save_connection
+        from rnaseq_agent.execution import CommandResult
+
+        token = _token(client)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                return CommandResult([], 0, "/srv/team\n", "", 10)
+
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        preview = client.post(
+            "/api/settings/remote-data-roots/preview",
+            json={"requested_path": "/data/team"},
+            headers=_headers(token),
+        ).json()
+        monkeypatch.setattr(webapp, "create_remote_transport", lambda _config: (_ for _ in ()).throw(AssertionError("invalid port reached transport")))
+        preview["port"] = bad_port
+        response = client.post(
+            "/api/settings/remote-data-roots",
+            json={**preview, "expected_revision": preview["browse_policy_revision"]},
+            headers=_headers(token),
+        )
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "REMOTE_CONNECTION_INVALID"
+
     def test_index_renders(self, client) -> None:
         resp = client.get("/")
         assert resp.status_code == 200

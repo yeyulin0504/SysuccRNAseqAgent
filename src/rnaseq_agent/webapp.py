@@ -26,7 +26,10 @@ import secrets
 import shlex
 import socket
 import threading
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +67,20 @@ from .threads import (
 )
 from .webchat import ChatIntent, execute_intent, route_intent
 from .remote_transport import create_remote_transport, test_server_connection
+from .remote_browse import (
+    BrowseExecutionBudget,
+    MAX_SCAN_OUTPUT_BYTES,
+    REMOTE_PATH_ESCAPE,
+    REMOTE_PATH_INVALID,
+    REMOTE_PATH_NOT_DIRECTORY,
+    REMOTE_PATH_NOT_FOUND,
+    REMOTE_ROOT_REVISION_CONFLICT,
+    REMOTE_SCAN_FAILED,
+    SCAN_TIMEOUT_SECONDS,
+    _BrowseResolutionError,
+    resolve_remote_directory,
+    validate_remote_browse_path,
+)
 from .project_intake import (
     append_history,
     derive_visible_state,
@@ -83,17 +100,23 @@ from .container_service import (
     validate_image_settings,
 )
 from .connection_store import (
+    ApprovedDataRoot,
+    BrowsePolicyConflictError,
     apply_connection_to_config,
     apply_llm_to_config,
     connection_file_path,
     llm_model_name,
+    load_browse_policy,
+    list_all_approved_data_roots,
     load_connection,
     load_llm,
+    approve_data_root,
+    revoke_data_root,
     save_connection,
     save_llm,
 )
 from .ssh_auth import get_ssh_credential, normalize_auth_mode, set_ssh_credential
-from .ssh_identity import validate_ssh_patch
+from .ssh_identity import normalize_ssh_identity, validate_ssh_patch
 from .workspace import Workspace, WorkspaceError
 
 STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
@@ -163,6 +186,68 @@ def _connection_as_config() -> dict[str, Any] | None:
     from copy import deepcopy
 
     return {"server": deepcopy(shared)}
+
+
+def _remote_root_error(code: str, *, status_code: int | None = None) -> JSONResponse:
+    statuses = {
+        REMOTE_PATH_INVALID: 400,
+        REMOTE_PATH_NOT_FOUND: 404,
+        REMOTE_PATH_NOT_DIRECTORY: 422,
+        REMOTE_PATH_ESCAPE: 403,
+        REMOTE_SCAN_FAILED: 502,
+        REMOTE_ROOT_REVISION_CONFLICT: 409,
+        "REMOTE_CONNECTION_INVALID": 400,
+    }
+    messages = {
+        REMOTE_PATH_INVALID: "远程目录路径无效。",
+        REMOTE_PATH_NOT_FOUND: "远程目录不存在。",
+        REMOTE_PATH_NOT_DIRECTORY: "远程目标不是目录。",
+        REMOTE_PATH_ESCAPE: "远程目录解析结果不安全。",
+        REMOTE_SCAN_FAILED: "远程目录解析失败。",
+        REMOTE_ROOT_REVISION_CONFLICT: "远程数据根或服务器连接已变化，请重新预览。",
+        "REMOTE_CONNECTION_INVALID": "请先在设置中保存有效的服务器主机、用户名和端口。",
+    }
+    return JSONResponse(
+        {"ok": False, "error_code": code, "message": messages.get(code, code)},
+        status_code=status_code or statuses.get(code, 400),
+    )
+
+
+def _remote_policy_for_settings() -> Any:
+    """Return the live policy; callers must reject unavailable identities."""
+    return load_browse_policy()
+
+
+def _resolve_settings_remote_path(requested_path: str) -> tuple[Any, str]:
+    policy = _remote_policy_for_settings()
+    if not policy.available or policy.identity is None:
+        raise ValueError("REMOTE_CONNECTION_INVALID")
+    try:
+        requested_path = validate_remote_browse_path(requested_path)
+    except ValueError as exc:
+        raise ValueError(REMOTE_PATH_INVALID) from exc
+    if requested_path == "/":
+        raise ValueError(REMOTE_PATH_INVALID)
+    config = _connection_as_config()
+    if config is None:
+        raise ValueError("REMOTE_CONNECTION_INVALID")
+    server = config.get("server") or {}
+    credential = get_ssh_credential(policy.identity.host, policy.identity.user)
+    auth_mode = normalize_auth_mode(str(server.get("auth_mode") or credential.mode or "key"))
+    if auth_mode == "password" and not credential.password:
+        raise ValueError("REMOTE_CONNECTION_INVALID")
+    transport = create_remote_transport(config)
+    budget = BrowseExecutionBudget.start(
+        timeout_seconds=SCAN_TIMEOUT_SECONDS,
+        max_output_bytes=MAX_SCAN_OUTPUT_BYTES,
+    )
+    canonical = resolve_remote_directory(requested_path, budget, transport)
+    return policy, canonical
+
+
+def _settings_root_records(policy: Any) -> list[dict[str, Any]]:
+    """Read all valid root records for the live identity, including revoked ones."""
+    return [asdict(root) for root in list_all_approved_data_roots()]
 
 
 def _restore_runtime_credential(connection: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1213,6 +1298,172 @@ def create_app(
             }
         except SessionError as exc:
             return {"error": str(exc)}
+
+    @app.get("/api/settings/remote-data-roots")
+    async def api_remote_data_roots_get(request: Request):
+        _guard(request)
+        policy = _remote_policy_for_settings()
+        if not policy.available or policy.identity is None:
+            return _remote_root_error("REMOTE_CONNECTION_INVALID")
+        return {
+            "ok": True,
+            "identity": {
+                "host": policy.identity.host,
+                "user": policy.identity.user,
+                "port": policy.identity.port,
+            },
+            "roots": _settings_root_records(policy),
+            "browse_policy_revision": policy.revision,
+        }
+
+    @app.post("/api/settings/remote-data-roots/preview")
+    async def api_remote_data_root_preview(request: Request):
+        _guard(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        if not isinstance(payload, dict) or set(payload) != {"requested_path"}:
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        requested_path = payload.get("requested_path")
+        if not isinstance(requested_path, str):
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        try:
+            policy, canonical = _resolve_settings_remote_path(requested_path)
+        except ValueError as exc:
+            return _remote_root_error(str(exc), status_code=400)
+        except _BrowseResolutionError as exc:
+            return _remote_root_error(exc.code)
+        except RuntimeError:
+            return _remote_root_error("REMOTE_CONNECTION_INVALID")
+        except Exception:
+            return _remote_root_error(REMOTE_SCAN_FAILED)
+        assert policy.identity is not None
+        return {
+            "ok": True,
+            "host": policy.identity.host,
+            "user": policy.identity.user,
+            "port": policy.identity.port,
+            "requested_path": requested_path,
+            "canonical_path": canonical,
+            "browse_policy_revision": policy.revision,
+        }
+
+    @app.post("/api/settings/remote-data-roots")
+    async def api_remote_data_root_approve(request: Request):
+        _guard(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        allowed = {
+            "ok", "host", "user", "port", "requested_path", "canonical_path",
+            "browse_policy_revision", "expected_revision",
+        }
+        if not isinstance(payload, dict) or set(payload) != allowed:
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        if payload.get("ok") is not True:
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        expected = payload.get("expected_revision")
+        preview_revision = payload.get("browse_policy_revision")
+        if not isinstance(expected, str) or expected != preview_revision:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        try:
+            if isinstance(payload.get("port"), bool) or not isinstance(payload.get("port"), int) or not 1 <= payload.get("port") <= 65535:
+                return _remote_root_error("REMOTE_CONNECTION_INVALID")
+            requested_identity = normalize_ssh_identity(
+                {"host": payload.get("host"), "user": payload.get("user"), "port": payload.get("port")}
+            )
+        except Exception:
+            return _remote_root_error("REMOTE_CONNECTION_INVALID")
+        if not isinstance(payload.get("requested_path"), str) or not isinstance(payload.get("canonical_path"), str):
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        live_before_resolve = _remote_policy_for_settings()
+        if (
+            not live_before_resolve.available
+            or live_before_resolve.identity is None
+            or requested_identity != live_before_resolve.identity
+        ):
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        try:
+            live_policy, canonical = _resolve_settings_remote_path(payload["requested_path"])
+        except ValueError as exc:
+            return _remote_root_error(str(exc), status_code=400)
+        except _BrowseResolutionError as exc:
+            return _remote_root_error(exc.code)
+        except RuntimeError:
+            return _remote_root_error("REMOTE_CONNECTION_INVALID")
+        except Exception:
+            return _remote_root_error(REMOTE_SCAN_FAILED)
+        identity = live_policy.identity
+        assert identity is not None
+        if (
+            payload["host"], payload["user"], payload["port"]
+        ) != (identity.host, identity.user, identity.port):
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        if canonical != payload["canonical_path"] or live_policy.revision != expected:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        root = ApprovedDataRoot(
+            root_id="root_" + uuid.uuid4().hex,
+            host=identity.host,
+            user=identity.user,
+            port=identity.port,
+            requested_path=payload["requested_path"],
+            canonical_path=canonical,
+            created_at=now,
+            revoked_at=None,
+        )
+        try:
+            updated = approve_data_root(root, expected_revision=expected)
+        except BrowsePolicyConflictError:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        except (TypeError, ValueError):
+            return _remote_root_error(REMOTE_PATH_INVALID)
+        persisted = next(
+            (
+                item for item in updated.roots
+                if item.canonical_path == root.canonical_path
+                and (item.host, item.user, item.port) == (root.host, root.user, root.port)
+            ),
+            root,
+        )
+        return {
+            "ok": True,
+            "root": asdict(persisted),
+            "browse_policy_revision": updated.revision,
+        }
+
+    @app.delete("/api/settings/remote-data-roots/{root_id}")
+    async def api_remote_data_root_revoke(root_id: str, request: Request):
+        _guard(request)
+        try:
+            payload = await request.json()
+        except Exception:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        if not isinstance(payload, dict) or set(payload) != {"expected_revision"}:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        expected = payload.get("expected_revision")
+        if not isinstance(expected, str):
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        policy = _remote_policy_for_settings()
+        if not policy.available or policy.identity is None:
+            return _remote_root_error("REMOTE_CONNECTION_INVALID")
+        try:
+            updated = revoke_data_root(root_id, expected_revision=expected)
+        except BrowsePolicyConflictError:
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        except (TypeError, ValueError):
+            return _remote_root_error(REMOTE_ROOT_REVISION_CONFLICT)
+        revoked = next(
+            (item for item in _settings_root_records(updated) if item["root_id"] == root_id),
+            None,
+        )
+        return {
+            "ok": True,
+            "root": revoked or {"root_id": root_id, "revoked_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")},
+            "browse_policy_revision": updated.revision,
+        }
 
     @app.post("/api/config/demo")
     async def api_config_demo(request: Request):

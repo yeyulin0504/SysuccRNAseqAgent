@@ -140,6 +140,18 @@
     <div class="muted" style="margin-top:8px">未启用或请求失败时，对话自动回退本地规则路由。</div>
   </div>
 
+  <h2>远程数据根（需预览后批准）</h2>
+  <div class="card">
+    <p class="muted" style="margin:0">远程 FASTQ 目录只能在这里经过一次预览、再次确认后加入允许列表。预览不会保存权限；连接配置改变后必须重新预览。</p>
+    <label>请求目录</label>
+    <input id="remoteRootPath" placeholder="/data/project/reads">
+    <button id="previewRemoteRoot" onclick="previewRemoteRoot()">预览目录</button>
+    <div id="remoteRootPreview" class="muted" style="margin-top:8px"></div>
+    <button id="approveRemoteRoot" class="secondary hidden" onclick="approveRemoteRoot()">批准这个目录</button>
+    <div id="remoteRootResult" class="muted" style="margin-top:8px"></div>
+    <div id="remoteRoots" style="margin-top:14px"></div>
+  </div>
+
   <h2>下游分析容器</h2>
   <div class="card">
     <p class="muted" style="margin:0">用于 DESeq2 与 CMScaller。服务器会把 Docker/OCI 镜像转换为 Apptainer SIF。</p>
@@ -160,6 +172,7 @@
 <script>
 const TOKEN = "{{ token }}";
 let authMode = "key";
+let rootPreview = null;
 async function api(path, method, body) {
   const opts = { method: method || "GET", headers: { "content-type": "application/json", "x-session-token": TOKEN } };
   if (body) opts.body = JSON.stringify(body);
@@ -205,7 +218,7 @@ function load() {
       document.getElementById("ctrPath").value = c.container.image_path || "";
       document.getElementById("ctrBinds").value = (c.container.bind_paths || []).join("\n");
     }
-  });
+  }).finally(loadRemoteRoots);
 }
 async function saveServer() {
   const server = {
@@ -231,8 +244,84 @@ async function saveServer() {
   if (server.port) server.port = Number(server.port);
   return api("/api/config", "POST", { server }).then(d => {
     if (d.error) { alert(d.error); return d; }
-    flash(); return d;
+    rootPreview = null;
+    document.getElementById("remoteRootPreview").textContent = "";
+    document.getElementById("approveRemoteRoot").classList.add("hidden");
+    flash();
+    loadRemoteRoots();
+    return d;
   });
+}
+
+function renderRemoteRoots(data) {
+  const el = document.getElementById("remoteRoots");
+  if (!data || data.error) { el.textContent = data && data.message ? data.message : "请先保存有效的服务器连接。"; return; }
+  if (!data.roots || !data.roots.length) { el.textContent = "当前连接还没有已批准的数据根。"; return; }
+  el.innerHTML = "";
+  const table = document.createElement("table");
+  table.style.width = "100%";
+  table.style.fontSize = "12px";
+  for (const root of data.roots) {
+    const row = document.createElement("tr");
+    const status = root.revoked_at ? `已撤销（${root.revoked_at}）` : "生效中";
+    row.innerHTML = `<td style="padding:5px 0"><code></code><br><span class="muted"></span></td><td style="text-align:right"></td>`;
+    row.querySelector("code").textContent = root.canonical_path;
+    row.querySelector(".muted").textContent = status;
+    if (!root.revoked_at) {
+      const button = document.createElement("button");
+      button.className = "secondary";
+      button.textContent = "撤销";
+      button.onclick = () => revokeRemoteRoot(root.root_id, data.browse_policy_revision);
+      row.lastElementChild.appendChild(button);
+    }
+    table.appendChild(row);
+  }
+  el.appendChild(table);
+}
+
+async function loadRemoteRoots() {
+  const result = await api("/api/settings/remote-data-roots");
+  renderRemoteRoots(result);
+}
+
+async function previewRemoteRoot() {
+  rootPreview = null;
+  document.getElementById("approveRemoteRoot").classList.add("hidden");
+  const requested_path = document.getElementById("remoteRootPath").value.trim();
+  const result = await api("/api/settings/remote-data-roots/preview", "POST", { requested_path });
+  const el = document.getElementById("remoteRootPreview");
+  if (!result.ok) { el.textContent = result.message || result.error_code; return result; }
+  rootPreview = result;
+  el.textContent = `请求目录：${result.requested_path}；规范目录：${result.canonical_path}；连接：${result.user}@${result.host}:${result.port}`;
+  document.getElementById("approveRemoteRoot").classList.remove("hidden");
+  return result;
+}
+
+async function approveRemoteRoot() {
+  if (!rootPreview) return;
+  const result = await api("/api/settings/remote-data-roots", "POST", {
+    ...rootPreview,
+    expected_revision: rootPreview.browse_policy_revision,
+  });
+  if (!result.ok) {
+    document.getElementById("remoteRootResult").textContent = result.message || result.error_code;
+    if (result.error_code === "REMOTE_ROOT_REVISION_CONFLICT") { rootPreview = null; await loadRemoteRoots(); }
+    return result;
+  }
+  rootPreview = null;
+  document.getElementById("remoteRootPreview").textContent = "已批准。";
+  document.getElementById("approveRemoteRoot").classList.add("hidden");
+  document.getElementById("remoteRootResult").textContent = "远程数据根已加入允许列表。";
+  await loadRemoteRoots();
+  return result;
+}
+
+async function revokeRemoteRoot(rootId, revision) {
+  const result = await api(`/api/settings/remote-data-roots/${encodeURIComponent(rootId)}`, "DELETE", { expected_revision: revision });
+  if (!result.ok && result.error_code === "REMOTE_ROOT_REVISION_CONFLICT") { await loadRemoteRoots(); return result; }
+  if (!result.ok) { alert(result.message || result.error_code); return result; }
+  await loadRemoteRoots();
+  return result;
 }
 async function saveLlm() {
   const llm = {
@@ -321,7 +410,7 @@ function clearKey() {
     if (d.error) alert(d.error); else { document.getElementById("llmKeyState").textContent = "（未设置）"; flash(); }
   });
 }
-{% if session.config %}load();{% endif %}
+{% if session.config %}load();{% else %}loadRemoteRoots();{% endif %}
 </script>
 </body>
 </html>
