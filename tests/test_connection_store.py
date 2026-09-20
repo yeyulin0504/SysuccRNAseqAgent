@@ -43,6 +43,11 @@ from rnaseq_agent.connection_store import (
     revoke_data_root,
 )
 from rnaseq_agent.ssh_identity import SSHIdentity
+from rnaseq_agent.model_provider import (
+    normalize_provider_config,
+    provider_config_revision,
+    provider_identity,
+)
 from rnaseq_agent.storage import ConnectionStoreCorruptError
 from rnaseq_agent import storage
 
@@ -1019,3 +1024,43 @@ class TestLlmModelName:
         assert llm_model_name({"llm": {"model": None}}) == ""
         assert llm_model_name({"llm": {"model": "   "}}) == ""
         assert llm_model_name({"llm": "not-a-dict"}) == ""
+
+
+def test_saved_provider_identity_and_revisions_ignore_api_key_only_changes(
+    store_dir: Path,
+) -> None:
+    save_llm(
+        {
+            "provider": "OpenAI",
+            "api_base": "https://llm.example/v1",
+            "model": "gpt-test",
+            "api_key": "API_KEY_SENTINEL_A",
+        },
+        store_dir=store_dir,
+    )
+    initial = normalize_provider_config(load_llm(store_dir=store_dir))
+    initial_identity = provider_identity(initial)
+    initial_revision = provider_config_revision(initial)
+
+    save_llm({"api_key": "API_KEY_SENTINEL_B"}, store_dir=store_dir)
+    secret_changed = normalize_provider_config(load_llm(store_dir=store_dir))
+    assert provider_identity(secret_changed) == initial_identity
+    assert provider_config_revision(secret_changed) == initial_revision
+
+    save_llm({"model": "gpt-other"}, store_dir=store_dir)
+    model_changed = normalize_provider_config(load_llm(store_dir=store_dir))
+    assert provider_identity(model_changed) != initial_identity
+    assert provider_config_revision(model_changed) != initial_revision
+
+    save_llm(
+        {"model": "gpt-test", "api_base": "https://other.example/v1"},
+        store_dir=store_dir,
+    )
+    origin_changed = normalize_provider_config(load_llm(store_dir=store_dir))
+    assert provider_identity(origin_changed) != initial_identity
+    assert provider_config_revision(origin_changed) != initial_revision
+
+    save_llm({"api_base": "https://llm.example/tenant-a/v1"}, store_dir=store_dir)
+    path_changed = normalize_provider_config(load_llm(store_dir=store_dir))
+    assert provider_identity(path_changed) == initial_identity
+    assert provider_config_revision(path_changed) != initial_revision
