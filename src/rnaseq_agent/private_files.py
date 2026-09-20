@@ -291,6 +291,39 @@ def ensure_private_file(path: Path) -> Path:
     return path
 
 
+def ensure_private_lock_file(path: Path) -> Path:
+    """Create or repair only the lock file; never rewrite its parent ACL."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        if os.name == "nt" and not path.is_symlink():
+            _apply_windows_private_dacl(path)
+        elif os.name != "nt" and not path.is_symlink():
+            os.chmod(path, 0o600)
+        verify_private_path(path)
+        return path
+    if os.name != "nt":
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.close(fd)
+    else:
+        attrs, descriptor = _windows_descriptor()
+        try:
+            kernel = ctypes.windll.kernel32
+            handle = kernel.CreateFileW(
+                str(path), 0xC0000000, 0, ctypes.byref(attrs), 1, 0x80, None
+            )
+            if handle == ctypes.c_void_p(-1).value:
+                error = kernel.GetLastError()
+                if error != 80:  # ERROR_FILE_EXISTS
+                    raise OSError(f"CreateFileW failed: {error}")
+            else:
+                kernel.CloseHandle(handle)
+        finally:
+            kernel.LocalFree(descriptor)
+    verify_private_path(path)
+    return path
+
+
 def _verify_or_apply_windows(path: Path) -> None:
     if not path.exists() or path.is_symlink():
         raise OSError(f"unsafe private path: {path}")

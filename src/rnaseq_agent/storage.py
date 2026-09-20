@@ -116,9 +116,9 @@ class _ProjectStateLock:
         try:
             if depth == 0:
                 self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-                from .private_files import ensure_private_file
+                from .private_files import ensure_private_lock_file
 
-                ensure_private_file(self._lock_path)
+                ensure_private_lock_file(self._lock_path)
                 handle = self._lock_path.open("r+b")
                 handle.seek(0, os.SEEK_END)
                 if handle.tell() == 0:
