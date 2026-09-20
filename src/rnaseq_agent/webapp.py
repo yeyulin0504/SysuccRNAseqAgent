@@ -4027,15 +4027,21 @@ def create_app(
                 "samples": [asdict(sample) for sample in group.samples],
             },
         )
-        append_history(
-            project_dir,
-            {
-                "type": "remote_scan_apply",
-                "name": "远程样本组已应用",
-                "state": "ready",
-                "details": {"sample_count": len(group.samples), "directory_count": 1},
-            },
-        )
+        try:
+            append_history(
+                project_dir,
+                {
+                    "type": "remote_scan_apply",
+                    "name": "远程样本组已应用",
+                    "state": "ready",
+                    "details": {"sample_count": len(group.samples), "directory_count": 1},
+                },
+            )
+        except OSError:
+            # The scan receipt/project write is authoritative.  History is a
+            # bounded de-identified projection and must not turn a consumed
+            # result into a misleading failed response.
+            pass
         session = _session_for(project_dir)
         return {
             "ok": True,
