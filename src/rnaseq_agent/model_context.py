@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import secrets
 import threading
 import time
@@ -25,6 +26,19 @@ MAX_ARGUMENT_FRAGMENTS = 128
 MAX_NESTING_DEPTH = 16
 MAX_COLLECTION_ITEMS = 256
 MAX_SCALAR_STRING_BYTES = 16 * 1024
+_SUMMARY_SAFE_ENUMS = {
+    "project_state": {"setup", "drafting", "input_ready", "planned", "running", "waiting_qc", "completed", "failed", "unknown"},
+    "route_id": {"bulk_rna", "single_cell", "spatial", "unknown"},
+    "capability_id": {"bulk_rna", "single_cell", "spatial", "unknown"},
+    "input_kind": {"fastq", "counts", "counts_matrix", "expression_matrix", "unknown"},
+    "data_scope": {"summary"},
+    "layout": {"single", "paired", "unknown"},
+    "strandedness": {"forward", "reverse", "unstranded", "unknown", "auto"},
+    "classification": {"raw_counts", "normalized", "normalized_expression", "unknown"},
+    "state": {"setup", "drafting", "input_ready", "planned", "running", "waiting_qc", "completed", "failed", "unknown"},
+    "category": {"run_failed", "unknown"},
+}
+_SUMMARY_STAGE_NAMES = {"fastp", "star", "featurecounts", "deseq2", "go", "gsea", "cms", "report", "qc", "align", "quantify"}
 
 
 class EphemeralArgumentError(ValueError):
@@ -231,6 +245,11 @@ def _safe_int(value: Any, default: int = 0) -> int:
     return result if result >= 0 else default
 
 
+def _safe_summary_enum(field: str, value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in _SUMMARY_SAFE_ENUMS.get(field, set()) else "unknown"
+
+
 def _sample_rows(project: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     samples = project.get("samples")
     if isinstance(samples, Mapping):
@@ -312,7 +331,51 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
         summary = full.get("summary") if isinstance(full.get("summary"), Mapping) else None
         result = {"ok": ok}
         if summary is not None:
-            result["summary"] = summary
+            # Rebuild the provider-facing shape from an allowlist.  A tool result
+            # may be assembled by a legacy executor and must not smuggle arbitrary
+            # nested values into the model context.
+            allowed = {
+                "policy_version", "data_scope", "project_state", "route_id",
+                "capability_id", "input_kind", "sample_count", "condition_counts",
+                "sample_aliases", "replicate_gate", "pipeline_stages", "matrix",
+                "references", "contract", "run", "errors", "sequencing",
+            }
+            safe_summary: dict[str, Any] = {}
+            for key in allowed:
+                value = summary.get(key)
+                if key == "condition_counts" and isinstance(value, Mapping):
+                    safe_summary[key] = {str(k): _safe_int(v) for k, v in list(value.items())[:64] if str(k) and not any(token in str(k).lower() for token in ("path", "file", "sample", "patient"))}
+                elif key == "sample_aliases" and isinstance(value, list):
+                    safe_summary[key] = [f"sample_{index:03d}" for index, _ in enumerate(value[:256], 1)]
+                elif key == "pipeline_stages" and isinstance(value, list):
+                    safe_summary[key] = [{"name": (stage if stage in _SUMMARY_STAGE_NAMES else "unknown"), "enabled": bool(item.get("enabled"))} for item in value[:64] if isinstance(item, Mapping) for stage in [str(item.get("name") or "").strip().lower()]]
+                elif key in {"references", "contract", "run", "replicate_gate", "matrix", "sequencing"} and isinstance(value, Mapping):
+                    nested: dict[str, Any] = {}
+                    for nested_key, nested_value in value.items():
+                        nested_key = str(nested_key)
+                        if nested_key in {"layout", "strandedness", "classification", "state"}:
+                            nested[nested_key] = _safe_summary_enum(nested_key, nested_value)
+                        elif nested_key in {"passed", "deseq2_eligible", "gtf_present", "genome_present", "star_index_present", "present"} and isinstance(nested_value, bool):
+                            nested[nested_key] = nested_value
+                        elif nested_key == "minimum_per_condition":
+                            nested[nested_key] = min(_safe_int(nested_value), 256)
+                        elif nested_key == "id_hash" and re.fullmatch(r"[0-9a-f]{8,128}", str(nested_value or "").lower()):
+                            nested[nested_key] = str(nested_value).lower()[:128]
+                    safe_summary[key] = nested
+                elif key in {"policy_version", "sample_count"}:
+                    safe_summary[key] = _safe_int(value)
+                elif key in {"project_state", "route_id", "capability_id", "input_kind", "data_scope"}:
+                    safe_summary[key] = _safe_summary_enum(key, value)
+                elif key == "errors" and isinstance(value, list):
+                    safe_summary[key] = [
+                        {
+                            "category": _safe_summary_enum("category", item.get("category")),
+                            "message": "项目运行失败。",
+                        }
+                        for item in value[:16]
+                        if isinstance(item, Mapping) and str(item.get("category") or "").strip()
+                    ]
+            result["summary"] = safe_summary
         else:
             result.update({"state": str(full.get("state") or "unknown"), "has_session": bool(full.get("has_session"))})
         return result
@@ -326,9 +389,11 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
         for group in groups:
             if isinstance(group, Mapping):
                 paired += sum(1 for sample in (group.get("samples") or []) if isinstance(sample, Mapping) and sample.get("fastq_2"))
+        paired = paired or _safe_int(nested.get("paired_count"))
+        directory_count = len(groups) or _safe_int(nested.get("directory_count")) or (1 if full.get("scanned_path") else 0)
         return {"ok": ok, "sample_count": sample_count, "paired_count": paired,
                 "unmatched_count": _safe_int(nested.get("unmatched_count")),
-                "directory_count": len(groups) or (1 if full.get("scanned_path") else 0), "truncated": bool(nested.get("truncated")),
+                "directory_count": directory_count, "truncated": bool(nested.get("truncated")),
                 "authorization": str(nested.get("authorization") or ("inside_approved_root" if full.get("scanned_path") else "")),
                 "source_ref": str(full.get("source_ref") or nested.get("source_ref") or "")}
     if name == "refresh_project_status":

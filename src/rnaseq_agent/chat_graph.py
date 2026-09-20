@@ -102,6 +102,7 @@ from .model_context import (
     EphemeralToolCallStore,
     project_assistant_tool_call,
     project_tool_arguments_for_model,
+    project_tool_result_for_model,
 )
 
 _EPHEMERAL_TOOL_CALL_STORE = EphemeralToolCallStore()
@@ -141,15 +142,14 @@ class ToolExecutionResult:
 ToolExecutor = Callable[[str, dict[str, Any], Path, bool, ToolExecutionContext], ToolExecutionResult]
 ToolResultFinalizer = Callable[[ToolExecutionResult, Path | None], ToolExecutionResult]
 
-_LEGACY_MODEL_KEYS = frozenset(
-    {
-        "ok", "blocked", "error", "error_code", "message", "reply", "state",
-        "has_session", "layout", "strandedness", "pipeline", "status", "run_state",
-        "action", "via", "confirmation_required", "tool_mode", "tool", "steps",
-        "summary", "gate", "contract_id", "gate_ok", "gate_reasons", "gate_warnings",
-        "warnings", "requested", "design", "stage", "result",
-    }
-)
+_LEGACY_MODEL_KEYS = frozenset({
+    "ok", "blocked", "error", "error_code", "message", "reply", "state",
+    "has_session", "layout", "strandedness", "pipeline", "status", "run_state",
+    "action", "via", "confirmation_required", "tool_mode", "tool", "steps",
+    "summary", "gate", "contract_id", "gate_ok", "gate_reasons", "gate_warnings",
+    "warnings", "requested", "design", "stage", "result", "sample_count",
+    "directory_count", "unmatched_count", "record_count",
+})
 _LEGACY_EXACT_KEYS = frozenset(
     {
         "samples", "sample_id", "fastq_1", "fastq_2", "path", "scanned_path",
@@ -158,30 +158,59 @@ _LEGACY_EXACT_KEYS = frozenset(
         "identity", "identity_digest", "browse_policy_revision", "stdout", "stderr",
     }
 )
-_PATH_TEXT_RE = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|/)[^\s,，。；;]+")
-_FASTQ_TEXT_RE = re.compile(r"(?<![\w])[^\s,，。；;]+\.(?:fastq|fq)(?:\.gz)?", re.IGNORECASE)
+_SAFE_LEGACY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_SAFE_LEGACY_ERROR_CODES = frozenset({"TOOL_MODE_DISABLED", "MODEL_TOOL_RESULT_UNMAPPED"})
+_PROVIDER_EXACT_TEXT_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|/)[^\s,，。；;]+|[^\s,，。；;]+\.(?:fastq|fq)(?:\.gz)?|"
+    r"\b(?:PATIENT|SAMPLE|REPORT|SECRET)(?:[_-][A-Z0-9][A-Z0-9_-]*|[A-Z0-9]{3,})\b|"
+    r"\bAPI[_-]?KEY(?:[_-][A-Z0-9][A-Z0-9_-]*|[A-Z0-9]{3,})\b|"
+    r"\b[A-Z0-9_-]*SENTINEL[A-Z0-9_-]*\b",
+    re.IGNORECASE,
+)
 
 
 def _legacy_model_projection(value: Any) -> Any:
-    """Keep legacy dict executors provider-safe until all tools are typed."""
-    if isinstance(value, dict):
-        projected: dict[str, Any] = {}
-        for raw_key, item in value.items():
-            key = str(raw_key)
-            lowered = key.lower()
-            if lowered in _LEGACY_EXACT_KEYS or lowered in {item.lower() for item in _LEGACY_EXACT_KEYS}:
-                continue
-            if key not in _LEGACY_MODEL_KEYS:
-                continue
-            projected[key] = _legacy_model_projection(item)
-        return projected
-    if isinstance(value, list):
-        return [_legacy_model_projection(item) for item in value[:64]]
-    if isinstance(value, str):
-        return _FASTQ_TEXT_RE.sub("<redacted-fastq>", _PATH_TEXT_RE.sub("<redacted-path>", value))
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return str(value)
+    """Project legacy executor output without carrying application free text."""
+    if not isinstance(value, Mapping):
+        return {"ok": False, "error_code": "MODEL_TOOL_RESULT_UNMAPPED"}
+    projected: dict[str, Any] = {}
+    for raw_key, item in value.items():
+        key = str(raw_key)
+        lowered = key.lower()
+        if lowered in _LEGACY_EXACT_KEYS or lowered not in _LEGACY_MODEL_KEYS:
+            continue
+        if lowered in {"reply", "message", "error"}:
+            projected["reply_category"] = "tool_error" if lowered == "error" else "tool_result"
+        elif lowered in {"ok", "blocked", "has_session", "confirmation_required", "gate_ok", "requested"}:
+            projected[key] = bool(item)
+        elif lowered in {"sample_count", "directory_count", "unmatched_count", "record_count", "steps", "warning_count"}:
+            try:
+                projected[key] = max(0, min(int(item), 1000000))
+            except (TypeError, ValueError, OverflowError):
+                projected[key] = 0
+        elif lowered == "error_code":
+            if str(item) in _SAFE_LEGACY_ERROR_CODES:
+                projected[key] = str(item)
+        elif lowered in {"state", "run_state", "layout", "strandedness", "action", "via", "tool", "tool_mode", "stage"}:
+            token = str(item)
+            projected[key] = token if _SAFE_LEGACY_TOKEN_RE.fullmatch(token) else "unknown"
+        elif lowered in {"summary", "result", "pipeline", "status", "gate", "design"}:
+            projected[f"{lowered}_present"] = item is not None
+        elif lowered in {"warnings", "gate_warnings", "gate_reasons", "steps"}:
+            projected[f"{lowered[:-1] if lowered.endswith('s') else lowered}_count"] = min(len(item) if isinstance(item, list) else 0, 64)
+    if "ok" not in projected:
+        projected["ok"] = False
+    return projected
+
+
+def _safe_provider_content(value: Any) -> str:
+    """Keep ordinary prose durable while replacing likely exact-data echoes."""
+    text = str(value or "")
+    if not text:
+        return ""
+    if _PROVIDER_EXACT_TEXT_RE.search(text):
+        return "模型回复已生成。"
+    return text[:16_384]
 
 #: ``ConfigReader`` 契约：``(项目目录) -> 当前配置``（读不到就返回 ``{}``）。
 #: 只用来在确认卡片上渲染「旧值 → 新值」，**必须只读**——它会跑在侧效应敏感的位置。
@@ -751,9 +780,9 @@ def build_chat_graph(
             return {
                 "status": "ok",
                 "via": "rejected" if rejected_turn else "llm",
-                "reply": content,
+                "reply": _safe_provider_content(content),
                 "messages": _append(
-                    state, {"role": "assistant", "content": content}
+                    state, {"role": "assistant", "content": _safe_provider_content(content) or "模型回复已生成。", "model_context_version": 1}
                 ),
                 "pending_calls": [],
                 "deferred_calls": [],
@@ -774,7 +803,11 @@ def build_chat_graph(
                 ref = ""
             projected_calls.append(_raw_call(call, ref or None))
             pending_calls.append(_pending_call(call, ref or None))
-        assistant_message: dict[str, Any] = {"role": "assistant", "content": content or None}
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "模型正在请求工具。" if content else None,
+            "model_context_version": 1,
+        }
         assistant_message["tool_calls"] = projected_calls
         # 本轮所有调用进 deferred 队列（保持模型给出的顺序），由 guardrail 按确认
         # 策略**一组一组**取出来处理。分组在这里不做：guardrail 是唯一判断风险的
@@ -801,6 +834,7 @@ def build_chat_graph(
             "role": "tool",
             "tool_call_id": call_id,
             "content": json.dumps(payload, ensure_ascii=False),
+            "model_projection_version": 1,
         }
 
     def _split_head(
@@ -1282,10 +1316,11 @@ def build_chat_graph(
             if isinstance(result, ToolExecutionResult):
                 if result_finalizer is not None:
                     result = result_finalizer(result, project_dir)
-                provider_result = result.model
-                log_result = result.log_projection
+                provider_result = project_tool_result_for_model(name, result.model)
+                log_result = project_tool_result_for_model(name, result.log_projection)
                 ok_value = bool(provider_result.get("ok", True))
-                reply_value = provider_result.get("reply") or provider_result.get("message")
+                reply_value = result.get("reply") or result.get("message")
+                reply_present = bool(reply_value)
             else:
                 # Legacy executors still return internal dicts.  Treat them as
                 # request-local data and project a conservative provider/log
@@ -1298,7 +1333,8 @@ def build_chat_graph(
                 )
                 log_result = _legacy_model_projection(provider_result)
                 ok_value = bool(provider_result.get("ok", True))
-                reply_value = provider_result.get("reply")
+                reply_value = None
+                reply_present = bool(provider_result.get("reply_category"))
             if not isinstance(result, dict):
                 if not isinstance(result, ToolExecutionResult):
                     result = {"ok": False, "error": "工具返回了非预期的结果。"}
@@ -1307,7 +1343,7 @@ def build_chat_graph(
                     "call_id": str(call.get("call_id") or ""),
                     "name": name,
                     "ok": ok_value,
-                    "has_reply": bool(reply_value),
+                    "has_reply": reply_present,
                 }
             )
             log.append(
@@ -1326,12 +1362,13 @@ def build_chat_graph(
                 }
             )
             if reply_value:
-                latest_reply = str(reply_value)
+                latest_reply = _safe_provider_content(reply_value)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": str(call.get("call_id") or ""),
                     "content": json.dumps(provider_result, ensure_ascii=False, default=str),
+                    "model_projection_version": 1,
                 }
             )
             call_ref = str(call.get("call_ref") or "")

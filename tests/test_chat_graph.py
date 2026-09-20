@@ -607,6 +607,39 @@ class TestChatGraphToolLoop:
         assert "SECRET_SAMPLE" not in json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
         assert secret_path not in json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
 
+    def test_legacy_free_text_fields_use_fixed_categories(self, monkeypatch, tmp_path) -> None:
+        secret = "PATIENT_SENTINEL_LEGACY /restricted/SENTINEL_LEGACY/report.md"
+
+        def executor(name, arguments, project_dir, approved):
+            return {"ok": False, "reply": secret, "message": secret, "error": secret,
+                    "error_code": "TOOL_MODE_DISABLED"}
+
+        graph, _recorded, fake = _graph(
+            monkeypatch,
+            [{"tool_calls": [_tool_call("c1", "read_project_state", {})]},
+             {"content": "好的。"}],
+            executor=executor,
+        )
+        result = graph.invoke(_initial(tmp_path, "用户自己的 PATIENT_SENTINEL_USER"),
+                              config={"configurable": {"thread_id": "legacy-free-text"}})
+        assert secret not in json.dumps(fake.seen_messages, ensure_ascii=False)
+        assert secret not in json.dumps(result.get("messages") or [], ensure_ascii=False)
+        assert "PATIENT_SENTINEL_USER" in json.dumps(fake.seen_messages[0], ensure_ascii=False)
+        tool_messages = [m for m in fake.seen_messages[1] if m.get("role") == "tool"]
+        assert tool_messages[0]["model_projection_version"] == 1
+
+    def test_provider_assistant_content_is_not_persisted_or_replayed(self, monkeypatch, tmp_path) -> None:
+        secret = "REPORT_SENTINEL_PROVIDER /restricted/SENTINEL_PROVIDER/report.md"
+        graph, _recorded, fake = _graph(
+            monkeypatch,
+            [{"content": secret}],
+        )
+        result = graph.invoke(_initial(tmp_path, "请解释"),
+                              config={"configurable": {"thread_id": "provider-content"}})
+        assert result["reply"] == "模型回复已生成。"
+        assert secret not in json.dumps(result.get("messages") or [], ensure_ascii=False)
+
+
     def test_invalid_arguments_go_back_to_the_model_for_correction(
         self, monkeypatch, tmp_path
     ) -> None:

@@ -169,6 +169,28 @@ def test_every_tool_result_uses_explicit_safe_projection() -> None:
                       "source_ref": full["source_ref"]}
 
 
+def test_read_project_state_rebuilds_nested_summary_without_trusting_values() -> None:
+    hostile = {
+        "ok": True,
+        "summary": {
+            "project_state": "ready",
+            "sample_count": 3,
+            "sample_aliases": ["PATIENT_SENTINEL_SUMMARY", "/restricted/SENTINEL_SUMMARY"],
+            "condition_counts": {"tumor": 2, "sample_id": 99},
+            "references": {"gtf_present": True, "path": "/restricted/SENTINEL_SUMMARY"},
+            "errors": [{"category": "run_failed", "message": "REPORT_SENTINEL_SUMMARY"}],
+            "unknown": {"secret": "PATIENT_SENTINEL_SUMMARY"},
+        },
+    }
+    projected = project_tool_result_for_model("read_project_state", hostile)
+    encoded = _serialized(projected)
+    assert "PATIENT_SENTINEL_SUMMARY" not in encoded
+    assert "/restricted/SENTINEL_SUMMARY" not in encoded
+    assert "REPORT_SENTINEL_SUMMARY" not in encoded
+    assert projected["summary"]["sample_aliases"] == ["sample_001", "sample_002"]
+    assert "unknown" not in projected["summary"]
+
+
 def test_tool_argument_projector_is_allowlisted_for_every_registered_tool() -> None:
     hostile = {"sample_id": "PATIENT_SENTINEL_73", "path": "/restricted/SENTINEL_73/fastq",
                "host": "HOST_SENTINEL_73", "user": "USER_SENTINEL_73", "password": "API_KEY_SENTINEL_73",
