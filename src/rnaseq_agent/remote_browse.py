@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 import time
 import uuid
@@ -30,6 +31,7 @@ REMOTE_SCAN_TIMEOUT = "REMOTE_SCAN_TIMEOUT"
 REMOTE_SCAN_OUTPUT_LIMIT = "REMOTE_SCAN_OUTPUT_LIMIT"
 REMOTE_SCAN_INVALID_OUTPUT = "REMOTE_SCAN_INVALID_OUTPUT"
 REMOTE_SCAN_FAILED = "REMOTE_SCAN_FAILED"
+REMOTE_ROOT_LIMIT = "REMOTE_ROOT_LIMIT"
 REMOTE_ROOT_REVISION_CONFLICT = "REMOTE_ROOT_REVISION_CONFLICT"
 REMOTE_SCAN_REFERENCE_INVALID = "REMOTE_SCAN_REFERENCE_INVALID"
 REMOTE_SCAN_REFERENCE_EXPIRED = "REMOTE_SCAN_REFERENCE_EXPIRED"
@@ -111,7 +113,69 @@ class BrowseScanPayload:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class ScanCommand:
+    argv: tuple[str, ...]
+    helper_source: str
+    remote_command: str
+    max_depth: int
+    max_candidates: int
+
+
+class ScanProtocolError(ValueError):
+    """The remote scanner returned a document outside its bounded protocol."""
+
+
+class ScanPathEscape(ValueError):
+    """A scanner candidate escaped the authorized target/root."""
+
+
 BrowseScanner = Callable[[str, str, BrowseExecutionBudget, DeadlineAwareRemoteTransport], BrowseScanPayload]
+
+
+_SCAN_HELPER_SOURCE = r'''import json, os, sys
+root, depth_limit, item_limit, deadline, target = sys.argv[1:]
+depth_limit = int(depth_limit)
+item_limit = int(item_limit)
+root = os.path.realpath(root)
+target = os.path.realpath(target)
+def inside(parent, child):
+    try:
+        return os.path.commonpath((parent, child)) == parent
+    except ValueError:
+        return False
+if not os.path.isdir(root) or not os.path.isdir(target) or not inside(root, target):
+    raise SystemExit(44)
+files = []
+truncated = False
+stack = [(target, 0)]
+while stack:
+    directory, depth = stack.pop()
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except OSError:
+        continue
+    for entry in entries:
+        if entry.is_dir(follow_symlinks=False):
+            if depth < depth_limit:
+                stack.append((entry.path, depth + 1))
+            continue
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        name = entry.name.lower()
+        if not (name.endswith('.fastq') or name.endswith('.fq') or name.endswith('.fastq.gz') or name.endswith('.fq.gz')):
+            continue
+        candidate = os.path.realpath(entry.path)
+        if not inside(root, candidate) or not inside(target, candidate):
+            raise SystemExit(45)
+        if len(files) >= item_limit:
+            truncated = True
+            break
+        files.append(candidate)
+    if truncated:
+        break
+print(json.dumps({'files': files, 'truncated': truncated}, ensure_ascii=False, separators=(',', ':')))
+'''
 
 
 @dataclass(frozen=True)
@@ -237,7 +301,194 @@ def scan_remote_fastqs(
     runner: BrowseExecutionBudget,
     transport: DeadlineAwareRemoteTransport,
 ) -> BrowseScanPayload:
-    raise NotImplementedError
+    command = build_scan_command(canonical_root, canonical_target, absolute_deadline=runner.absolute_deadline)
+    result = runner.execute(transport, command.remote_command)
+    if result.returncode == 44:
+        raise ScanPathEscape(REMOTE_PATH_ESCAPE)
+    if result.returncode == 45:
+        raise ScanPathEscape(REMOTE_PATH_ESCAPE)
+    if result.returncode != 0:
+        raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+    try:
+        document = json.loads(result.stdout, object_pairs_hook=_reject_duplicate_json_keys)
+    except (json.JSONDecodeError, ScanProtocolError) as exc:
+        raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT) from exc
+    return _scan_payload_from_document(document, canonical_target, canonical_root)
+
+
+def build_scan_command(
+    canonical_root: str,
+    canonical_target: str,
+    *,
+    absolute_deadline: float | None = None,
+) -> ScanCommand:
+    deadline_value = (
+        max(0.0, absolute_deadline - time.monotonic())
+        if absolute_deadline is not None
+        else SCAN_TIMEOUT_SECONDS
+    )
+    deadline = str(deadline_value)
+    # Keep all user-controlled values outside the fixed helper source. The
+    # target is deliberately the final positional value for easy framing audits.
+    argv = (
+        "python3",
+        "-c",
+        _SCAN_HELPER_SOURCE,
+        "--",
+        canonical_root,
+        str(MAX_SCAN_DEPTH),
+        str(MAX_SCAN_CANDIDATES),
+        deadline,
+        canonical_target,
+    )
+    return ScanCommand(
+        argv=argv,
+        helper_source=_SCAN_HELPER_SOURCE,
+        remote_command=" ".join(shlex.quote(value) for value in argv),
+        max_depth=MAX_SCAN_DEPTH,
+        max_candidates=MAX_SCAN_CANDIDATES,
+    )
+
+
+def scan_result_from_canonical_files(paths: list[str]) -> BrowseScanPayload:
+    return _group_canonical_files(paths)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+        result[key] = value
+    return result
+
+
+def _scan_payload_from_document(
+    document: object,
+    canonical_target: str,
+    canonical_root: str,
+) -> BrowseScanPayload:
+    if not isinstance(document, dict) or set(document) != {"files", "truncated"}:
+        raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+    files = document["files"]
+    producer_truncated = document["truncated"]
+    if not isinstance(files, list) or not isinstance(producer_truncated, bool):
+        raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+    if len(files) > MAX_SCAN_CANDIDATES:
+        raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+    if len(files) == MAX_SCAN_CANDIDATES and not producer_truncated:
+        raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+    filtered: list[str] = []
+    for candidate in files:
+        if not isinstance(candidate, str) or not candidate.startswith("/"):
+            raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+        try:
+            validate_remote_browse_path(candidate)
+        except ValueError as exc:
+            raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT) from exc
+        if not contains_posix_path(canonical_root, candidate) or not contains_posix_path(canonical_target, candidate):
+            raise ScanPathEscape(REMOTE_PATH_ESCAPE)
+        filtered.append(candidate)
+    payload = _group_canonical_files(filtered)
+    if producer_truncated:
+        return BrowseScanPayload(payload.groups, payload.sample_count, payload.unmatched_count, True)
+    return payload
+
+
+_FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
+_PAIR_RE = re.compile(
+    r"^(?P<sample>.+?)(?:[_\.](?:R)?(?P<read>[12]))(?P<suffix>\.f(?:ast)?q(?:\.gz)?)$",
+    re.IGNORECASE,
+)
+
+
+def _fastq_parts(basename: str) -> tuple[str, int] | None:
+    match = _PAIR_RE.match(basename)
+    if match is None:
+        return None
+    return match.group("sample"), int(match.group("read"))
+
+
+def _group_canonical_files(paths: list[str]) -> BrowseScanPayload:
+    grouped: dict[str, list[str]] = {}
+    for path in paths:
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT)
+        try:
+            validate_remote_browse_path(path)
+        except ValueError as exc:
+            raise ScanProtocolError(REMOTE_SCAN_INVALID_OUTPUT) from exc
+        basename = PurePosixPath(path).name
+        if not basename.lower().endswith(_FASTQ_SUFFIXES):
+            continue
+        parent = str(PurePosixPath(path).parent)
+        grouped.setdefault(parent, []).append(path)
+
+    groups: list[BrowseDirectoryGroup] = []
+    unmatched_total = 0
+    sample_total = 0
+    truncated = False
+    for parent in sorted(grouped):
+        by_sample: dict[str, dict[int, str]] = {}
+        unmatched: list[str] = []
+        for path in sorted(set(grouped[parent])):
+            basename = PurePosixPath(path).name
+            parts = _fastq_parts(basename)
+            if parts is None:
+                unmatched.append(basename)
+                continue
+            sample, read = parts
+            by_sample.setdefault(sample, {})[read] = basename
+        rows: list[BrowseSampleRow] = []
+        for sample in sorted(by_sample):
+            reads = by_sample[sample]
+            if 1 not in reads:
+                unmatched.append(reads.get(2, sample))
+                continue
+            rows.append(BrowseSampleRow(sample, reads[1], reads.get(2)))
+        rows.sort(key=lambda row: (row.sample_id, row.fastq_1, row.fastq_2 or ""))
+        unmatched = sorted(set(unmatched))
+        if sample_total + len(rows) > MAX_RETURNED_SAMPLES:
+            keep = max(0, MAX_RETURNED_SAMPLES - sample_total)
+            rows = rows[:keep]
+            truncated = True
+        if unmatched_total + len(unmatched) > MAX_RETURNED_UNMATCHED:
+            keep = max(0, MAX_RETURNED_UNMATCHED - unmatched_total)
+            unmatched = unmatched[:keep]
+            truncated = True
+        group_id = _group_digest("", "", parent, "")
+        groups.append(BrowseDirectoryGroup(group_id, parent, tuple(rows), tuple(unmatched)))
+        sample_total += len(rows)
+        unmatched_total += len(unmatched)
+    return BrowseScanPayload(tuple(groups), sample_total, unmatched_total, truncated)
+
+
+def _group_digest(
+    authorization_revision: str,
+    selected_root_id: str,
+    canonical_parent: str,
+    result_identity: str,
+) -> str:
+    value = "\x00".join((authorization_revision, selected_root_id, canonical_parent, result_identity))
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _rebind_group_ids(
+    payload: BrowseScanPayload,
+    authorization_revision: str,
+    selected_root_id: str,
+    result_identity: str,
+) -> BrowseScanPayload:
+    groups = tuple(
+        BrowseDirectoryGroup(
+            _group_digest(authorization_revision, selected_root_id, group.canonical_directory, result_identity),
+            group.canonical_directory,
+            group.samples,
+            group.unmatched_basenames,
+        )
+        for group in payload.groups
+    )
+    return BrowseScanPayload(groups, payload.sample_count, payload.unmatched_count, payload.truncated)
 
 
 def browse_remote_fastqs(
@@ -245,8 +496,9 @@ def browse_remote_fastqs(
     context: BrowseContext,
     policy_reader: Callable[[], BrowsePolicy],
     transport_factory: Callable[[SSHIdentity], DeadlineAwareRemoteTransport],
-    scanner: BrowseScanner,
+    scanner: BrowseScanner | None = None,
 ) -> BrowseResult:
+    scanner = scanner or scan_remote_fastqs
     started_at = _utc_now()
     event_id = uuid.uuid4().hex
     requested_digest = _digest(requested_path)
@@ -312,6 +564,19 @@ def browse_remote_fastqs(
             revision=initial.revision,
             error_code=REMOTE_ROOT_NOT_APPROVED,
             message="Remote browse root is not approved.",
+        )
+    if len(active_roots) > MAX_ACTIVE_ROOTS:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=initial.revision,
+            error_code=REMOTE_ROOT_LIMIT,
+            message="Too many active remote browse roots.",
         )
     try:
         transport = transport_factory(identity)
@@ -476,6 +741,7 @@ def browse_remote_fastqs(
 
     try:
         payload = scanner(canonical_target, selected[1], runner, transport)
+        payload = _rebind_group_ids(payload, initial.revision, selected[0].root_id, event_id)
         _validate_scan_payload(payload)
     except CommandTimeoutError:
         return _result(
@@ -504,6 +770,32 @@ def browse_remote_fastqs(
             message="Remote browse output exceeded its limit.",
         )
     except _InvalidScanPayload:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_INVALID_OUTPUT,
+            message="Remote browse returned invalid output.",
+        )
+    except ScanPathEscape:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_PATH_ESCAPE,
+            message="Remote browse candidate escaped the approved root.",
+        )
+    except ScanProtocolError:
         return _result(
             context=context,
             event_id=event_id,
@@ -681,7 +973,12 @@ def _validate_scan_payload(payload: object) -> None:
                 raise _InvalidScanPayload()
             if sample.fastq_2 is not None and not isinstance(sample.fastq_2, str):
                 raise _InvalidScanPayload()
+        for basename in group.unmatched_basenames:
+            if not isinstance(basename, str):
+                raise _InvalidScanPayload()
     if sum(len(group.samples) for group in payload.groups) != payload.sample_count:
         raise _InvalidScanPayload()
     if sum(len(group.unmatched_basenames) for group in payload.groups) != payload.unmatched_count:
+        raise _InvalidScanPayload()
+    if payload.sample_count > MAX_RETURNED_SAMPLES or payload.unmatched_count > MAX_RETURNED_UNMATCHED:
         raise _InvalidScanPayload()
