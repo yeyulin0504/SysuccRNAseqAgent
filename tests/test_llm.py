@@ -16,6 +16,30 @@ from rnaseq_agent.llm import (
     _friendly_api_error,
     parse_decision,
 )
+from rnaseq_agent.model_disclosure import ProviderReply
+
+
+class FakeGateway:
+    def __init__(self, reply: ProviderReply | None = None, models=None) -> None:
+        self.reply = reply
+        self.models = list(models or [])
+        self.requests = []
+
+    def list_models(self, config, credentials, timeout_seconds):
+        self.requests.append((config, credentials, timeout_seconds))
+        return self.models
+
+    def complete(self, request):
+        self.requests.append(request)
+        return self.reply
+
+    def responses(self, request):
+        self.requests.append(request)
+        return self.reply
+
+    def codex_exec(self, request):
+        self.requests.append(request)
+        return self.reply
 
 
 class ParseDecisionTests(unittest.TestCase):
@@ -46,40 +70,28 @@ class ParseDecisionTests(unittest.TestCase):
 
 
 class ModelDiscoveryTests(unittest.TestCase):
-    @patch("rnaseq_agent.llm.urllib.request.urlopen")
-    def test_lists_and_sorts_provider_models(self, urlopen: MagicMock) -> None:
-        response = MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps(
-            {
-                "data": [
-                    {"id": "model-z"},
-                    {"id": "model-a"},
-                    {"id": "model-a"},
-                ]
-            }
-        ).encode("utf-8")
-        urlopen.return_value = response
+    def test_lists_and_sorts_provider_models(self) -> None:
+        gateway = FakeGateway(models=["model-z", "model-a", "model-a"])
         client = OpenAICompatibleClient(
             base_url="https://api.example.com/v1/",
             model="",
             api_key="secret",
+            gateway=gateway,
         )
 
         models = client.list_models()
 
         self.assertEqual(models, ["model-a", "model-z"])
-        request = urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, "https://api.example.com/v1/models")
-        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+        config, credentials, _timeout = gateway.requests[0]
+        self.assertEqual(config.api_base, "https://api.example.com/v1")
+        self.assertEqual(credentials.api_key, "secret")
 
-    @patch("rnaseq_agent.llm.urllib.request.urlopen")
-    def test_rejects_invalid_model_list_shape(self, urlopen: MagicMock) -> None:
-        response = MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"wrong":[]}'
-        urlopen.return_value = response
+    def test_rejects_invalid_model_list_shape(self) -> None:
+        gateway = FakeGateway(models=[])
         client = OpenAICompatibleClient(
             base_url="https://api.example.com/v1",
             model="",
+            gateway=gateway,
         )
 
         with self.assertRaisesRegex(LLMError, "data"):
@@ -103,6 +115,21 @@ class ModelDiscoveryTests(unittest.TestCase):
 
 
 class ResponsesAPITests(unittest.TestCase):
+    def test_decide_uses_injected_gateway_for_responses(self) -> None:
+        gateway = FakeGateway(ProviderReply(
+            text='{"action":"chat","message":"ok","path":""}', raw={}
+        ))
+        client = OpenAICompatibleClient(
+            base_url="https://llm.example/v1", model="gpt-test",
+            api_key="API_KEY_SENTINEL_73", api_mode="responses", gateway=gateway,
+        )
+        self.assertEqual(client.decide("你好", has_project=False).message, "ok")
+        request = gateway.requests[0]
+        self.assertEqual(request.api_mode, "responses")
+        self.assertFalse(request.payload["store"])
+        self.assertEqual(request.credentials.api_key, "API_KEY_SENTINEL_73")
+        self.assertNotIn("API_KEY_SENTINEL_73", json.dumps(request.payload))
+
     def test_cc_switch_auto_selects_responses(self) -> None:
         client = OpenAICompatibleClient(
             base_url="http://127.0.0.1:15721/v1",
@@ -154,37 +181,36 @@ class ResponsesAPITests(unittest.TestCase):
 
 
 class CodexCLIClientTests(unittest.TestCase):
-    @patch("rnaseq_agent.llm.subprocess.run")
-    def test_uses_ephemeral_read_only_codex_exec(self, run: MagicMock) -> None:
-        def fake_run(command: list[str], **_: object) -> SimpleNamespace:
-            output_path = Path(command[command.index("--output-last-message") + 1])
-            output_path.write_text(
-                '{"action":"summary","message":"","path":""}',
-                encoding="utf-8",
-            )
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+    def test_decide_uses_injected_gateway_for_codex(self) -> None:
+        gateway = FakeGateway(ProviderReply(
+            text='{"action":"summary","message":"ok","path":""}', raw={}
+        ))
+        client = CodexCLIClient(
+            model="gpt-test", executable=Path("codex"), gateway=gateway,
+        )
+        self.assertEqual(client.decide("总结项目", has_project=True).action, "summary")
+        self.assertEqual(gateway.requests[0].api_mode, "codex_cli")
+        self.assertIn("总结项目", gateway.requests[0].prompt)
 
-        run.side_effect = fake_run
+    def test_uses_gateway_for_codex_exec(self) -> None:
+        gateway = FakeGateway(ProviderReply(
+            text='{"action":"summary","message":"","path":""}', raw={}
+        ))
         client = CodexCLIClient(
             model="gpt-5.5",
             executable=Path("codex.exe"),
             codex_home=Path("isolated-codex-home"),
+            gateway=gateway,
         )
 
         decision = client.decide("总结项目", has_project=True)
 
         self.assertEqual(decision.action, "summary")
-        command = run.call_args.args[0]
-        self.assertIn("--ephemeral", command)
-        self.assertIn("--ignore-user-config", command)
-        self.assertIn("read-only", command)
-        self.assertIn("--ignore-rules", command)
-        self.assertIn("mcp_servers={}", command)
-        self.assertIn("gpt-5.5", command)
-        self.assertEqual(
-            run.call_args.kwargs["env"]["CODEX_HOME"],
-            "isolated-codex-home",
-        )
+        request = gateway.requests[0]
+        self.assertEqual(request.api_mode, "codex_cli")
+        self.assertEqual(request.codex_executable, Path("codex.exe"))
+        self.assertEqual(request.codex_home, Path("isolated-codex-home"))
+        self.assertEqual(request.provider.model, "gpt-5.5")
 
     @patch.dict(
         "os.environ",

@@ -41,7 +41,9 @@ from rnaseq_agent.connection_store import (
     list_approved_data_roots,
     approve_data_root,
     revoke_data_root,
+    provider_credentials_from_connection,
 )
+from rnaseq_agent.model_disclosure import ProviderCredentials
 from rnaseq_agent.ssh_identity import SSHIdentity
 from rnaseq_agent.model_provider import (
     normalize_provider_config,
@@ -144,6 +146,41 @@ def test_policy_revision_ignores_llm_and_unrelated_connection_fields(tmp_path):
     save_llm({"model": "new"}, store_dir=store)
     save_connection({"threads": 64}, store_dir=store)
     assert load_browse_policy(store_dir=store).revision == before
+
+
+def test_provider_credentials_include_protected_ciphertexts_without_exposing_them() -> None:
+    credentials = provider_credentials_from_connection(
+        {"api_key": "API_KEY_SENTINEL_73"},
+        {
+            "llm": {"api_key_protected": "dpapi:API_CIPHERTEXT_SENTINEL"},
+            "server": {"password_protected": "dpapi:SSH_CIPHERTEXT_SENTINEL"},
+        },
+        runtime_secrets=("SESSION_TOKEN_SENTINEL",),
+    )
+    assert isinstance(credentials, ProviderCredentials)
+    assert credentials.api_key == "API_KEY_SENTINEL_73"
+    assert "SESSION_TOKEN_SENTINEL" in credentials.known_secrets
+    assert "dpapi:API_CIPHERTEXT_SENTINEL" in credentials.protected_values
+    assert "dpapi:SSH_CIPHERTEXT_SENTINEL" in credentials.protected_values
+    assert "API_KEY_SENTINEL_73" not in repr(credentials)
+    assert "CIPHERTEXT_SENTINEL" not in repr(credentials)
+
+
+def test_save_llm_persists_backend_and_api_mode(tmp_path: Path) -> None:
+    save_llm(
+        {
+            "backend": "openai_compatible",
+            "provider": "openai",
+            "api_base": "https://llm.example/v1",
+            "model": "gpt-test",
+            "api_mode": "responses",
+            "tool_mode": TOOL_MODE_READ_ONLY,
+        },
+        store_dir=tmp_path / "store",
+    )
+    loaded = load_llm(store_dir=tmp_path / "store")
+    assert loaded["backend"] == "openai_compatible"
+    assert loaded["api_mode"] == "responses"
 
 
 def test_policy_revision_changes_for_active_root_or_identity(tmp_path):

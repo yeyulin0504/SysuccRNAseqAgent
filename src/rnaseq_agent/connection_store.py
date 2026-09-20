@@ -58,7 +58,7 @@ _PASSWORD_KEY = "password_protected"
 # 大模型接入（OpenAI 兼容端点）同样是用户级共享配置：存在同一个文件的
 # ``llm`` 子对象里，API Key 与密码用同一套 DPAPI 加密。
 LLM_BLOCK_KEY = "llm"
-LLM_FIELDS = ("enabled", "provider", "api_base", "model", "tool_mode")
+LLM_FIELDS = ("enabled", "backend", "provider", "api_base", "model", "api_mode", "tool_mode")
 _LLM_API_KEY_KEY = "api_key_protected"
 
 
@@ -825,6 +825,34 @@ def load_llm(*, store_dir: Path | None = None) -> dict[str, Any]:
         if secret:
             result["api_key"] = secret
     return result
+
+
+def provider_credentials_from_connection(
+    decrypted_llm: dict[str, Any],
+    raw_connection: dict[str, Any],
+    *,
+    runtime_secrets: Sequence[str] = (),
+):
+    """Build gateway credentials while retaining protected ciphertext for scanning.
+
+    The returned object is intentionally runtime-only.  Ciphertexts are included
+    as scanner inputs but are never serialized into model payloads or logs.
+    """
+    from .model_disclosure import ProviderCredentials
+
+    server = raw_connection.get("server") if isinstance(raw_connection.get("server"), dict) else {}
+    llm = raw_connection.get("llm") if isinstance(raw_connection.get("llm"), dict) else {}
+    api_key = str(decrypted_llm.get("api_key") or "")
+    known = tuple(value for value in (api_key, *(str(item) for item in runtime_secrets)) if value)
+    protected = tuple(
+        value
+        for value in (
+            str(llm.get("api_key_protected") or ""),
+            str(server.get("password_protected") or ""),
+        )
+        if value
+    )
+    return ProviderCredentials(api_key=api_key, known_secrets=known, protected_values=protected)
 
 
 def save_llm(values: dict[str, Any], *, store_dir: Path | None = None) -> dict[str, Any]:

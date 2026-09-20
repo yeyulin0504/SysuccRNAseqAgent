@@ -4,13 +4,13 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .model_disclosure import PreparedModelRequest, ProviderCredentials
+from .model_provider import MAX_RESPONSE_BYTES, ModelProviderGateway, normalize_provider_config, provider_identity
 
 
 ALLOWED_ACTIONS = {
@@ -54,6 +54,7 @@ class OpenAICompatibleClient:
         api_key: str = "",
         timeout_seconds: int = 45,
         api_mode: str = "auto",
+        gateway: ModelProviderGateway | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -61,6 +62,11 @@ class OpenAICompatibleClient:
         self.timeout_seconds = timeout_seconds
         normalized_mode = api_mode.strip().lower()
         self.api_mode = normalized_mode if normalized_mode in API_MODES else "auto"
+        self.gateway = gateway or ModelProviderGateway()
+
+    @property
+    def provider_config(self):
+        return self._provider_config()
 
     @classmethod
     def from_env(cls) -> OpenAICompatibleClient | None:
@@ -112,7 +118,7 @@ class OpenAICompatibleClient:
                 raise LLMError(
                     "CC Switch 当前返回空模型列表，请手动填写 Codex 中显示的模型名称。"
                 )
-            raise LLMError("模型列表接口没有返回可用模型。")
+            raise LLMError("模型列表接口没有返回可用模型（缺少 data 或 models 数组）。")
         return sorted(model_ids, key=str.casefold)
 
     def decide(self, user_text: str, *, has_project: bool) -> LLMDecision:
@@ -143,21 +149,50 @@ class OpenAICompatibleClient:
         return parse_decision(content)
 
     def _get_json(self, endpoint: str) -> dict[str, Any]:
-        request = urllib.request.Request(
-            f"{self.base_url}{endpoint}",
-            headers=self._headers(),
-            method="GET",
-        )
-        return self._open_json(request, operation="模型列表接口")
+        if endpoint != "/models":
+            raise LLMError("不支持的模型 GET 接口。")
+        provider = self._provider_config()
+        try:
+            models = self.gateway.list_models(
+                provider,
+                ProviderCredentials(api_key=self.api_key),
+                self.timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, LLMError):
+                raise
+            raise LLMError("模型列表接口请求失败。") from exc
+        return {"data": models}
 
     def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        request = urllib.request.Request(
-            f"{self.base_url}{endpoint}",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=self._headers(),
-            method="POST",
+        if endpoint not in {"/responses", "/chat/completions"}:
+            raise LLMError("不支持的模型 POST 接口。")
+        mode = "responses" if endpoint == "/responses" else "chat_completions"
+        provider = self._provider_config(api_mode=mode)
+        request = PreparedModelRequest(
+            provider=provider,
+            identity=provider_identity(provider),
+            api_mode=mode,
+            payload=payload,
+            credentials=ProviderCredentials(api_key=self.api_key),
+            timeout_seconds=self.timeout_seconds,
         )
-        return self._open_json(request, operation="模型接口")
+        try:
+            reply = (self.gateway.responses(request) if mode == "responses" else self.gateway.complete(request))
+        except Exception as exc:  # noqa: BLE001
+            raise LLMError("模型接口请求失败。") from exc
+        if mode == "responses":
+            return {"output_text": reply.text}
+        return {"choices": [{"message": {"content": reply.text}}]}
+
+    def _provider_config(self, *, api_mode: str | None = None):
+        return normalize_provider_config({
+            "backend": "openai_compatible",
+            "provider": "openai",
+            "api_base": self.base_url,
+            "model": self.model or "model-list",
+            "api_mode": api_mode or self.resolved_api_mode,
+        })
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -168,44 +203,6 @@ class OpenAICompatibleClient:
     def _is_cc_switch_local(self) -> bool:
         parsed = urllib.parse.urlparse(self.base_url)
         return parsed.hostname in {"127.0.0.1", "localhost"} and parsed.port == 15721
-
-    def _open_json(
-        self,
-        request: urllib.request.Request,
-        *,
-        operation: str,
-    ) -> dict[str, Any]:
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            content_type = exc.headers.get("Content-Type", "")
-            if exc.code == 401 and self._is_cc_switch_local():
-                detail = (
-                    "CC Switch 的 Codex 官方路由需要 Codex 客户端内部的 OAuth 凭证。"
-                    "普通 API Key、ChatGPT Plus 订阅或空 Key 都不能代替该凭证；"
-                    "请不要从 auth.json 复制登录令牌。可改用独立 API 服务或本地模型。"
-                )
-            elif "text/html" in content_type.lower() or detail.lstrip().lower().startswith("<html"):
-                detail = (
-                    "服务器返回了网页而不是 API JSON，请检查 Base URL 是否为 API 地址"
-                    "（OpenAI 官方地址为 https://api.openai.com/v1）。"
-                )
-            else:
-                detail = _friendly_api_error(exc.code, detail)
-            raise LLMError(f"{operation}返回 HTTP {exc.code}: {detail}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise LLMError(f"无法连接{operation}：{exc}") from exc
-
-        try:
-            decoded = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise LLMError(f"{operation}返回的内容不是合法 JSON。") from exc
-        if not isinstance(decoded, dict):
-            raise LLMError(f"{operation}返回格式不正确。")
-        return decoded
-
 
 class CodexCLIClient:
     """Use an already signed-in Codex CLI without reading its OAuth credentials."""
@@ -220,11 +217,22 @@ class CodexCLIClient:
         executable: Path | None = None,
         codex_home: Path | None = None,
         timeout_seconds: int = 90,
+        gateway: ModelProviderGateway | None = None,
     ) -> None:
         self.model = model
         self.executable = executable or find_codex_executable()
         self.codex_home = codex_home or codex_home_path()
         self.timeout_seconds = timeout_seconds
+        self.gateway = gateway or ModelProviderGateway()
+
+    @property
+    def provider_config(self):
+        return normalize_provider_config({
+            "backend": "codex_cli",
+            "provider": "codex",
+            "model": self.model or "codex-default",
+            "api_mode": "codex_cli",
+        })
 
     def decide(self, user_text: str, *, has_project: bool) -> LLMDecision:
         if self.executable is None:
@@ -247,73 +255,23 @@ class CodexCLIClient:
             f"User input: {user_text}"
         )
 
-        with tempfile.TemporaryDirectory(prefix="rnaseq-agent-codex-") as temp_name:
-            temp_dir = Path(temp_name)
-            schema_path = temp_dir / "decision.schema.json"
-            output_path = temp_dir / "decision.json"
-            schema_path.write_text(
-                json.dumps(schema, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            command = [
-                str(self.executable),
-                "exec",
-                "--ignore-user-config",
-                "--ephemeral",
-                "--ignore-rules",
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "--color",
-                "never",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-                "--cd",
-                str(temp_dir),
-                "--config",
-                "mcp_servers={}",
-            ]
-            if self.model:
-                command.extend(["--model", self.model])
-            command.append(prompt)
-            try:
-                process_env = os.environ.copy()
-                process_env["CODEX_HOME"] = str(self.codex_home)
-                result = subprocess.run(
-                    command,
-                    cwd=temp_dir,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self.timeout_seconds,
-                    check=False,
-                    env=process_env,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise LLMError(
-                    f"Codex CLI 在 {self.timeout_seconds} 秒内没有返回。"
-                ) from exc
-            except OSError as exc:
-                raise LLMError(f"无法启动 Codex CLI：{exc}") from exc
-
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout).strip()[-1200:]
-                if "401" in detail or "not logged in" in detail.lower():
-                    raise LLMError(
-                        "RNA-seq Agent 尚未完成独立的 ChatGPT 登录。"
-                        "请在“模型”页点击“登录 ChatGPT”，完成浏览器/设备授权后再测试。"
-                    )
-                raise LLMError(
-                    f"Codex CLI 调用失败（退出码 {result.returncode}）：{detail}"
-                )
-            if not output_path.exists():
-                raise LLMError("Codex CLI 没有生成决策结果。")
-            return parse_decision(output_path.read_text(encoding="utf-8"))
+        request = PreparedModelRequest(
+            provider=self.provider_config,
+            identity=provider_identity(self.provider_config),
+            api_mode="codex_cli",
+            payload={},
+            credentials=ProviderCredentials(),
+            timeout_seconds=self.timeout_seconds,
+            prompt=prompt,
+            response_schema=schema,
+            codex_executable=self.executable,
+            codex_home=self.codex_home,
+        )
+        try:
+            reply = self.gateway.codex_exec(request)
+        except Exception as exc:  # noqa: BLE001 - preserve the stable CLI error surface
+            raise LLMError("Codex CLI 调用失败。") from exc
+        return parse_decision(reply.text)
 
 
 def find_codex_executable() -> Path | None:
@@ -429,8 +387,12 @@ def _router_system_prompt(has_project: bool) -> str:
 
 
 def _extract_responses_text(response: dict[str, Any]) -> str:
+    if any(isinstance(response.get(key), list) and response.get(key) for key in ("tool_calls", "function_calls")):
+        raise LLMError("Responses API 返回了不支持的工具调用。")
     direct = response.get("output_text")
     if isinstance(direct, str) and direct.strip():
+        if len(direct.encode("utf-8")) > MAX_RESPONSE_BYTES:
+            raise LLMError("Responses API 响应超过大小限制。")
         return direct.strip()
 
     output = response.get("output")
@@ -439,17 +401,25 @@ def _extract_responses_text(response: dict[str, Any]) -> str:
         for item in output:
             if not isinstance(item, dict):
                 continue
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in {"function_call", "tool_call", "computer_call"}:
+                raise LLMError("Responses API 返回了不支持的工具调用。")
             content = item.get("content")
             if not isinstance(content, list):
                 continue
             for part in content:
                 if not isinstance(part, dict):
                     continue
+                if str(part.get("type") or "").strip().lower() in {"function_call", "tool_call", "function_call_output"}:
+                    raise LLMError("Responses API 返回了不支持的工具调用。")
                 text = part.get("text")
                 if part.get("type") == "output_text" and isinstance(text, str):
                     texts.append(text)
         if texts:
-            return "\n".join(texts).strip()
+            result = "\n".join(texts).strip()
+            if len(result.encode("utf-8")) > MAX_RESPONSE_BYTES:
+                raise LLMError("Responses API 响应超过大小限制。")
+            return result
 
     # Some compatible gateways translate Responses requests back to chat shape.
     try:
