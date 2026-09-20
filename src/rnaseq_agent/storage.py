@@ -15,7 +15,7 @@ class ConnectionStoreCorruptError(ValueError):
 
 
 def shared_file_lock(path: Path):
-    return project_state_lock(Path(path).resolve())
+    return project_state_lock(path)
 
 
 def _read_json_object_or_raise(path: Path) -> dict[str, Any]:
@@ -128,9 +128,12 @@ class _ProjectStateLock:
         handle = None
         try:
             if depth == 0:
-                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-                from .private_files import ensure_private_lock_file
+                from .private_files import (
+                    _ensure_directory_exists_no_follow,
+                    ensure_private_lock_file,
+                )
 
+                _ensure_directory_exists_no_follow(self._lock_path.parent)
                 ensure_private_lock_file(self._lock_path)
                 handle = self._lock_path.open("r+b")
                 handle.seek(0)
@@ -195,11 +198,14 @@ def project_state_lock(config_path: Path):
     The filesystem lock makes read/compare/write sections exclusive across
     worker processes and is released by the OS if a process exits abruptly.
     """
-    key = str(Path(config_path).resolve())
+    from .private_files import _absolute_without_resolving
+
+    config_path = _absolute_without_resolving(config_path)
+    key = str(config_path)
     with _PROJECT_STATE_LOCKS_GUARD:
         lock = _PROJECT_STATE_LOCKS.get(key)
         if lock is None:
-            lock = _ProjectStateLock(Path(config_path).resolve())
+            lock = _ProjectStateLock(config_path)
             _PROJECT_STATE_LOCKS[key] = lock
         return lock
 

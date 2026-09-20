@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import sys
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -243,11 +244,19 @@ def _read_browse_payload(directory: Path) -> tuple[dict[str, Any], bool, bool]:
     try:
         from .private_files import verify_private_path
 
-        if directory.exists() or directory.is_symlink():
+        try:
+            directory_info = os.lstat(directory)
+        except FileNotFoundError:
+            directory_info = None
+        if directory_info is not None:
             verify_private_path(directory)
         payload, _exists, valid_payload = _read_payload_state(directory)
         path = directory / CONNECTION_FILE_NAME
-        if path.exists() or path.is_symlink():
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            pass
+        else:
             verify_private_path(path)
     except (OSError, PermissionError):
         return {}, True, False
@@ -267,6 +276,21 @@ def locked_browse_policy(*, store_dir: Path | None = None) -> Iterator[BrowsePol
     directory = _resolve_store_dir(store_dir)
     path = directory / CONNECTION_FILE_NAME
     from .storage import project_state_lock
+    from .private_files import verify_private_path
+
+    # Validate the untrusted store directory before deriving or creating its
+    # lock.  This keeps rejected stores from receiving a lock file and avoids
+    # following a replaced parent component during lock setup.
+    try:
+        try:
+            os.lstat(directory)
+        except FileNotFoundError:
+            yield _invalid_policy()
+            return
+        verify_private_path(directory)
+    except (OSError, PermissionError):
+        yield _invalid_policy()
+        return
 
     with project_state_lock(path):
         payload, _exists, valid_payload = _read_browse_payload(directory)
@@ -491,12 +515,48 @@ def _read_payload_state(directory: Path) -> tuple[dict[str, Any], bool, bool]:
     file from an existing file that cannot be trusted. The former may use
     compatibility defaults; the latter must fail closed.
     """
-    path = directory / CONNECTION_FILE_NAME
-    if not path.is_file():
-        return {}, False, True
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        directory_info = os.lstat(directory)
+    except FileNotFoundError:
+        return {}, False, True
+    except OSError:
+        return {}, True, False
+    if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(directory_info.st_mode):
+        return {}, True, False
+    try:
+        from .private_files import verify_private_path
+
+        verify_private_path(directory)
+    except (OSError, PermissionError):
+        return {}, True, False
+
+    path = directory / CONNECTION_FILE_NAME
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {}, False, True
+    except OSError:
+        return {}, True, False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return {}, True, False
+    try:
+        from .private_files import verify_private_path
+
+        verify_private_path(path)
+    except (OSError, PermissionError):
+        return {}, True, False
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = None
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = None
+            raw = json.load(handle)
+    except (OSError, UnicodeDecodeError, ValueError):
+        if fd is not None:
+            os.close(fd)
         return {}, True, False
     if not isinstance(raw, dict):
         return {}, True, False

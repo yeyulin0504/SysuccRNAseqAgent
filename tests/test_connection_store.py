@@ -223,7 +223,7 @@ def test_invalid_inactive_root_identity_makes_policy_unavailable(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behavior")
-def test_browse_policy_rejects_connection_file_symlink(tmp_path):
+def test_browse_policy_does_not_read_external_connection_file_through_symlink(tmp_path, monkeypatch):
     store = tmp_path / "store"
     save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
     path = store / CONNECTION_FILE_NAME
@@ -231,10 +231,62 @@ def test_browse_policy_rejects_connection_file_symlink(tmp_path):
     external.write_text(path.read_text("utf-8"), encoding="utf-8")
     path.unlink()
     path.symlink_to(external)
+
+    original_read_text = Path.read_text
+
+    def reject_external_read(self, *args, **kwargs):
+        if self == external:
+            raise AssertionError("policy reader followed connection.json symlink")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_external_read)
     policy = load_browse_policy(store_dir=store)
     assert policy.available is False
     assert policy.identity is None
     assert policy.roots == ()
+
+
+def test_locked_browse_policy_rejects_untrusted_store_without_placing_lock(tmp_path, monkeypatch):
+    store = tmp_path / "broad-store"
+    store.mkdir()
+    (store / CONNECTION_FILE_NAME).write_text(
+        json.dumps({"host": "h.example", "user": "alice", "port": 22}),
+        encoding="utf-8",
+    )
+
+    from rnaseq_agent import private_files
+
+    original_verify = private_files.verify_private_path
+
+    def reject_store(path):
+        if Path(path) == store:
+            raise PermissionError("store is not private")
+        return original_verify(path)
+
+    monkeypatch.setattr(private_files, "verify_private_path", reject_store)
+
+    from rnaseq_agent.connection_store import locked_browse_policy
+
+    with locked_browse_policy(store_dir=store) as policy:
+        assert policy.available is False
+    assert not (store / ".project-state.lock").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX private mode assertions")
+def test_locked_browse_policy_rejects_broad_store_without_placing_lock(tmp_path):
+    store = tmp_path / "broad-store"
+    store.mkdir(mode=0o755)
+    os.chmod(store, 0o755)
+    (store / CONNECTION_FILE_NAME).write_text(
+        json.dumps({"host": "h.example", "user": "alice", "port": 22}),
+        encoding="utf-8",
+    )
+
+    from rnaseq_agent.connection_store import locked_browse_policy
+
+    with locked_browse_policy(store_dir=store) as policy:
+        assert policy.available is False
+    assert not (store / ".project-state.lock").exists()
 
 
 def test_concurrent_connection_and_llm_saves_preserve_both_blocks(tmp_path, monkeypatch):
