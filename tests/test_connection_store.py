@@ -246,6 +246,90 @@ def test_browse_policy_does_not_read_external_connection_file_through_symlink(tm
     assert policy.roots == ()
 
 
+def test_browse_policy_binds_payload_read_to_validated_directory(tmp_path, monkeypatch):
+    """A parent replacement between validation and open must not redirect reads."""
+    store = tmp_path / "store"
+    save_connection({"host": "trusted.example", "user": "alice", "port": 22}, store_dir=store)
+    displaced = tmp_path / "displaced"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir(mode=0o700)
+    (attacker / CONNECTION_FILE_NAME).write_text(
+        json.dumps({"host": "attacker.example", "user": "mallory", "port": 22}),
+        encoding="utf-8",
+    )
+
+    original_open = storage.os.open
+    replaced = False
+
+    # Keep the test focused on pathname binding; ACL validation is covered by
+    # the private-files tests and would otherwise reject the synthetic swap on
+    # Windows before the race is observable.
+    monkeypatch.setattr("rnaseq_agent.private_files.verify_private_path", lambda path: None)
+
+    def replace_parent_then_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        # The lock implementation may use a different Windows API; only the
+        # payload open is relevant to this race.
+        if not replaced and (
+            (dir_fd is None and Path(path).name == CONNECTION_FILE_NAME)
+            or (dir_fd is not None and path == CONNECTION_FILE_NAME)
+        ):
+            store.rename(displaced)
+            attacker.rename(store)
+            replaced = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("rnaseq_agent.connection_store.os.open", replace_parent_then_open)
+    policy = load_browse_policy(store_dir=store)
+    assert replaced
+    if os.name == "nt":
+        # The Windows path has no Python-level directory-fd equivalent; secure
+        # browse reads therefore fail closed rather than following the swap.
+        assert policy.available is False
+    else:
+        assert policy.available is True
+        assert policy.identity == SSHIdentity("trusted.example", "alice", 22)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows locks prevent replacing an open store directory")
+def test_locked_browse_policy_binds_payload_read_to_validated_directory(tmp_path, monkeypatch):
+    """The locked reader must retain the same directory binding guarantee."""
+    store = tmp_path / "store"
+    save_connection({"host": "trusted.example", "user": "alice", "port": 22}, store_dir=store)
+    displaced = tmp_path / "displaced"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir(mode=0o700)
+    (attacker / CONNECTION_FILE_NAME).write_text(
+        json.dumps({"host": "attacker.example", "user": "mallory", "port": 22}),
+        encoding="utf-8",
+    )
+    original_open = storage.os.open
+    replaced = False
+    monkeypatch.setattr("rnaseq_agent.private_files.verify_private_path", lambda path: None)
+
+    def replace_parent_then_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if not replaced and (
+            (dir_fd is None and Path(path).name == CONNECTION_FILE_NAME)
+            or (dir_fd is not None and path == CONNECTION_FILE_NAME)
+        ):
+            store.rename(displaced)
+            attacker.rename(store)
+            replaced = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("rnaseq_agent.connection_store.os.open", replace_parent_then_open)
+    from rnaseq_agent.connection_store import locked_browse_policy
+
+    with locked_browse_policy(store_dir=store) as policy:
+        assert replaced
+        if os.name == "nt":
+            assert policy.available is False
+        else:
+            assert policy.available is True
+            assert policy.identity == SSHIdentity("trusted.example", "alice", 22)
+
+
 def test_locked_browse_policy_rejects_untrusted_store_without_placing_lock(tmp_path, monkeypatch):
     store = tmp_path / "broad-store"
     store.mkdir()

@@ -250,7 +250,7 @@ def _read_browse_payload(directory: Path) -> tuple[dict[str, Any], bool, bool]:
             directory_info = None
         if directory_info is not None:
             verify_private_path(directory)
-        payload, _exists, valid_payload = _read_payload_state(directory)
+        payload, _exists, valid_payload = _read_payload_state(directory, secure=True)
         path = directory / CONNECTION_FILE_NAME
         try:
             os.lstat(path)
@@ -508,7 +508,36 @@ def _resolve_store_dir(store_dir: Path | None) -> Path:
     return Path(store_dir) if store_dir is not None else connection_home()
 
 
-def _read_payload_state(directory: Path) -> tuple[dict[str, Any], bool, bool]:
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_directory_no_follow(directory: Path) -> int:
+    """Open every POSIX path component without following a symlink.
+
+    A pathname open with ``O_NOFOLLOW`` protects only its final component.
+    Walking with ``dir_fd`` binds the later payload open to the directory
+    object that was validated, so replacing a parent cannot redirect it.
+    """
+    if os.name == "nt" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise OSError("directory-fd no-follow reads are unavailable")
+    from .private_files import _absolute_without_resolving
+
+    path = _absolute_without_resolving(directory)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path.anchor or os.sep, flags)
+    try:
+        for part in path.parts[1:] if path.anchor else path.parts:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_payload_state(directory: Path, *, secure: bool = False) -> tuple[dict[str, Any], bool, bool]:
     """Return ``(payload, exists, valid_object)`` for the shared settings file.
 
     Callers that make security decisions must distinguish a missing legacy
@@ -531,6 +560,7 @@ def _read_payload_state(directory: Path) -> tuple[dict[str, Any], bool, bool]:
         return {}, True, False
 
     path = directory / CONNECTION_FILE_NAME
+    directory_identity = directory_info
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -549,8 +579,43 @@ def _read_payload_state(directory: Path) -> tuple[dict[str, Any], bool, bool]:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = None
+    directory_fd = None
     try:
-        fd = os.open(path, flags)
+        if secure and os.name != "nt":
+            directory_fd = _open_directory_no_follow(directory)
+            opened_directory = os.fstat(directory_fd)
+            if not _same_file_identity(directory_identity, opened_directory):
+                return {}, True, False
+            fd = os.open(CONNECTION_FILE_NAME, flags, dir_fd=directory_fd)
+            opened_file = os.fstat(fd)
+            if (
+                not _same_file_identity(info, opened_file)
+                or not stat.S_ISREG(opened_file.st_mode)
+                or bool(opened_file.st_mode & 0o077)
+            ):
+                os.close(fd)
+                fd = None
+                return {}, True, False
+        else:
+            # Windows has no dir_fd/O_NOFOLLOW equivalent in the Python
+            # standard library.  Open by pathname, then verify both the
+            # directory and final-file identities again before parsing.  A
+            # detected replacement fails closed; the remaining limitation is
+            # documented at the call site rather than silently treated safe.
+            fd = os.open(path, flags)
+            if secure:
+                current_directory = os.lstat(directory)
+                current_file = os.lstat(path)
+                opened_file = os.fstat(fd)
+                if (
+                    not _same_file_identity(directory_identity, current_directory)
+                    or not _same_file_identity(info, current_file)
+                    or not _same_file_identity(info, opened_file)
+                    or not stat.S_ISREG(opened_file.st_mode)
+                ):
+                    os.close(fd)
+                    fd = None
+                    return {}, True, False
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = None
             raw = json.load(handle)
@@ -558,6 +623,9 @@ def _read_payload_state(directory: Path) -> tuple[dict[str, Any], bool, bool]:
         if fd is not None:
             os.close(fd)
         return {}, True, False
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
     if not isinstance(raw, dict):
         return {}, True, False
     return raw, True, True
