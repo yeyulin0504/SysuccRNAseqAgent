@@ -616,9 +616,7 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
             context=context,
             timeout_seconds=timeout,
         )
-        gateway = ModelProviderGateway()
-        reply = gateway.responses(request) if provider.api_mode == "responses" else gateway.complete(request)
-        return reply.text.strip() or None
+        return ModelProviderGateway().complete(request).text.strip() or None
     except Exception:  # noqa: BLE001 - any failure falls back to the rule router
         return None
 
@@ -654,14 +652,8 @@ def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0)
             timeout_seconds=timeout,
             stream=True,
         )
-        gateway = ModelProviderGateway()
-        if provider.api_mode == "responses":
-            reply = gateway.responses(request)
-            if reply.text.strip():
-                yield reply.text.strip()
-            return
         streamed = False
-        for event in gateway.stream(request):
+        for event in ModelProviderGateway().stream(request):
             if event.kind == "delta":
                 streamed = True
                 yield str(event.value)
@@ -1817,8 +1809,7 @@ def create_app(
                 context=context,
                 timeout_seconds=30,
             )
-            gateway = ModelProviderGateway()
-            reply = (gateway.responses(prepared) if provider.api_mode == "responses" else gateway.complete(prepared)).text.strip()
+            reply = ModelProviderGateway().complete(prepared).text.strip()
             return {"ok": True, "message": "LLM API 连接成功", "reply": reply}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"LLM API 连接失败：{type(exc).__name__}"}
