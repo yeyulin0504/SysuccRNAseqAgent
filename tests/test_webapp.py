@@ -811,7 +811,7 @@ class TestWebApp:
         assert "密码认证失败" in result["message"]
 
     def test_browse_samples_surfaces_readable_failure(self, client, monkeypatch) -> None:
-        """「浏览服务器目录」失败时也要给出可读原因，而不是只报异常类名。"""
+        """未批准的远程根目录必须在连接/扫描前被明确拒绝。"""
         import rnaseq_agent.webapp as webapp
 
         token = _token(client)
@@ -830,13 +830,9 @@ class TestWebApp:
             headers=_headers(token),
         )
 
-        # 让底层传输抛出带 SSH stderr 的 RuntimeError（真实失败形态）。
+        # 即使底层传输被替换成会抛异常的实现，没有 approved root 也不得触碰它。
         def _boom(config):
-            raise RuntimeError(
-                "Command failed with exit code 255: ssh -o BatchMode=yes u@h\n"
-                "STDOUT:\n\nSTDERR:\n"
-                "u@h: Permission denied (publickey,password).\n"
-            )
+            raise AssertionError("unapproved browse must not create a transport")
 
         monkeypatch.setattr(webapp, "create_remote_transport", _boom)
         result = client.post(
@@ -844,8 +840,8 @@ class TestWebApp:
             json={"message": "浏览我的服务器目录"},
             headers=_headers(token),
         ).json()
-        assert "RuntimeError" not in result["reply"]
-        assert "认证被拒绝" in result["reply"]
+        assert result["error_code"] == "REMOTE_ROOT_NOT_APPROVED"
+        assert "approved" in result["reply"].lower()
 
     def test_password_auth_mode_from_web_form_is_used_and_echoed(self, client) -> None:
         """前端认证按钮值为 'pass'，后端须按 password 模式保存并回显。"""
@@ -1126,42 +1122,145 @@ class TestWebApp:
 
     def test_remote_scan_returns_paired_preview(self, client, monkeypatch) -> None:
         import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import (
+            ApprovedDataRoot,
+            approve_data_root,
+            load_browse_policy,
+            save_connection,
+        )
         from rnaseq_agent.execution import CommandResult
+        from rnaseq_agent.remote_browse import (
+            BrowseDirectoryGroup,
+            BrowseSampleRow,
+            BrowseScanPayload,
+        )
 
         token = _token(client)
         _new_project(client, token)
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+        policy = load_browse_policy()
+        approve_data_root(
+            ApprovedDataRoot(
+                "root_reads",
+                "h.example",
+                "alice",
+                22,
+                "/reads",
+                "/reads",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            expected_revision=policy.revision,
+        )
+
+        calls = {"bounded": 0, "scanner": 0}
 
         class Transport:
-            def execute(self, command):
-                return CommandResult([], 0, "/reads/A_R1.fastq.gz\n/reads/A_R2.fastq.gz\n", "")
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                calls["bounded"] += 1
+                return CommandResult([], 0, "/reads\n", "", len(b"/reads\n"))
 
         monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        def _scan(canonical_target, canonical_root, runner, transport):
+            calls["scanner"] += 1
+            assert canonical_target == "/reads"
+            assert canonical_root == "/reads"
+            return BrowseScanPayload(
+                (
+                    BrowseDirectoryGroup(
+                        "group_reads",
+                        "/reads",
+                        (BrowseSampleRow("A", "A_R1.fastq.gz", "A_R2.fastq.gz"),),
+                        (),
+                    ),
+                ),
+                1,
+                0,
+                False,
+            )
+
+        monkeypatch.setattr(webapp, "scan_remote_fastqs", _scan)
         result = client.post(
             "/api/samples/scan-remote", json={"path": "/reads"}, headers=_headers(token)
         ).json()
         assert result["ok"] is True
         assert result["samples"][0]["sample_id"] == "A"
+        assert result["groups"][0]["canonical_directory"] == "/reads"
+        assert calls["bounded"] >= 1
+        assert calls["scanner"] == 1
 
     def test_chat_browses_remote_samples_before_calling_llm(self, client, monkeypatch) -> None:
         import rnaseq_agent.webapp as webapp
+        from rnaseq_agent.connection_store import (
+            ApprovedDataRoot,
+            approve_data_root,
+            load_browse_policy,
+            save_connection,
+        )
         from rnaseq_agent.execution import CommandResult
+        from rnaseq_agent.remote_browse import (
+            BrowseDirectoryGroup,
+            BrowseSampleRow,
+            BrowseScanPayload,
+        )
 
         token = _token(client)
         _new_project(client, token)
+        save_connection(
+            {
+                "host": "h.example",
+                "user": "alice",
+                "port": 22,
+                "remote_workdir": "/hwdata/home/yeyulin/rna",
+            }
+        )
+        policy = load_browse_policy()
+        approve_data_root(
+            ApprovedDataRoot(
+                "root_rna",
+                "h.example",
+                "alice",
+                22,
+                "/hwdata/home/yeyulin/rna",
+                "/data",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            expected_revision=policy.revision,
+        )
         client.post(
             "/api/config",
             json={"server": {"remote_workdir": "/hwdata/home/yeyulin/rna"}},
             headers=_headers(token),
         )
 
-        calls = {}
+        calls = {"bounded": 0, "scanner": 0}
 
         class Transport:
-            def execute(self, command):
-                calls["command"] = command
-                return CommandResult([], 0, "/data/P1_R1.fastq.gz\n/data/P1_R2.fastq.gz\n", "")
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                calls["bounded"] += 1
+                return CommandResult([], 0, "/data\n", "", len(b"/data\n"))
+
+        def _scan(canonical_target, canonical_root, runner, transport):
+            calls["scanner"] += 1
+            assert canonical_target == "/data"
+            assert canonical_root == "/data"
+            return BrowseScanPayload(
+                (
+                    BrowseDirectoryGroup(
+                        "group_rna",
+                        "/data",
+                        (BrowseSampleRow("P1", "P1_R1.fastq.gz", "P1_R2.fastq.gz"),),
+                        (),
+                    ),
+                ),
+                1,
+                0,
+                False,
+            )
 
         monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
+        monkeypatch.setattr(webapp, "scan_remote_fastqs", _scan)
         monkeypatch.setattr(webapp, "_llm_reply_or_none", lambda config, text: (_ for _ in ()).throw(AssertionError("LLM must not handle tool intents")))
         result = client.post(
             "/api/chat",
@@ -1171,8 +1270,9 @@ class TestWebApp:
 
         assert result["action"] == "browse_samples"
         assert result["scanned_path"] == "/hwdata/home/yeyulin/rna"
-        assert result["samples"][0]["sample_id"] == "P1"
-        assert "find /hwdata/home/yeyulin/rna" in calls["command"]
+        assert result["groups"][0]["samples"][0]["sample_id"] == "P1"
+        assert calls["bounded"] >= 1
+        assert calls["scanner"] == 1
 
     def test_container_config_pull_and_test(self, client, monkeypatch) -> None:
         import rnaseq_agent.webapp as webapp

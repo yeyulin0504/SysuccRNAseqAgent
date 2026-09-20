@@ -1335,30 +1335,68 @@ class TestReadAndDerivedArtifactTools:
         self, client, tmp_path, monkeypatch
     ) -> None:
         from rnaseq_agent import webapp as webapp_module
+        from rnaseq_agent.connection_store import (
+            ApprovedDataRoot,
+            approve_data_root,
+            load_browse_policy,
+            save_connection,
+        )
+        from rnaseq_agent.execution import CommandResult
+        from rnaseq_agent.remote_browse import (
+            BrowseDirectoryGroup,
+            BrowseSampleRow,
+            BrowseScanPayload,
+        )
 
         token = _token(client)
         _create_project(client, token, "browse_tool")
         _seed_project(tmp_path, monkeypatch, "browse_tool")
+        save_connection({"host": "h.example", "user": "alice", "port": 22})
+        policy = load_browse_policy()
+        approve_data_root(
+            ApprovedDataRoot(
+                "root_remote",
+                "h.example",
+                "alice",
+                22,
+                "/remote/fastq",
+                "/remote/fastq",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            expected_revision=policy.revision,
+        )
         _configure_llm(client, token)
 
-        seen: list[tuple[dict, str]] = []
+        calls = {"bounded": 0, "scanner": 0}
 
-        def fake_scan(config, remote_dir):
-            seen.append((config, remote_dir))
-            return {
-                "ok": True,
-                "scanned_path": remote_dir,
-                "samples": [
-                    {
-                        "sample_id": "S1",
-                        "fastq_1": "/remote/S1_R1.fastq.gz",
-                        "fastq_2": "/remote/S1_R2.fastq.gz",
-                    }
-                ],
-                "warnings": [],
-            }
+        class Transport:
+            def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+                calls["bounded"] += 1
+                return CommandResult(
+                    [], 0, "/remote/fastq\n", "", len(b"/remote/fastq\n")
+                )
 
-        monkeypatch.setattr(webapp_module, "_scan_remote_samples", fake_scan)
+        def fake_scan(canonical_target, canonical_root, runner, transport):
+            calls["scanner"] += 1
+            assert canonical_target == "/remote/fastq"
+            assert canonical_root == "/remote/fastq"
+            return BrowseScanPayload(
+                (
+                    BrowseDirectoryGroup(
+                        "group_remote",
+                        "/remote/fastq",
+                        (BrowseSampleRow("S1", "S1_R1.fastq.gz", "S1_R2.fastq.gz"),),
+                        (),
+                    ),
+                ),
+                1,
+                0,
+                False,
+            )
+
+        monkeypatch.setattr(webapp_module, "create_remote_transport", lambda config: Transport())
+        monkeypatch.setattr(webapp_module, "scan_remote_fastqs", fake_scan)
         fake = FakeLLM(
             [
                 {
@@ -1373,10 +1411,14 @@ class TestReadAndDerivedArtifactTools:
 
         events = _stream(client, token, "扫描 /remote/fastq", project="browse_tool")
         assert _confirm_event(events) is None, events
-        assert seen and seen[0][1] == "/remote/fastq"
+        assert calls["bounded"] >= 1
+        assert calls["scanner"] == 1
         tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
         assert tool_result["ok"] is True
-        assert tool_result["samples"][0]["sample_id"] == "S1"
+        assert tool_result["directory_count"] == 1
+        assert tool_result["sample_count"] == 1
+        assert "S1" not in json.dumps(tool_result, ensure_ascii=False)
+        assert "/remote/fastq" not in json.dumps(tool_result, ensure_ascii=False)
 
     def test_rejected_refresh_does_not_update_project_or_session_state(
         self, client, tmp_path, monkeypatch
