@@ -41,6 +41,8 @@ from .storage import project_state_lock
 
 _FIELDS = {"sample_ids", "fastq_filenames", "remote_paths", "report_excerpt"}
 _TERMINAL = {"rejected", "consumed_success", "consumed_ambiguous", "consumed_failed"}
+_MARKED_PREPARE_IDS: set[int] = set()
+_MARKED_STREAM_IDS: set[int] = set()
 
 
 class DataGrantError(RuntimeError):
@@ -99,23 +101,29 @@ class ExactOpenStreamCallback(Protocol):
 def mark_exact_prepare(callback: Callable[..., Any]) -> Callable[..., Any]:
     """Mark the sole exact-request preparation callback."""
     setattr(callback, "__model_data_exact_prepare__", True)
+    _MARKED_PREPARE_IDS.add(id(callback))
     return callback
 
 
 def mark_exact_open_stream(callback: Callable[..., Any]) -> Callable[..., Any]:
     """Mark the sole exact dispatcher callback."""
     setattr(callback, "__model_data_exact_open_stream__", True)
+    _MARKED_STREAM_IDS.add(id(callback))
     return callback
 
 
 def _marked(callback: Any, marker: str) -> bool:
     if not callable(callback):
         return False
-    if bool(getattr(callback, marker, False)):
+    if id(callback) in (_MARKED_PREPARE_IDS if marker == "__model_data_exact_prepare__" else _MARKED_STREAM_IDS):
         return True
-    # The production gateway exposes this exact dispatcher as a bound method;
-    # keep that single canonical entry point usable without mutating the gateway.
-    return marker == "__model_data_exact_open_stream__" and getattr(callback, "__name__", "") == "dispatch_exact"
+    if marker == "__model_data_exact_open_stream__":
+        try:
+            from .model_provider import ModelProviderGateway
+            return getattr(callback, "__func__", None) is ModelProviderGateway.dispatch_exact
+        except (ImportError, AttributeError):
+            return False
+    return False
 
 
 def _now(value: datetime | None) -> datetime:
@@ -281,7 +289,9 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
         r = value["revisions"]
         if not isinstance(r, Mapping):
             raise ValueError
-        policy_version = int(value["policy_version"])
+        if not isinstance(value["policy_version"], int) or isinstance(value["policy_version"], bool):
+            raise ValueError
+        policy_version = value["policy_version"]
         if policy_version <= 0 or int(r.get("policy_version", policy_version)) != policy_version:
             raise ValueError
         revisions = ModelDataRevisions(r["project_revision"], r["sample_revision"], r.get("remote_scan_revision"), r.get("report_revision"), r["provider_config_revision"], int(r.get("policy_version", value["policy_version"])))
@@ -294,39 +304,57 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
         fields = tuple(value["fields"])
         if not isinstance(value["fields"], (list, tuple)) or not fields or any(not isinstance(field, str) or field not in _FIELDS for field in fields) or len(set(fields)) != len(fields):
             raise ValueError
-        project_id, thread_id = str(value["project_id"]), str(value["thread_id"])
+        if not isinstance(value["project_id"], str) or not isinstance(value["thread_id"], str):
+            raise ValueError
+        project_id, thread_id = value["project_id"], value["thread_id"]
         if not project_id.strip() or not thread_id.strip():
             raise ValueError
         status = value["status"]
         if str(value["grant_id"]) != grant_id or status not in {"pending", "approved", "rejected", "transmitting", "consumed_success", "consumed_ambiguous", "consumed_failed"}:
             raise ValueError
-        issued_at, expires_at = str(value["issued_at"]), str(value["expires_at"])
+        if not isinstance(value["issued_at"], str) or not isinstance(value["expires_at"], str):
+            raise ValueError
+        issued_at, expires_at = value["issued_at"], value["expires_at"]
         issued, expires = _parse(issued_at), _parse(expires_at)
         if expires <= issued or not str(value["provider_identity"]).strip() or not str(value["tool_mode"]).strip() or not str(value["purpose_hash"]).strip():
             raise ValueError
-        counts = dict(value["record_counts"])
-        if set(counts) != set(fields) or any(not isinstance(k, str) or isinstance(v, bool) or int(v) < 0 for k, v in counts.items()):
+        if not isinstance(value["record_counts"], dict):
             raise ValueError
-        manifest = value.get("manifest") or {}
-        if not isinstance(manifest, Mapping):
+        counts = value["record_counts"]
+        if set(counts) != set(fields) or any(not isinstance(k, str) or not isinstance(v, int) or isinstance(v, bool) or v < 0 for k, v in counts.items()):
             raise ValueError
+        if "manifest" not in value or not isinstance(value["manifest"], dict):
+            raise ValueError
+        manifest = value["manifest"]
         if status in _TERMINAL - {"rejected"} and not all(key in manifest for key in ("fields", "record_counts", "byte_length", "revisions")):
             raise ValueError
         for timestamp_key in ("decided_at", "claimed_at", "consumed_at"):
             if value.get(timestamp_key) is not None:
-                _parse(str(value[timestamp_key]))
+                if not isinstance(value[timestamp_key], str):
+                    raise ValueError
+                _parse(value[timestamp_key])
         if status in {"approved", "rejected"} and value.get("decided_at") is None:
+            raise ValueError
+        if status in {"pending", "transmitting"} and value.get("decided_at") is None and status == "transmitting":
             raise ValueError
         if status in _TERMINAL - {"rejected"} and value.get("consumed_at") is None:
             raise ValueError
         if status == "transmitting" and value.get("claimed_at") is None:
+            raise ValueError
+        if status == "transmitting" and not isinstance(manifest.get("claim_token_hash"), str):
+            raise ValueError
+        if "claim_token_hash" in value and value["claim_token_hash"] != manifest.get("claim_token_hash"):
+            raise ValueError
+        if status in {"pending", "approved", "rejected"} and (value.get("claimed_at") is not None or value.get("consumed_at") is not None or "claim_token_hash" in manifest):
             raise ValueError
         if status == "pending" and value.get("decided_at") is not None:
             raise ValueError
         if status in _TERMINAL - {"rejected"}:
             mf = manifest
             mf_fields = tuple(mf["fields"])
-            mf_counts = dict(mf["record_counts"])
+            if not isinstance(mf["record_counts"], dict):
+                raise ValueError
+            mf_counts = mf["record_counts"]
             mf_revisions = mf["revisions"]
             if mf_fields != fields or mf_counts != counts or isinstance(mf["byte_length"], bool) or not isinstance(mf["byte_length"], int) or mf["byte_length"] < 0 or not isinstance(mf_revisions, Mapping):
                 raise ValueError
@@ -337,7 +365,7 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
             provider_identity=str(value["provider_identity"]), tool_mode=str(value["tool_mode"]), fields=fields,
             purpose_hash=str(value["purpose_hash"]), issued_at=issued_at, expires_at=expires_at,
             policy_version=policy_version, revisions=revisions,
-            record_counts={str(k): int(v) for k, v in counts.items()}, status=status,
+            record_counts=counts, status=status,
             remote_scan_ref_hash=value.get("remote_scan_ref_hash"), decided_at=value.get("decided_at"),
             claimed_at=value.get("claimed_at"), consumed_at=value.get("consumed_at"), error_code=value.get("error_code"),
             manifest=dict(manifest),
@@ -361,7 +389,7 @@ def issue_grant_request(
         raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")
     if not isinstance(purpose, str) or not 1 <= len(purpose) <= 240:
         raise DataGrantError("invalid model data purpose", code=MODEL_DATA_GRANT_INVALID, grant_id="")
-    if not str(project_id).strip() or not str(thread_id).strip():
+    if not isinstance(project_id, str) or not isinstance(thread_id, str) or not project_id.strip() or not thread_id.strip():
         raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id="")
     if "remote_paths" in fields:
         raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")

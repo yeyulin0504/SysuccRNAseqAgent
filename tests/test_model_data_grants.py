@@ -236,3 +236,46 @@ def test_recovery_of_transmitting_grant_is_terminal(tmp_path):
         )
     assert caught.value.code == MODEL_DATA_GRANT_CONSUMED
     assert load_grant(project, grant.grant_id).status == "consumed_ambiguous"
+
+
+@pytest.mark.parametrize("field, value", [
+    ("project_id", 7), ("thread_id", []), ("policy_version", "1"),
+    ("record_counts", [["sample_ids", 1]]), ("manifest", None),
+])
+def test_load_rejects_wrong_json_types(tmp_path, field, value):
+    project = _project(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", now=NOW)
+    payload = json.loads(grant_record_path(project, grant.grant_id).read_text(encoding="utf-8"))
+    payload[field] = value
+    grant_record_path(project, grant.grant_id).write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DataGrantError) as caught:
+        load_grant(project, grant.grant_id)
+    assert caught.value.code == MODEL_DATA_GRANT_INVALID
+
+
+def test_load_enforces_status_timestamp_and_claim_hash_contract(tmp_path):
+    project = _project(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", now=NOW)
+    record = grant_record_path(project, grant.grant_id)
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    payload["status"] = "transmitting"
+    payload["claimed_at"] = NOW.isoformat().replace("+00:00", "Z")
+    payload["manifest"] = {}
+    record.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DataGrantError):
+        load_grant(project, grant.grant_id)
+
+
+def test_callback_marker_attribute_spoof_is_rejected(tmp_path):
+    project = _project(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", now=NOW)
+    decide_grant(project, grant.grant_id, approved=True, now=NOW)
+    def prepare(claim, snapshot):
+        return None, object()
+    prepare.__model_data_exact_prepare__ = True
+    def open_stream(request):
+        return iter(())
+    open_stream.__model_data_exact_open_stream__ = True
+    with pytest.raises(DataGrantError) as caught:
+        claim_grant_for_send(project, grant.grant_id, live_inputs=ExactClaimInputs("p1", "t1"), prepare=prepare, open_stream=open_stream, now=NOW)
+    assert caught.value.code == MODEL_DATA_GRANT_INVALID
