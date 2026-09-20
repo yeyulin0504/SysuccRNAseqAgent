@@ -58,16 +58,18 @@ def _save_llm_worker(store_dir: Path, barrier) -> None:
     save_llm({"model": "m"}, store_dir=store_dir)
 
 
-def _transaction_contender_worker(path: str, ready, entered) -> None:
-    from rnaseq_agent.storage import locked_json_transaction
+def _transaction_contender_worker(path: str, attempting, acquired, entered) -> None:
+    from rnaseq_agent.storage import locked_json_transaction, shared_file_lock
 
-    ready.set()
+    attempting.set()
 
     def mutate(current):
         entered.set()
         return current
 
-    locked_json_transaction(Path(path), mutate)
+    with shared_file_lock(Path(path)):
+        acquired.set()
+        locked_json_transaction(Path(path), mutate)
 
 
 @pytest.fixture
@@ -331,6 +333,39 @@ def test_windows_connection_file_has_protected_current_user_dacl(tmp_path):
         kernel.LocalFree(sd)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
+def test_windows_connection_store_directory_is_private_and_broad_directory_is_rejected(tmp_path):
+    from rnaseq_agent.private_files import _read_windows_acl, _windows_sid
+    import ctypes
+
+    store = tmp_path / "store"
+    save_connection({"host": "h"}, store_dir=store)
+    protected, trustees = _read_windows_acl(store)
+    assert protected
+    assert set(trustees) in ({_windows_sid(), "SY"}, {_windows_sid(), "S-1-5-18"})
+
+    broad = ctypes.c_void_p()
+    kernel = ctypes.windll.kernel32
+    adv = ctypes.windll.advapi32
+    assert adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        "D:(A;;GA;;;WD)", 1, ctypes.byref(broad), None
+    )
+    try:
+        broad_dacl = ctypes.c_void_p()
+        present = ctypes.c_bool()
+        defaulted = ctypes.c_bool()
+        assert adv.GetSecurityDescriptorDacl(
+            broad, ctypes.byref(present), ctypes.byref(broad_dacl), ctypes.byref(defaulted)
+        )
+        adv.SetNamedSecurityInfoW.restype = ctypes.c_ulong
+        assert adv.SetNamedSecurityInfoW(str(store), 1, 4, None, None, broad_dacl, None) == 0
+    finally:
+        kernel.LocalFree(broad)
+
+    with pytest.raises((OSError, PermissionError)):
+        save_connection({"host": "after"}, store_dir=store)
+
+
 def test_transaction_callback_waits_for_shared_lock(tmp_path):
     from rnaseq_agent.storage import locked_json_transaction, project_state_lock
 
@@ -355,25 +390,28 @@ def test_transaction_callback_waits_for_shared_lock(tmp_path):
 
 
 def test_transaction_callback_waits_for_shared_lock_across_processes(tmp_path):
-    from rnaseq_agent.storage import project_state_lock
+    from rnaseq_agent.storage import shared_file_lock
 
     store = tmp_path / "store"
     path = store / "connection.json"
     save_connection({"host": "h"}, store_dir=store)
     context = multiprocessing.get_context("spawn")
-    ready = context.Event()
+    attempting = context.Event()
+    acquired = context.Event()
     entered = context.Event()
     process = context.Process(
         target=_transaction_contender_worker,
-        args=(str(path), ready, entered),
+        args=(str(path), attempting, acquired, entered),
     )
 
-    with project_state_lock(path):
+    with shared_file_lock(path):
         process.start()
-        assert ready.wait(5)
-        assert not entered.wait(0.5)
+        assert attempting.wait(5)
+        assert not acquired.wait(0.5)
+        assert not entered.is_set()
     process.join(10)
     assert process.exitcode == 0
+    assert acquired.is_set()
     assert entered.is_set()
 
 
