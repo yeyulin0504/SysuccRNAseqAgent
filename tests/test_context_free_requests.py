@@ -91,4 +91,3 @@ def test_context_free_chat_request_has_only_context_messages() -> None:
     ]
     assert "tools" not in request.payload
     assert "tool_choice" not in request.payload
-

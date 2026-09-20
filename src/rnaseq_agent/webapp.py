@@ -616,7 +616,9 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
             context=context,
             timeout_seconds=timeout,
         )
-        return ModelProviderGateway().complete(request).text.strip() or None
+        gateway = ModelProviderGateway()
+        reply = gateway.responses(request) if provider.api_mode == "responses" else gateway.complete(request)
+        return reply.text.strip() or None
     except Exception:  # noqa: BLE001 - any failure falls back to the rule router
         return None
 
@@ -652,8 +654,14 @@ def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0)
             timeout_seconds=timeout,
             stream=True,
         )
+        gateway = ModelProviderGateway()
+        if provider.api_mode == "responses":
+            reply = gateway.responses(request)
+            if reply.text.strip():
+                yield reply.text.strip()
+            return
         streamed = False
-        for event in ModelProviderGateway().stream(request):
+        for event in gateway.stream(request):
             if event.kind == "delta":
                 streamed = True
                 yield str(event.value)
