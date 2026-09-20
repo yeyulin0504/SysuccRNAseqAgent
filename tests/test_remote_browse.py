@@ -22,6 +22,8 @@ from rnaseq_agent.remote_browse import (
     REMOTE_PATH_ESCAPE,
     REMOTE_SCAN_INVALID_OUTPUT,
     ScanPathEscape,
+    ScanPython3Required,
+    REMOTE_SCAN_PYTHON3_REQUIRED,
 )
 from rnaseq_agent.ssh_identity import SSHIdentity
 
@@ -139,7 +141,7 @@ def test_exact_root_authorizes_injected_scanner():
         "/data/root": _command_result("/data/root\n"),
     })
     payload = BrowseScanPayload(
-        groups=(BrowseDirectoryGroup("g1", "/data/root", (BrowseSampleRow("s", "/data/root/a_R1.fastq", None),), ()),),
+        groups=(BrowseDirectoryGroup("g1", "/data/root", (BrowseSampleRow("s", "a_R1.fastq", None),), ()),),
         sample_count=1,
         unmatched_count=0,
         truncated=False,
@@ -214,6 +216,76 @@ def test_scan_argv_keeps_hostile_path_out_of_helper_source():
     assert command.max_depth == 2
     assert command.max_candidates == 5_000
     assert "find" not in command.remote_command
+
+
+def test_scan_helper_executes_with_framed_positional_arguments(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "S1_R1.fastq.gz").write_bytes(b"reads")
+    command = build_scan_command(str(tmp_path), str(target))
+    completed = subprocess.run(
+        [sys.executable, *command.argv[1:]],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    document = json.loads(completed.stdout)
+    assert document["files"] == [str(target / "S1_R1.fastq.gz")]
+    assert document["truncated"] is False
+
+
+def test_browse_rejects_non_basename_sample_and_unmatched_rows():
+    root = _root()
+    policy = _policy(root)
+    transport = ScriptedTransport({"/data/root": _command_result("/data/root\n")})
+
+    def scanner(*args):
+        return BrowseScanPayload(
+            groups=(BrowseDirectoryGroup(
+                "g1",
+                "/data/root",
+                (BrowseSampleRow("s", "/data/root/a_R1.fastq", None),),
+                ("/data/root/orphan.fastq",),
+            ),),
+            sample_count=1,
+            unmatched_count=1,
+            truncated=False,
+        )
+
+    result = browse_remote_fastqs(
+        "/data/root", CONTEXT, lambda: policy, lambda _: transport, scanner
+    )
+    assert result.error_code == REMOTE_SCAN_INVALID_OUTPUT
+
+
+def test_missing_remote_python3_has_stable_scan_error():
+    class Transport:
+        def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes):
+            assert "command -v python3" in command
+            return _command_result("", returncode=46)
+
+    runner = BrowseExecutionBudget.start(timeout_seconds=5, max_output_bytes=10000)
+    with pytest.raises(ValueError, match=REMOTE_SCAN_PYTHON3_REQUIRED):
+        scan_remote_fastqs("/data/root/run", "/data/root", runner, Transport())
+
+
+def test_browse_maps_missing_remote_python3_to_stable_error():
+    root = _root()
+    policy = _policy(root)
+    transport = ScriptedTransport({"/data/root": _command_result("/data/root\n")})
+
+    def scanner(*args):
+        raise ScanPython3Required(REMOTE_SCAN_PYTHON3_REQUIRED)
+
+    result = browse_remote_fastqs(
+        "/data/root", CONTEXT, lambda: policy, lambda _: transport, scanner
+    )
+    assert result.error_code == REMOTE_SCAN_PYTHON3_REQUIRED
 
 
 def test_grouping_returns_canonical_parent_and_basename_rows():

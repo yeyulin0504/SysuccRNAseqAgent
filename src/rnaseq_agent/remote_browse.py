@@ -31,6 +31,7 @@ REMOTE_SCAN_TIMEOUT = "REMOTE_SCAN_TIMEOUT"
 REMOTE_SCAN_OUTPUT_LIMIT = "REMOTE_SCAN_OUTPUT_LIMIT"
 REMOTE_SCAN_INVALID_OUTPUT = "REMOTE_SCAN_INVALID_OUTPUT"
 REMOTE_SCAN_FAILED = "REMOTE_SCAN_FAILED"
+REMOTE_SCAN_PYTHON3_REQUIRED = "REMOTE_SCAN_PYTHON3_REQUIRED"
 REMOTE_ROOT_LIMIT = "REMOTE_ROOT_LIMIT"
 REMOTE_ROOT_REVISION_CONFLICT = "REMOTE_ROOT_REVISION_CONFLICT"
 REMOTE_SCAN_REFERENCE_INVALID = "REMOTE_SCAN_REFERENCE_INVALID"
@@ -130,11 +131,18 @@ class ScanPathEscape(ValueError):
     """A scanner candidate escaped the authorized target/root."""
 
 
+class ScanPython3Required(ScanProtocolError):
+    """The remote scanner host does not provide the required Python 3 runtime."""
+
+
 BrowseScanner = Callable[[str, str, BrowseExecutionBudget, DeadlineAwareRemoteTransport], BrowseScanPayload]
 
 
 _SCAN_HELPER_SOURCE = r'''import json, os, sys
-root, depth_limit, item_limit, deadline, target = sys.argv[1:]
+arguments = sys.argv[1:]
+if arguments and arguments[0] == '--':
+    arguments = arguments[1:]
+root, depth_limit, item_limit, deadline, target = arguments
 depth_limit = int(depth_limit)
 item_limit = int(item_limit)
 root = os.path.realpath(root)
@@ -303,6 +311,8 @@ def scan_remote_fastqs(
 ) -> BrowseScanPayload:
     command = build_scan_command(canonical_root, canonical_target, absolute_deadline=runner.absolute_deadline)
     result = runner.execute(transport, command.remote_command)
+    if result.returncode == 46:
+        raise ScanPython3Required(REMOTE_SCAN_PYTHON3_REQUIRED)
     if result.returncode == 44:
         raise ScanPathEscape(REMOTE_PATH_ESCAPE)
     if result.returncode == 45:
@@ -341,10 +351,12 @@ def build_scan_command(
         deadline,
         canonical_target,
     )
+    quoted = " ".join(shlex.quote(value) for value in argv)
+    remote_command = "command -v python3 >/dev/null 2>&1 || exit 46; exec " + quoted
     return ScanCommand(
         argv=argv,
         helper_source=_SCAN_HELPER_SOURCE,
-        remote_command=" ".join(shlex.quote(value) for value in argv),
+        remote_command=remote_command,
         max_depth=MAX_SCAN_DEPTH,
         max_candidates=MAX_SCAN_CANDIDATES,
     )
@@ -795,6 +807,19 @@ def browse_remote_fastqs(
             error_code=REMOTE_PATH_ESCAPE,
             message="Remote browse candidate escaped the approved root.",
         )
+    except ScanPython3Required:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_PYTHON3_REQUIRED,
+            message="Remote browse requires Python 3 on the server.",
+        )
     except ScanProtocolError:
         return _result(
             context=context,
@@ -969,12 +994,12 @@ def _validate_scan_payload(payload: object) -> None:
         for sample in group.samples:
             if not isinstance(sample, BrowseSampleRow):
                 raise _InvalidScanPayload()
-            if not isinstance(sample.sample_id, str) or not isinstance(sample.fastq_1, str):
+            if not _is_safe_basename(sample.sample_id) or not _is_safe_basename(sample.fastq_1):
                 raise _InvalidScanPayload()
-            if sample.fastq_2 is not None and not isinstance(sample.fastq_2, str):
+            if sample.fastq_2 is not None and not _is_safe_basename(sample.fastq_2):
                 raise _InvalidScanPayload()
         for basename in group.unmatched_basenames:
-            if not isinstance(basename, str):
+            if not _is_safe_basename(basename):
                 raise _InvalidScanPayload()
     if sum(len(group.samples) for group in payload.groups) != payload.sample_count:
         raise _InvalidScanPayload()
@@ -982,3 +1007,11 @@ def _validate_scan_payload(payload: object) -> None:
         raise _InvalidScanPayload()
     if payload.sample_count > MAX_RETURNED_SAMPLES or payload.unmatched_count > MAX_RETURNED_UNMATCHED:
         raise _InvalidScanPayload()
+
+
+def _is_safe_basename(value: object) -> bool:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    return not any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
