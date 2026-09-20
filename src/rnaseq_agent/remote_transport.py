@@ -282,6 +282,7 @@ class DeadlineAwareRemoteTransport(RemoteTransport, Protocol):
         *,
         absolute_deadline: float,
         max_capture_bytes: int,
+        check: bool = False,
     ) -> CommandResult: ...
 
 
@@ -369,6 +370,7 @@ class SystemSSHTransport:
         *,
         absolute_deadline: float,
         max_capture_bytes: int,
+        check: bool = False,
     ) -> CommandResult:
         remaining = _remaining_remote_time(absolute_deadline)
         return run_command_bounded(
@@ -383,6 +385,7 @@ class SystemSSHTransport:
             ],
             timeout_seconds=remaining,
             max_capture_bytes=max_capture_bytes,
+            check=check,
         )
 
     def upload(self, local_paths: Sequence[Path], remote_dir: str) -> CommandResult:
@@ -544,6 +547,7 @@ class ParamikoTransport:
         *,
         absolute_deadline: float,
         max_capture_bytes: int,
+        check: bool = False,
     ) -> CommandResult:
         # The Paramiko implementation already enforces the absolute deadline;
         # this bounded entry point additionally applies the caller's byte cap.
@@ -601,7 +605,8 @@ class ParamikoTransport:
                 channel.close()
             if client is not None:
                 client.close()
-        _raise_for_result(result)
+        if check:
+            _raise_for_result(result)
         return result
 
     def upload(self, local_paths: Sequence[Path], remote_dir: str) -> CommandResult:

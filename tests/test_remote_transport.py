@@ -235,6 +235,31 @@ def test_bracketed_ipv6_password_credential_selects_paramiko_transport() -> None
 
 class SystemSSHTransportTests(unittest.TestCase):
     @patch("rnaseq_agent.remote_transport.run_command_bounded")
+    def test_execute_bounded_preserves_browse_resolution_exit_codes(
+        self,
+        run_command_bounded: MagicMock,
+    ) -> None:
+        exit_codes = iter((44, 45))
+        run_command_bounded.side_effect = lambda *args, **kwargs: (
+            CommandResult([], next(exit_codes), "", "")
+            if kwargs.get("check") is False
+            else (_ for _ in ()).throw(RuntimeError("bounded command checked"))
+        )
+        transport = SystemSSHTransport(SERVER, SSHCredential(mode="system"))
+
+        results = [
+            transport.execute_bounded(
+                f"resolved=$(realpath -e -- /path-{code}) || exit {code}",
+                absolute_deadline=time.monotonic() + 5,
+                max_capture_bytes=1024,
+            )
+            for code in (44, 45)
+        ]
+
+        self.assertEqual([result.returncode for result in results], [44, 45])
+        self.assertIs(run_command_bounded.call_args.kwargs["check"], False)
+
+    @patch("rnaseq_agent.remote_transport.run_command_bounded")
     def test_key_mode_uses_batch_mode_and_private_key(
         self,
         run_command_bounded: MagicMock,
