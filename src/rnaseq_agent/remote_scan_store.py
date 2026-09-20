@@ -398,6 +398,10 @@ def _cleanup(directory: Path, now: datetime) -> None:
 def store_remote_scan(project_dir: Path, result: BrowseResult) -> RemoteScanReference:
     if not result.ok:
         raise ValueError(REMOTE_SCAN_STORE_FAILED)
+    if not _DIGEST_RE.fullmatch(str(result.audit.browse_policy_revision or "")):
+        raise ValueError(REMOTE_SCAN_STORE_FAILED)
+    if not _DIGEST_RE.fullmatch(str(result.audit.identity_digest or "")):
+        raise ValueError(REMOTE_SCAN_STORE_FAILED)
     directory = _store_dir(project_dir)
     now = _now()
     with shared_file_lock(_lock_path(directory)):
