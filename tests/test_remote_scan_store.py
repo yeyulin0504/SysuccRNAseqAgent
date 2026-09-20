@@ -131,6 +131,44 @@ def test_consume_remote_scan_fails_closed_for_revoked_or_changed_root(tmp_path):
             apply=lambda *_: pytest.fail("revoked root reached callback"),
         )
 
+
+def test_consume_remote_scan_rejects_immutable_revision_tamper_and_outside_group(tmp_path):
+    ref, policy, context, group = _stored_case(tmp_path)
+    record = next((tmp_path / ".remote-scans").glob("scan-*.record"))
+    payload = __import__("json").loads(record.read_text(encoding="utf-8"))
+    payload["groups"][0]["canonical_directory"] = "/outside/run"
+    record.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="REMOTE_SCAN_REFERENCE_INVALID"):
+        consume_remote_scan(
+            tmp_path, scan_id=ref.scan_id, result_revision=ref.result_revision,
+            group_id=group.group_id, expected_policy=policy, expected_context=context,
+            apply=lambda *_: pytest.fail("tampered record reached callback"),
+        )
+
+
+def test_remote_scan_record_rejects_duplicate_group_ids(tmp_path):
+    ref, policy, context, group = _stored_case(tmp_path)
+    record = next((tmp_path / ".remote-scans").glob("scan-*.record"))
+    payload = __import__("json").loads(record.read_text(encoding="utf-8"))
+    payload["groups"].append(dict(payload["groups"][0]))
+    record.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="REMOTE_SCAN_REFERENCE_INVALID"):
+        load_remote_scan(tmp_path, scan_id=ref.scan_id)
+
+
+def test_consume_remote_scan_rejects_expiry_tamper(tmp_path):
+    ref, policy, context, group = _stored_case(tmp_path)
+    record = next((tmp_path / ".remote-scans").glob("scan-*.record"))
+    payload = __import__("json").loads(record.read_text(encoding="utf-8"))
+    payload["expires_at"] = "2099-01-01T00:00:00Z"
+    record.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="REMOTE_SCAN_REFERENCE_INVALID"):
+        consume_remote_scan(
+            tmp_path, scan_id=ref.scan_id, result_revision=ref.result_revision,
+            group_id=group.group_id, expected_policy=policy, expected_context=context,
+            apply=lambda *_: pytest.fail("expiry tamper reached callback"),
+        )
+
     calls = []
     ref, policy, context, group = _stored_case(tmp_path / "truncated", truncated=True)
     with pytest.raises(ValueError, match="REMOTE_SCAN_TRUNCATED_ACK_REQUIRED"):

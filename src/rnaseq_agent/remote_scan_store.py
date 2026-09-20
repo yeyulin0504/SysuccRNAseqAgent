@@ -253,6 +253,9 @@ def _record_from_json(value: object) -> StoredRemoteScan:
     if not isinstance(groups_raw, list) or len(groups_raw) > _MAX_GROUPS:
         raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
     groups = tuple(_group_from_json(item) for item in groups_raw)
+    group_ids = [group.group_id for group in groups]
+    if len(set(group_ids)) != len(group_ids):
+        raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
     if type(value["truncated"]) is not bool:
         raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
     created_at = _strict_timestamp(value["created_at"])
@@ -290,6 +293,26 @@ def _revision(*, result: BrowseResult, groups: tuple[BrowseDirectoryGroup, ...])
         "root_id": result.audit.root_id, "policy": result.audit.browse_policy_revision,
         "canonical_target": result.audit.canonical_target, "groups": [_group_to_json(g) for g in groups],
         "truncated": result.truncated,
+    }
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _stored_revision(scan: StoredRemoteScan) -> str:
+    value = {
+        "scan_id": scan.scan_id,
+        "source_ref": scan.source_ref,
+        "project_id": scan.project_id,
+        "thread_id": scan.thread_id,
+        "source": scan.source,
+        "identity_digest": scan.identity_digest,
+        "root_id": scan.root_id,
+        "policy": scan.browse_policy_revision,
+        "canonical_target": scan.canonical_target,
+        "groups": [_group_to_json(group) for group in scan.groups],
+        "truncated": scan.truncated,
+        "created_at": scan.created_at,
+        "expires_at": scan.expires_at,
     }
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -421,12 +444,13 @@ def store_remote_scan(project_dir: Path, result: BrowseResult) -> RemoteScanRefe
         groups = tuple(result.groups)
         created = _iso(now); expires = _iso(now + timedelta(seconds=REMOTE_SCAN_TTL_SECONDS))
         scan = StoredRemoteScan(
-            scan_id, source_ref, _revision(result=result, groups=groups), result.audit.project_id,
+            scan_id, source_ref, "", result.audit.project_id,
             result.audit.thread_id, result.audit.source, result.audit.identity_digest,
             str(result.audit.root_id or ""), str(result.audit.browse_policy_revision or ""),
             str(result.audit.canonical_target or ""), groups, result.truncated, created, expires,
             "pending", None, None, None, None, None,
         )
+        scan = _replace_scan(scan, result_revision=_stored_revision(scan))
         record_path = remote_scan_lookup_path(directory, scan_id, kind="scan")
         alias = remote_scan_lookup_path(directory, source_ref, kind="source")
         try:
@@ -552,6 +576,8 @@ def consume_remote_scan(
             raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
         if scan.result_revision != result_revision:
             raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
+        if scan.result_revision != _stored_revision(scan):
+            raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
         if _parse(scan.expires_at) <= now:
             expired = _replace_scan(
                 scan,
@@ -568,6 +594,8 @@ def consume_remote_scan(
             raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
         group = groups[group_id]
         _validate_group_for_apply(group)
+        if not contains_posix_path(scan.canonical_target, group.canonical_directory):
+            raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)
         if scan.truncated and not accept_truncated:
             # There is no stable dedicated truncation code in the fixed
             # contract; a conflict is the HTTP-safe refusal for missing

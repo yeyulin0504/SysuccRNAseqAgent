@@ -136,6 +136,34 @@ STATIC_DIR = Path(__file__).resolve().parent / "webstatic"
 TEMPLATES_DIR = Path(__file__).resolve().parent / "webtemplates"
 
 
+def _atomic_project_json_write(config_path: Path, payload: dict[str, Any]) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".project.json.", dir=str(config_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, config_path)
+        temp_name = ""
+        if os.name != "nt":
+            dir_fd = os.open(config_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_name:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+
+
 def _default_workspace_dir() -> Path:
     return Path("runs/workspace")
 
@@ -3869,6 +3897,9 @@ def create_app(
             receipts = current.get("remote_scan_apply_receipts")
             if not isinstance(receipts, list):
                 receipts = []
+            unresolved = current.get("remote_scan_apply_unresolved_claims")
+            if not isinstance(unresolved, list):
+                unresolved = []
             for receipt in receipts:
                 if isinstance(receipt, dict) and receipt.get("apply_claim_id") == claim_id:
                     return current
@@ -3917,39 +3948,18 @@ def create_app(
                     "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
                 }
             )
-            updated["remote_scan_apply_receipts"] = receipts[-32:]
+            if claim_id not in unresolved:
+                unresolved.append(claim_id)
+            unresolved = [item for item in unresolved if isinstance(item, str)][-32:]
+            protected = [item for item in receipts if isinstance(item, dict) and item.get("apply_claim_id") in unresolved]
+            ordinary = [item for item in receipts if item not in protected]
+            updated["remote_scan_apply_receipts"] = (protected + ordinary[-max(0, 32 - len(protected)):])[-32:]
+            updated["remote_scan_apply_unresolved_claims"] = unresolved
             return updated
-
-        def atomic_project_write(payload: dict[str, Any]) -> None:
-            project_dir.mkdir(parents=True, exist_ok=True)
-            fd, temp_name = tempfile.mkstemp(prefix=".project.json.", dir=str(project_dir))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    fd = -1
-                    json.dump(payload, handle, ensure_ascii=False, indent=2)
-                    handle.write("\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp_name, config_path)
-                temp_name = ""
-                if os.name != "nt":
-                    dir_fd = os.open(project_dir, os.O_RDONLY)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-            finally:
-                if fd >= 0:
-                    os.close(fd)
-                if temp_name:
-                    try:
-                        os.unlink(temp_name)
-                    except FileNotFoundError:
-                        pass
 
         with project_state_lock(config_path):
             current = load_json(config_path) if config_path.is_file() else {}
-            atomic_project_write(mutate(current))
+            _atomic_project_json_write(config_path, mutate(current))
 
         # A scan can be applied to a project created from the workspace page,
         # where project.json/session.json do not exist yet.  Create the normal
@@ -3979,11 +3989,30 @@ def create_app(
         scan_id = payload.get("scan_id")
         result_revision = payload.get("result_revision")
         group_id = payload.get("group_id")
-        accept_truncated = bool(payload.get("accept_truncated", False))
+        accept_truncated_raw = payload.get("accept_truncated", False)
+        if not isinstance(accept_truncated_raw, bool):
+            return JSONResponse(
+                {"ok": False, "error_code": "REMOTE_SCAN_REFERENCE_INVALID", "message": "accept_truncated 必须是布尔值。"},
+                status_code=400,
+            )
+        accept_truncated = accept_truncated_raw
         if not all(isinstance(value, str) and value for value in (scan_id, result_revision, group_id)):
             return JSONResponse({"ok": False, "error_code": "REMOTE_SCAN_REFERENCE_INVALID", "message": "缺少有效的 scan_id、result_revision 或 group_id。"}, status_code=400)
 
         try:
+            applied_claim: dict[str, str] = {}
+
+            def apply_selected(selected: Any, claim: str) -> None:
+                applied_claim["id"] = claim
+                _apply_remote_scan_group(
+                    project_id,
+                    project_dir,
+                    selected,
+                    claim,
+                    scan_id=scan_id,
+                    result_revision=result_revision,
+                )
+
             with locked_browse_policy() as policy:
                 group = consume_remote_scan(
                     project_dir,
@@ -3993,14 +4022,7 @@ def create_app(
                     expected_policy=policy,
                     expected_context=BrowseContext(project_id, None, "workbench"),
                     accept_truncated=accept_truncated,
-                    apply=lambda selected, claim: _apply_remote_scan_group(
-                        project_id,
-                        project_dir,
-                        selected,
-                        claim,
-                        scan_id=scan_id,
-                        result_revision=result_revision,
-                    ),
+                    apply=apply_selected,
                 )
         except ValueError as exc:
             code = str(exc) or "REMOTE_SCAN_REFERENCE_INVALID"
@@ -4041,6 +4063,22 @@ def create_app(
             # The scan receipt/project write is authoritative.  History is a
             # bounded de-identified projection and must not turn a consumed
             # result into a misleading failed response.
+            pass
+        # The scan record is terminal now; clear this claim from the
+        # project-side unresolved set.  If a process exits before this small
+        # projection update, the claim remains protected from pruning and a
+        # retry can safely reconcile it.
+        try:
+            config_path = project_dir / "project.json"
+            with project_state_lock(config_path):
+                current = load_json(config_path)
+                unresolved = [
+                    item for item in (current.get("remote_scan_apply_unresolved_claims") or [])
+                    if item != applied_claim.get("id")
+                ]
+                current["remote_scan_apply_unresolved_claims"] = unresolved[-32:]
+                _atomic_project_json_write(config_path, current)
+        except OSError:
             pass
         session = _session_for(project_dir)
         return {

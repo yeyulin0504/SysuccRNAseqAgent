@@ -439,6 +439,19 @@ def test_remote_scan_apply_persists_filename_only_group_and_rejects_replay(tmp_p
     assert replay.json()["error_code"] == "REMOTE_SCAN_REFERENCE_USED"
 
 
+def test_remote_scan_apply_rejects_string_truncation_ack(tmp_path: Path) -> None:
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    _create_project(client, token, "wiz_ack")
+    response = client.post(
+        "/api/projects/wiz_ack/fastq/scan-apply",
+        json={"scan_id": "scan_" + "a" * 32, "result_revision": "sha256:" + "a" * 64, "group_id": "g", "accept_truncated": "false"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 400
+    assert response.json()["error_code"] == "REMOTE_SCAN_REFERENCE_INVALID"
+
+
 def test_fastq_session_rejects_samples_not_a_list(tmp_path: Path) -> None:
     """Finding 1：samples 传 dict 而非 list → INVALID_SAMPLES，不得 500."""
     client = TestClient(create_app(project_dir=tmp_path / "legacy"))
