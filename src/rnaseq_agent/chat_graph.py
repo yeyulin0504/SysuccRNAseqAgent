@@ -100,6 +100,7 @@ from .model_disclosure import PreparedModelRequest, ProviderCredentials, Provide
 from .model_provider import ModelProviderGateway, normalize_provider_config, provider_identity
 from .model_context import (
     EphemeralToolCallStore,
+    ModelContextBuilder,
     project_assistant_tool_call,
     project_tool_arguments_for_model,
     project_tool_result_for_model,
@@ -293,6 +294,88 @@ SYSTEM_PROMPT = (
 
 
 # -- LLM 调用 ---------------------------------------------------------------
+
+
+def _provider_messages_for_model(
+    llm_config: dict[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    project_dir: Path | None,
+    project_id: str,
+    thread_id: str,
+) -> tuple[list[dict[str, Any]], Any]:
+    """Build a summary-bound provider history while retaining tool-call shape.
+
+    ``ModelContextBuilder`` owns the project projection.  The graph still needs
+    to retain assistant ``tool_calls`` and tool replies for protocol continuity,
+    so those fields are copied only after the builder has supplied the bounded
+    project summary and fixed system context.
+    """
+    llm_block = llm_config.get("llm", llm_config)
+    if not isinstance(llm_block, dict):
+        llm_block = {}
+    model = str(llm_block.get("model") or "").strip() or "gpt-4o-mini"
+    config = normalize_provider_config(
+        {
+            "provider": llm_block.get("provider") or "openai",
+            "api_base": llm_block.get("api_base"),
+            "model": model,
+            "api_mode": llm_block.get("api_mode") or "chat_completions",
+            "backend": llm_block.get("backend") or "api",
+        }
+    )
+    system_prompt = next(
+        (
+            str(item.get("content") or "")
+            for item in messages
+            if isinstance(item, dict) and item.get("role") == "system"
+        ),
+        SYSTEM_PROMPT,
+    )
+    context = ModelContextBuilder.build(
+        project_dir=project_dir,
+        project_id=project_id,
+        thread_id=thread_id,
+        provider=config,
+        system_prompt=system_prompt,
+        current_user_message="",
+        durable_messages=(),
+        claimed_grant=None,
+    )
+    provider_messages = [
+        dict(item)
+        for item in context.messages
+        if not (item.get("role") == "user" and not str(item.get("content") or ""))
+    ]
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") == "system":
+            continue
+        projected_message = dict(message)
+        calls = projected_message.get("tool_calls")
+        if isinstance(calls, list):
+            safe_calls: list[dict[str, Any]] = []
+            for item in calls:
+                if not isinstance(item, dict):
+                    continue
+                function = item.get("function") if isinstance(item.get("function"), dict) else {}
+                safe_calls.append(
+                    {
+                        "id": str(item.get("id") or ""),
+                        "type": "function",
+                        "function": {
+                            "name": str(function.get("name") or ""),
+                            "arguments": str(function.get("arguments") or "{}"),
+                        },
+                    }
+                )
+            projected_message["tool_calls"] = safe_calls
+        projected_message.pop("call_ref", None)
+        projected_message.pop("tool_projection_version", None)
+        projected_message.pop("arguments_hash", None)
+        if projected_message.get("role") == "tool":
+            projected_message["content"] = _safe_provider_content(projected_message.get("content"))
+        provider_messages.append(projected_message)
+    return provider_messages, config
 
 
 def _chat_endpoint(llm_config: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -724,29 +807,13 @@ def build_chat_graph(
             runtime_block = {}
             runtime_llm_config["llm"] = runtime_block
         runtime_block["tool_mode"] = _live_tool_mode()
-        provider_messages: list[dict[str, Any]] = []
-        for message in messages:
-            projected_message = dict(message)
-            calls = projected_message.get("tool_calls")
-            if isinstance(calls, list):
-                safe_calls: list[dict[str, Any]] = []
-                for item in calls:
-                    if not isinstance(item, dict):
-                        continue
-                    function = item.get("function") if isinstance(item.get("function"), dict) else {}
-                    safe_calls.append({
-                        "id": str(item.get("id") or ""),
-                        "type": "function",
-                        "function": {
-                            "name": str(function.get("name") or ""),
-                            "arguments": str(function.get("arguments") or "{}"),
-                        },
-                    })
-                projected_message["tool_calls"] = safe_calls
-            projected_message.pop("call_ref", None)
-            projected_message.pop("tool_projection_version", None)
-            projected_message.pop("arguments_hash", None)
-            provider_messages.append(projected_message)
+        provider_messages, _provider_config = _provider_messages_for_model(
+            runtime_llm_config,
+            messages,
+            project_dir=Path(state.get("project_dir") or "") if state.get("project_dir") else None,
+            project_id=str(state.get("project_id") or ""),
+            thread_id=str(state.get("thread_id") or ""),
+        )
         for kind, payload in _stream_chat_completion(
             runtime_llm_config, provider_messages, timeout=timeout
         ):

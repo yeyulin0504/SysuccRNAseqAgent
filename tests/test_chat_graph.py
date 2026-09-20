@@ -250,6 +250,42 @@ class TestToolContract:
         assert "record_qc_decision" not in names
 
 
+def test_provider_messages_use_summary_context_without_exact_project_values(tmp_path: Path) -> None:
+    (tmp_path / "project.json").write_text(
+        json.dumps(
+            {
+                "route": {"id": "bulk_rna"},
+                "samples": [
+                    {
+                        "sample_id": "PATIENT_SENTINEL_73",
+                        "condition": "control",
+                        "fastq_1": "/restricted/SENTINEL_73/TUMOR_SENTINEL_R1.fastq.gz",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    messages = [
+        {"role": "system", "content": cg.SYSTEM_PROMPT},
+        {"role": "user", "content": "请查看项目状态"},
+    ]
+
+    provider_messages, _config = cg._provider_messages_for_model(
+        {"llm": {"api_base": "http://provider.test", "model": "m", "provider": "openai"}},
+        messages,
+        project_dir=tmp_path,
+        project_id="p1",
+        thread_id="t1",
+    )
+
+    serialized = json.dumps(provider_messages, ensure_ascii=False)
+    assert "PATIENT_SENTINEL_73" not in serialized
+    assert "TUMOR_SENTINEL_R1.fastq.gz" not in serialized
+    assert "/restricted/SENTINEL_73" not in serialized
+    assert any(item.get("role") == "user" and item.get("content") == "请查看项目状态" for item in provider_messages)
+
+
 class TestConfirmationPolicy:
     """用户 2026-09-16 定的确认边界：配置合并、执行单独。"""
 
