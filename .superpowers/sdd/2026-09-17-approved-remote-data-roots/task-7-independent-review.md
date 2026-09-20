@@ -69,3 +69,22 @@ re-enabled by this commit.
 上述 blocker 已在后续工作区修复：`_stored_revision()` 重新计算所有不可变绑定字段（包括 scan/source ids、identity、policy、target、groups、truncation、created/expiry）；记录中的重复 group id、篡改 expiry/group、越过 scan target 的目录会 fail closed；apply endpoint 要求 `accept_truncated` 是 JSON 布尔值；project callback 记录并精确清理当前 claim，保留 unresolved claim receipt，使用原子 project writer。
 
 新增 tamper、重复 group、string acknowledgment 和 apply/replay 测试；scoped follow-up 为 `11 passed`。旧版本（`3b0a4d5` 之前）尚未消费的 record 使用不同 revision 公式，当前按完整性不确定直接返回 `REMOTE_SCAN_REFERENCE_INVALID`，不会迁移或扩大权限；其 TTL 清理仍可将过期记录转为 bounded tombstone。这是显式 fail-closed 迁移策略。
+
+## Final scoped re-review at `f9104e5`（2026-09-21）
+
+完整性 follow-up 已经落入 `f9104e5`，并关闭了前一节列出的四个 blocker：revision 重算覆盖不可变绑定字段、group target containment/重复 group id、unresolved claim 保留与精确清理、严格 boolean truncation acknowledgment。当前包含 follow-up 工作区改动的专项运行结果为 `22 passed, 69 deselected`，`compileall` 和 `git diff --check` 通过。
+
+在 `f9104e5` 提交快照中仍有一个发布门禁缺口：apply endpoint 对非权威 History projection 只捕获 `OSError`。`append_history` 读取损坏的 `history.json` 时可以抛出 `JSONDecodeError`，测试注入也可能抛出其他异常；此时 scan 已经 consumed、project receipt 已经 durable，但 HTTP 请求仍可能返回 500，重试只会得到 `REMOTE_SCAN_REFERENCE_USED`。工作区已有将此处改为 `except Exception` 的一行 follow-up，且专项测试仍为 `22 passed`；提交该 follow-up 后，Task 7 cases 44–48 可判 **PASS**。在该一行修复尚未提交前，本次 scoped review 保留 **BLOCKER** 结论。
+
+`save_intake` 失败后的 projection repair 和 project writer 对 private-file helper/Windows replace retry 的加固属于后续 hardening；它们不改变已验证的 filename-only、opaque receipt、claim recovery 和 workbench-only context 契约，但应在 Task 8 兼容性/发布门禁中继续覆盖。
+
+## Re-review after the current follow-up（2026-09-21）
+
+当前工作区 follow-up 已包含 exact claim capture/atomic unresolved cleanup、`except Exception` 的 History projection 处理，以及对旧 revision record 的显式 fail-closed 说明。复核结果：
+
+- `consume_remote_scan` 的 callback claim 会写入本次实际 `claim_id`，成功后只从 unresolved ledger 移除该 claim；receipt pruning 不会丢失仍处于 `applying` 的 claim。
+- apply History 写入失败（包括非 `OSError` 异常）不会回滚已消费的 scan 或把成功 apply 变成失败响应。
+- 旧公式生成的 pending record 在新 `_stored_revision` 校验下返回 `REMOTE_SCAN_REFERENCE_INVALID`，不会被迁移、延长或执行。
+- 专项 focused run：`22 passed, 69 deselected, 1 warning`；`compileall` 与 `git diff --check` 通过。
+
+因此，Task 7 cases 44–48 在当前 follow-up 完整后判定 **PASS**。`save_intake` projection repair、private-file helper/Windows replace retry，以及两项 Task 6 旧 browse 测试仍属于 Task 8/后续 hardening，不改变本次 Task 7 结论。该 PASS 以当前 follow-up 纳入最终提交为前提。

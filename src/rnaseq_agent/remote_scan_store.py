@@ -548,6 +548,9 @@ def consume_remote_scan(
     The callback owns its own idempotent project receipt; once it returns, the
     record is durably marked ``consumed``.
     """
+    # Records written before the immutable-revision formula was introduced do
+    # not carry enough authenticated fields to prove expiry/target integrity;
+    # they intentionally fail closed and must be rescanned.
     _validate_identifier(scan_id, "scan")
     if not isinstance(result_revision, str) or not result_revision.startswith("sha256:"):
         raise _scan_error(REMOTE_SCAN_REFERENCE_INVALID)

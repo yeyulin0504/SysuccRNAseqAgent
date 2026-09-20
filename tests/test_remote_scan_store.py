@@ -169,6 +169,21 @@ def test_consume_remote_scan_rejects_expiry_tamper(tmp_path):
             apply=lambda *_: pytest.fail("expiry tamper reached callback"),
         )
 
+
+def test_legacy_revision_record_fails_closed_and_requires_rescan(tmp_path):
+    ref, policy, context, group = _stored_case(tmp_path)
+    record = next((tmp_path / ".remote-scans").glob("scan-*.record"))
+    payload = __import__("json").loads(record.read_text(encoding="utf-8"))
+    # The pre-integrity formula omitted immutable scan/source/timestamp fields.
+    payload["result_revision"] = "sha256:" + "b" * 64
+    record.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="REMOTE_SCAN_REFERENCE_INVALID"):
+        consume_remote_scan(
+            tmp_path, scan_id=ref.scan_id, result_revision=payload["result_revision"],
+            group_id=group.group_id, expected_policy=policy, expected_context=context,
+            apply=lambda *_: pytest.fail("legacy record reached callback"),
+        )
+
     calls = []
     ref, policy, context, group = _stored_case(tmp_path / "truncated", truncated=True)
     with pytest.raises(ValueError, match="REMOTE_SCAN_TRUNCATED_ACK_REQUIRED"):

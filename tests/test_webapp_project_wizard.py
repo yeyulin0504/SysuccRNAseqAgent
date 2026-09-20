@@ -758,8 +758,7 @@ def test_command_scan_failure_skips_history_and_reports_error(tmp_path: Path) ->
     assert resp.status_code == 200, body
 
     assert body.get("ok") is False
-    assert body.get("error_code") == "NOT_EVALUABLE", body
-    assert "绝对 POSIX 路径" in body.get("message", "")
+    assert body.get("error_code") == "REMOTE_PATH_INVALID", body
     # 失败不得写入假成功的 fastq_scan/ready 审计事实。
     types = _read_history_types(tmp_path / project_id)
     assert "fastq_scan" not in types, types
@@ -784,27 +783,39 @@ def test_command_rejects_non_dict_json_body(tmp_path: Path) -> None:
     assert "JSON 对象" in body.get("message", "")
 
 
-def test_command_scan_success_records_fastq_scan_history(
+def test_command_scan_with_approved_root_uses_central_browse_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Task 6 修复回归：scan 成功分支仍必须写 fastq_scan/ready 审计 history.
-
-    打桩 _scan_remote_samples 返回 ok=True（避免真实 SSH），验证 ok 分支
-    的既有行为没有被这次修复破坏。
-    """
+    """Approved-root command scans use the shared browse envelope."""
+    monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
     import rnaseq_agent.webapp as webapp
+    from rnaseq_agent.connection_store import ApprovedDataRoot, approve_data_root, load_browse_policy, save_connection
+    from rnaseq_agent.execution import CommandResult
+    from rnaseq_agent.remote_browse import BrowseDirectoryGroup, BrowseSampleRow, BrowseScanPayload
+    from rnaseq_agent.ssh_identity import SSHIdentity
 
+    save_connection({"host": "h.example", "user": "alice", "port": 22})
+    policy = load_browse_policy()
+    approve_data_root(
+        ApprovedDataRoot("root_cmd", "h.example", "alice", 22, "/data/team", "/srv/team", "2026-01-01T00:00:00Z", None),
+        expected_revision=policy.revision,
+    )
+
+    class Transport:
+        def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes, check=False):
+            output = "/srv/team\n" if "/data/team" in command else "/srv/team/reads\n"
+            return CommandResult([], 0, output, "", len(output.encode()))
+
+    monkeypatch.setattr(webapp, "create_remote_transport", lambda config: Transport())
     monkeypatch.setattr(
         webapp,
-        "_scan_remote_samples",
-        lambda config, remote_dir: {
-            "ok": True,
-            "scanned_path": remote_dir,
-            "samples": [
-                {"sample_id": "CTRL_1", "fastq_1": "CTRL_1_R1.fastq.gz", "fastq_2": "CTRL_1_R2.fastq.gz"},
-                {"sample_id": "CASE_1", "fastq_1": "CASE_1_R1.fastq.gz", "fastq_2": "CASE_1_R2.fastq.gz"},
-            ],
-        },
+        "scan_remote_fastqs",
+        lambda target, root, runner, transport: BrowseScanPayload(
+            (BrowseDirectoryGroup("group_cmd", "/srv/team/reads", (BrowseSampleRow("S1", "S1_R1.fastq.gz", "S1_R2.fastq.gz"),), ()),),
+            1,
+            0,
+            False,
+        ),
     )
 
     client = TestClient(create_app(project_dir=tmp_path / "legacy"))
@@ -822,6 +833,4 @@ def test_command_scan_success_records_fastq_scan_history(
 
     assert body.get("ok") is True, body
     assert body["action"] == "scan_remote_fastq"
-    assert body["history"][-1]["type"] == "fastq_scan"
-    assert body["history"][-1]["state"] == "ready"
-    assert body["history"][-1]["details"]["sample_count"] == 2
+    assert body["groups"][0]["canonical_directory"] == "/srv/team/reads"

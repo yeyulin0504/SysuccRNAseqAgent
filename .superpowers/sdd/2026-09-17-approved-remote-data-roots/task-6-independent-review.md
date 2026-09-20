@@ -72,3 +72,21 @@
 本轮新增/修复了：disabled LLM browse 进入统一 wrapper 并保留一次 `security_audit`、rule-chat disabled 分支不再提前短路、旧 `_scan_remote_samples` 改为统一 wrapper 的 compatibility shim、scan alias/source_ref 重新绑定检查、严格 scan record schema、scan short-write loop、audit fixed-schema parser/reconciliation、legacy dict provider/log projection，以及 chat/chat-stream 的显式未知项目 404。
 
 Fix round focused evidence：`8 passed`（新增 alias/schema/disabled/sentinel tests），并通过 `compileall` 与 `git diff --check`。Task7 的 `consume_remote_scan`/apply 未纳入本轮提交。
+
+## Scoped re-review: `34dfe38`（2026-09-21）
+
+审查对象是提交 `34dfe38 fix: close remote browse audit and disclosure boundaries` 的提交快照；当前工作区中的 `src/rnaseq_agent/remote_scan_store.py`、`tests/test_remote_scan_store.py` 和 `src/rnaseq_agent/webapp.py` 未提交部分属于 Task 7/后续修复，不计入本次结论。
+
+结论：**BLOCKER，不能通过 Task 6 scoped review**。
+
+逐项结论如下：
+
+1. **Disabled rule/LLM browse：PASS。** `_run_tool` 在通用 `tool_mode_block` 之前进入 `_execute_browse_attempt`，并传入实时模式；rule-chat 的 `_rule_intent_mode_block` 对 `browse_samples` 让出给 `_browse_samples_reply`。disabled 分支只构造 `TOOL_MODE_DISABLED` 的审计结果，不读取 policy、credential 或 transport；生产路径随后由 `_finalize_tool_execution_result` 写入一次 authoritative audit。现有新增测试也确认返回 `ToolExecutionResult` 和审计对象。
+2. **旧 scanner：PASS。** `webapp.py` 中的 `_scan_remote_samples` 已退化为调用共享 wrapper 的兼容 shim；workbench、project command、rule chat 和 LLM executor 的生产路径均直接进入 `_execute_browse_attempt`，不再保留第二套 `find`/`detect_fastq_pairs` 扫描实现。
+3. **Scan alias/record schema：BLOCKER。** `34dfe38` 没有修改 `remote_scan_store.py`。提交快照中的 `_record_from_json` 仍以 `str()`/`bool()` 强制转换、允许缺省字段并过滤 malformed sample；`load_remote_scan(source_ref=...)` 只读取 alias 的 `scan_id`，没有校验 alias 的字段集合、`source_ref` 与查询值相等，也没有重新验证 record 的 `source_ref` 绑定。因此 `src_A -> scan_B` 的篡改仍可返回 B 的 exact scan。当前工作区虽有未提交的严格 schema/alias 修复，但不能作为本提交证据。
+4. **Scan short-write/publication recovery：BLOCKER。** 提交快照的 `_write_atomic` 对 record/alias 只调用一次 `handle.write(raw)`，不能处理 prefix/short write；alias 发布失败后的回滚仍直接 `unlink` 两个路径，也没有 verified cleanup/reconciliation 矩阵。相关短写和发布故障修复仍在未提交的 scan-store diff 中。
+5. **Audit parser/reconcile：PARTIAL，按发布门禁仍为 BLOCKER。** 固定字段集合、重复 JSON key、事件 id、文件名 digest、类型/数量边界、canonical bytes 和 post-publish file/directory fsync reconciliation 已实现，故原先的“裸 `json.loads`/无 reconcile”缺口已关闭。可是计划要求的 malformed published record 的 bounded quarantine/recovery 尚未实现；`reconcile_browse_audit` 将这类记录压成 `uncertain`，没有显式 quarantine/repair 状态。此外 `_finalize_tool_execution_result` 把 `_record_browse_audit` 与 `append_history` 放在同一个 `try` 中：audit 已成功而 History 写入失败时仍返回 `REMOTE_SECURITY_AUDIT_FAILED` 并可能 discard scan，违反“History 失败不重试/不回滚已提交 audit”的契约。相关故障注入测试也未在本提交中加入。
+6. **Non-browse four-channel contract：PARTIAL。** `_legacy_model_projection` 已阻断样本名、FASTQ 路径、报告路径等进入 provider message 和 generic `tool_log`，新增 sentinel 测试覆盖了这一点。可是 `_run_tool` 的非 browse 分支仍返回普通 dict，尚未统一为 `ToolExecutionResult(local, model, log_projection, security_audit)`；这仍是 Task 6 Step 9 的残余契约缺口。作为泄露修复它是有效缓解，作为完整四通道门禁不能标 PASS。
+7. **Explicit project binding：BLOCKER。** `/api/chat`、`/api/samples/scan-remote` 和 project command 已对显式未知项目返回 `PROJECT_NOT_FOUND`，但 `34dfe38` 的 `/api/chat/stream` 没有同样的早期检查。它仍先调用 `_legacy_dir_for`；`_bound_project_id` 对未知 id 返回 `None`，随后回退到 legacy project。带有未知 `project_id` 的流式 rule/LLM browse 因此可能在 legacy 项目上继续执行，违反“unknown explicit id never falls back”。当前工作区未提交 diff 才补上了 stream 检查。
+
+本次复审的阻断项是 3、4、5、7；6 是必须继续收敛的契约债务。应先提交严格 scan-store 协议、stream project resolver、audit/History failure separation 和相应故障注入测试，再重新运行完整 Task 6 入口/审计门禁；不能把当前工作区中的未提交修复或 `150 passed` 的排除旧测试结果当作 `34dfe38` 的 GREEN 证据。

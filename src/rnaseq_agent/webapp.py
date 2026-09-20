@@ -4059,7 +4059,7 @@ def create_app(
                     "details": {"sample_count": len(group.samples), "directory_count": 1},
                 },
             )
-        except OSError:
+        except Exception:
             # The scan receipt/project write is authoritative.  History is a
             # bounded de-identified projection and must not turn a consumed
             # result into a misleading failed response.

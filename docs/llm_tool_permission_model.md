@@ -79,6 +79,36 @@ provider 请求最终都由同一 `ModelContextBuilder` 通过显式 allowlist �
 前检查已知凭据和私钥标记。详细设计见
 `docs/superpowers/specs/2026-09-17-llm-data-disclosure-design.md`。
 
+## 三个相互独立的权限轴
+
+远程数据根、工具模式和模型数据披露回答的是三个不同问题，不能由模型调用一个
+工具互相提升：
+
+| 权限轴 | 要回答的问题 | 唯一授权方 |
+|---|---|---|
+| Approved remote root | 当前 SSH 身份是否可以扫描这个远程目录？ | Settings 中的 approved-root 生命周期 |
+| `tool_mode` | 规则/LLM 逻辑是否可以调用这类工具？ | 用户级 live tool-mode 设置 |
+| `data_scope` | provider 这一轮可以收到哪些精确项目数据？ | 独立的数据披露授权 |
+
+Settings 是创建、扩大和撤销 approved root 的唯一入口。项目 JSON、对话确认卡、模型
+工具参数和通用连接编辑都不能自动迁移或写入 root。结构化本地工作台可以显示已获批
+扫描的精确目录与文件名；provider 默认仍只收到去标识的数量、状态和组计数，除非
+另有绑定 project、thread、provider、字段类别与 revision 的一次性披露授权。
+
+远程浏览统一返回四个通道：`local` 仅供当前请求和结构化 UI 使用，`model` 是 provider
+安全摘要，`log_projection` 是唯一允许进入通用工具日志的内容，`security_audit` 只交给
+独立审计 owner 完成一次权威提交。审计提交失败时 exact scan reference 必须撤销或保留
+为可 reconciliation 的 uncertain 状态；History 只是去标识显示投影，不能替代审计记录，
+也不能在审计已提交后把一次成功误改成失败。
+
+Workbench 的 remote scan apply 只接受服务器构造的
+`BrowseContext(project_id, None, "workbench")`。浏览器提交的 `scan_id`、
+`result_revision`、`group_id` 和截断确认会在 private scan store 中重新验证；目录、样本
+行、当前身份、approved root 与 policy revision 都不以浏览器 JSON 为 authority。整个
+bounded scan 的 `source_ref` 指向全部目录组，不能通过客户端挑选子集重写结果。一次
+apply 先持久化 claim，再在 project state 中原子写入 filename-only FASTQ 和 opaque receipt，
+最后把 scan 标记为 consumed；崩溃重试复用同一 claim，避免重复写入。
+
 ## 三级策略
 
 | 策略 | 适用范围 | 行为 |
