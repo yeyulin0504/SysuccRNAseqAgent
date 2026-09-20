@@ -91,6 +91,89 @@ def _bounded_json(value: Any) -> dict[str, Any]:
     return value
 
 
+def _bounded_response_json(response: Any) -> dict[str, Any]:
+    """Parse a provider JSON response only after enforcing the wire-size cap."""
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            declared = int(headers.get("Content-Length", "0") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > MAX_RESPONSE_BYTES:
+            raise ValueError("provider response exceeds size limit")
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_content):
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            piece = bytes(chunk)
+            total += len(piece)
+            if total > MAX_RESPONSE_BYTES:
+                raise ValueError("provider response exceeds size limit")
+            chunks.append(piece)
+        if chunks:
+            return _bounded_json(json.loads(b"".join(chunks).decode("utf-8")))
+    raw = getattr(response, "content", None)
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ValueError("provider response exceeds size limit")
+        return _bounded_json(json.loads(bytes(raw).decode("utf-8")))
+    data = _bounded_json(response.json())
+    if len(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise ValueError("provider response exceeds size limit")
+    return data
+
+
+def _bounded_text(value: Any) -> str:
+    text = str(value or "")
+    if len(text.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise ValueError("provider response text exceeds size limit")
+    return text
+
+
+def _responses_reply(data: dict[str, Any], *, reject_tools: bool) -> tuple[str, list[Any]]:
+    """Extract bounded Responses text, checking nested official output items first."""
+    tool_calls: list[Any] = []
+    output = data.get("output")
+    if isinstance(data.get("tool_calls"), list):
+        tool_calls.extend(data["tool_calls"])
+    if isinstance(data.get("function_calls"), list):
+        tool_calls.extend(data["function_calls"])
+    texts: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in {"function_call", "tool_call", "computer_call"}:
+                tool_calls.append(item)
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type") or "").strip().lower()
+                if part_type in {"function_call", "tool_call", "function_call_output"}:
+                    tool_calls.append(part)
+                elif part_type == "output_text" and isinstance(part.get("text"), str):
+                    texts.append(_bounded_text(part["text"]))
+    if tool_calls and reject_tools:
+        raise ProviderRequestError(
+            "精确请求返回了工具调用。",
+            code=MODEL_EXACT_TOOL_CALL_REJECTED,
+            transmission_started=True,
+        )
+    if texts:
+        text = _bounded_text("\n".join(texts))
+    else:
+        text = _bounded_text(data.get("output_text") or data.get("text") or "")
+    return text, tool_calls
+
+
 class ModelProviderGateway:
     """Single boundary for all generative provider transports."""
 
@@ -118,7 +201,7 @@ class ModelProviderGateway:
             response = requests.post(endpoint, headers=headers, data=body, timeout=request.timeout_seconds)
             if getattr(response, "status_code", 0) < 200 or getattr(response, "status_code", 0) >= 300:
                 raise _request_error(f"模型接口返回 HTTP {getattr(response, 'status_code', 0)}。", started=started)
-            data = _bounded_json(response.json())
+            data = _bounded_response_json(response)
             choices = data.get("choices") or []
             message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
             text = str((message or {}).get("content") or "")
@@ -205,12 +288,11 @@ class ModelProviderGateway:
         started = False
         try:
             started = True
-            response = requests.post(endpoint, headers=headers, data=body, timeout=request.timeout_seconds)
+            response = requests.post(endpoint, headers=headers, data=body, timeout=request.timeout_seconds, stream=True)
             if getattr(response, "status_code", 0) < 200 or getattr(response, "status_code", 0) >= 300:
                 raise _request_error(f"模型接口返回 HTTP {getattr(response, 'status_code', 0)}。", started=started)
-            data = _bounded_json(response.json())
-            text = str(data.get("output_text") or data.get("text") or "")
-            tool_calls = data.get("tool_calls") or data.get("function_calls") or []
+            data = _bounded_response_json(response)
+            text, tool_calls = _responses_reply(data, reject_tools=request.exact_attempt)
             return ProviderReply(text=text, raw={"text": text, "tool_calls": tool_calls})
         except ProviderRequestError:
             raise
@@ -277,7 +359,13 @@ class ModelProviderGateway:
         request = urllib.request.Request(endpoint, headers={"Authorization": f"Bearer {credentials.api_key}"} if credentials.api_key else {})
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-                data = _bounded_json(json.loads(response.read().decode("utf-8")))
+                try:
+                    raw = response.read(MAX_RESPONSE_BYTES + 1)
+                except TypeError:
+                    raw = response.read()
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise ValueError("provider response exceeds size limit")
+                data = _bounded_json(json.loads(raw.decode("utf-8")))
             rows = data.get("data") or []
             return sorted(str(row.get("id")) for row in rows if isinstance(row, dict) and row.get("id"))
         except Exception as exc:  # noqa: BLE001

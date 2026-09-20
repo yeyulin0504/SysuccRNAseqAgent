@@ -1078,7 +1078,8 @@ class TestWebApp:
         assert get_ssh_credential("10.30.24.1", "yeyulin").password == "in-memory"
 
     def test_llm_test_and_model_list_use_configured_api(self, client, monkeypatch) -> None:
-        import requests
+        from types import SimpleNamespace
+        import rnaseq_agent.webapp as webapp
 
         token = _token(client)
         _new_project(client, token)
@@ -1088,23 +1089,18 @@ class TestWebApp:
             headers=_headers(token),
         )
 
-        class Response:
-            status_code = 200
-            text = ""
-            def __init__(self, payload): self.payload = payload
-            def json(self): return self.payload
-            def raise_for_status(self): return None
+        def fake_list(self, provider, credentials, timeout):
+            assert provider.backend == "openai_compatible"
+            assert provider.api_mode == "chat_completions"
+            assert credentials.api_key == "secret"
+            return ["model-a", "model-b"]
 
-        def fake_get(url, **kwargs):
-            assert url == "https://llm.example/v1/models"
-            return Response({"data": [{"id": "model-b"}, {"id": "model-a"}]})
+        def fake_complete(self, request):
+            assert request.provider.api_base == "https://llm.example/v1"
+            return SimpleNamespace(text="连接正常")
 
-        def fake_post(url, **kwargs):
-            assert url == "https://llm.example/v1/chat/completions"
-            return Response({"choices": [{"message": {"content": "连接正常"}}]})
-
-        monkeypatch.setattr(requests, "get", fake_get)
-        monkeypatch.setattr(requests, "post", fake_post)
+        monkeypatch.setattr(webapp.ModelProviderGateway, "list_models", fake_list)
+        monkeypatch.setattr(webapp.ModelProviderGateway, "complete", fake_complete)
         models = client.get("/api/llm/models", headers=_headers(token)).json()
         tested = client.post("/api/test-llm", headers=_headers(token)).json()
         assert models == {"ok": True, "models": ["model-a", "model-b"]}
@@ -1312,7 +1308,7 @@ class TestWebApp:
             assert f'id="{control_id}"' in page
 
     def test_chat_uses_llm_when_configured(self, client, tmp_path: Path, monkeypatch) -> None:
-        import requests
+        import rnaseq_agent.webapp as webapp
 
         token = _token(client)
         _new_project(client, token)
@@ -1325,21 +1321,14 @@ class TestWebApp:
 
         calls = {}
 
-        def fake_post(url, headers=None, json=None, timeout=None):
-            calls["url"] = url
-            calls["auth"] = headers.get("Authorization")
-            calls["model"] = json["model"]
-            calls["content"] = json["messages"][-1]["content"]
+        def fake_complete(self, request):
+            calls["url"] = request.provider.api_base + "/chat/completions"
+            calls["auth"] = "Bearer " + request.credentials.api_key
+            calls["model"] = request.payload["model"]
+            calls["content"] = request.payload["messages"][-1]["content"]
+            return type("Reply", (), {"text": "你好，我在。"})()
 
-            class FakeResp:
-                status_code = 200
-
-                def json(self):
-                    return {"choices": [{"message": {"content": "你好，我在。"}}]}
-
-            return FakeResp()
-
-        monkeypatch.setattr(requests, "post", fake_post)
+        monkeypatch.setattr(webapp.ModelProviderGateway, "complete", fake_complete)
         resp = client.post(
             "/api/chat",
             json={"message": "你好"},
@@ -1481,7 +1470,7 @@ class TestSharedLlmConfig:
 
     def test_chat_uses_shared_llm_when_project_has_no_config(self, client, monkeypatch) -> None:
         """核心回归：项目尚未创建（无 project.json）时也必须走 LLM。"""
-        import requests
+        import rnaseq_agent.webapp as webapp
 
         from rnaseq_agent.connection_store import save_llm
 
@@ -1499,20 +1488,13 @@ class TestSharedLlmConfig:
 
         calls = {}
 
-        def fake_post(url, headers=None, json=None, timeout=None):
-            calls["url"] = url
-            calls["auth"] = headers.get("Authorization")
-            calls["model"] = json["model"]
+        def fake_complete(self, request):
+            calls["url"] = request.provider.api_base + "/chat/completions"
+            calls["auth"] = "Bearer " + request.credentials.api_key
+            calls["model"] = request.payload["model"]
+            return type("Reply", (), {"text": "我看到了你的问题。"})()
 
-            class FakeResp:
-                status_code = 200
-
-                def json(self):
-                    return {"choices": [{"message": {"content": "我看到了你的问题。"}}]}
-
-            return FakeResp()
-
-        monkeypatch.setattr(requests, "post", fake_post)
+        monkeypatch.setattr(webapp.ModelProviderGateway, "complete", fake_complete)
         resp = client.post(
             "/api/chat",
             json={"message": "RNA-seq 分析一般需要多少生物学重复？"},
@@ -1570,28 +1552,18 @@ class TestSharedLlmConfig:
         assert cfg["llm"]["api_key_set"] is True
 
     def test_llm_models_endpoint_works_with_shared_llm_only(self, client, monkeypatch) -> None:
-        import requests
-
         from rnaseq_agent.connection_store import save_llm
+        import rnaseq_agent.webapp as webapp
 
         token = _token(client)
         save_llm({"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"})
 
-        class Response:
-            status_code = 200
+        def fake_list(self, provider, credentials, timeout):
+            assert provider.backend == "openai_compatible"
+            assert credentials.api_key == "sk-1"
+            return ["model-a", "model-b"]
 
-            def json(self):
-                return {"data": [{"id": "model-b"}, {"id": "model-a"}]}
-
-            def raise_for_status(self):
-                return None
-
-        def fake_get(url, **kwargs):
-            assert url == "https://llm.example/v1/models"
-            assert kwargs["headers"]["Authorization"] == "Bearer sk-1"
-            return Response()
-
-        monkeypatch.setattr(requests, "get", fake_get)
+        monkeypatch.setattr(webapp.ModelProviderGateway, "list_models", fake_list)
         result = client.get("/api/llm/models", headers=_headers(token)).json()
 
         assert result == {"ok": True, "models": ["model-a", "model-b"]}
@@ -1620,23 +1592,17 @@ class TestSharedLlmConfig:
 
         配好全局大模型后，同一句话应得到模型答复而不是规则兜底。
         """
-        import requests
+        import rnaseq_agent.webapp as webapp
 
         from rnaseq_agent.connection_store import save_llm
 
         token = _token(client)
         save_llm({"enabled": True, "api_base": "https://llm.example/v1", "model": "m", "api_key": "sk-1"})
 
-        def fake_post(url, headers=None, json=None, timeout=None):
-            class FakeResp:
-                status_code = 200
+        def fake_complete(self, request):
+            return type("Reply", (), {"text": "这是模型给出的解释。"})()
 
-                def json(self):
-                    return {"choices": [{"message": {"content": "这是模型给出的解释。"}}]}
-
-            return FakeResp()
-
-        monkeypatch.setattr(requests, "post", fake_post)
+        monkeypatch.setattr(webapp.ModelProviderGateway, "complete", fake_complete)
         reply = client.post(
             "/api/chat", json={"message": "这个流程大概要跑多久"}, headers=_headers(token)
         ).json()

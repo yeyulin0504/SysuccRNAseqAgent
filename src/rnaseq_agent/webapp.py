@@ -594,7 +594,7 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
         return None
     try:
         llm = config.get("llm", config)
-        provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": "chat_completions"})
+        provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": llm.get("api_mode") or "chat_completions"})
         request = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": _llm_messages(text), "temperature": 0.2}, credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")), timeout_seconds=timeout)
         return ModelProviderGateway().complete(request).text.strip() or None
     except Exception:  # noqa: BLE001 - any failure falls back to the rule router
@@ -614,7 +614,7 @@ def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0)
         return
     try:
         llm = config.get("llm", config)
-        provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": "chat_completions"})
+        provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": llm.get("api_mode") or "chat_completions"})
         request = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": _llm_messages(text), "temperature": 0.2, "stream": True}, credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")), timeout_seconds=timeout, stream=True)
         streamed = False
         for event in ModelProviderGateway().stream(request):
@@ -1743,7 +1743,7 @@ def create_app(
         if not llm.get("api_base") or not llm.get("api_key"):
             return {"ok": False, "message": "请先保存 API Base 和 API Key", "models": []}
         try:
-            provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm.get("model") or "gpt-4o-mini"})
+            provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm.get("model") or "gpt-4o-mini", "api_mode": llm.get("api_mode") or "chat_completions"})
             models = ModelProviderGateway().list_models(provider, ProviderCredentials(api_key=str(llm["api_key"])), 20)
             return {"ok": True, "models": models}
         except Exception as exc:  # noqa: BLE001
@@ -1756,7 +1756,7 @@ def create_app(
         if not llm.get("api_base") or not llm.get("api_key") or not llm.get("model"):
             return {"ok": False, "message": "请先保存 API Base、API Key 和模型"}
         try:
-            provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm["model"], "api_mode": "chat_completions"})
+            provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm["model"], "api_mode": llm.get("api_mode") or "chat_completions"})
             prepared = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": [{"role": "user", "content": "请只回复：连接正常"}], "temperature": 0}, credentials=ProviderCredentials(api_key=str(llm["api_key"])), timeout_seconds=30)
             reply = ModelProviderGateway().complete(prepared).text.strip()
             return {"ok": True, "message": "LLM API 连接成功", "reply": reply}

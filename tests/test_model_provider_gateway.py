@@ -13,7 +13,7 @@ from rnaseq_agent.model_disclosure import (
     ProviderCredentials,
     ProviderRequestError,
 )
-from rnaseq_agent.model_provider import ModelProviderGateway, normalize_provider_config, provider_identity
+from rnaseq_agent.model_provider import MAX_RESPONSE_BYTES, ModelProviderGateway, normalize_provider_config, provider_identity
 
 
 @pytest.fixture
@@ -154,3 +154,65 @@ def test_transport_error_marks_transmission_started(base_request, monkeypatch):
         ModelProviderGateway().complete(base_request)
     assert caught.value.code == MODEL_PROVIDER_REQUEST_FAILED
     assert caught.value.transmission_started is True
+
+
+def test_exact_responses_rejects_nested_function_call_before_exposing_text(base_request, monkeypatch):
+    class ResponsesResponse(_Response):
+        def json(self):
+            return {
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "safe"}]},
+                    {"type": "function_call", "name": "exfiltrate", "arguments": "{}", "call_id": "call-1"},
+                ]
+            }
+
+    monkeypatch.setattr("rnaseq_agent.model_provider.requests.post", lambda *args, **kwargs: ResponsesResponse())
+    request = replace(base_request, api_mode="responses", exact_attempt=True)
+
+    with pytest.raises(ProviderRequestError) as caught:
+        list(ModelProviderGateway().dispatch_exact(request))
+
+    assert caught.value.code == MODEL_EXACT_TOOL_CALL_REJECTED
+
+
+def test_responses_rejects_oversized_output_text(base_request, monkeypatch):
+    class ResponsesResponse(_Response):
+        def json(self):
+            return {"output_text": "x" * (MAX_RESPONSE_BYTES + 1)}
+
+    monkeypatch.setattr("rnaseq_agent.model_provider.requests.post", lambda *args, **kwargs: ResponsesResponse())
+    request = replace(base_request, api_mode="responses")
+
+    with pytest.raises(ProviderRequestError):
+        ModelProviderGateway().responses(request)
+
+
+def test_responses_rejects_oversized_body_before_json_return(base_request, monkeypatch):
+    class ResponsesResponse(_Response):
+        content = b"x" * (MAX_RESPONSE_BYTES + 1)
+
+        def json(self):
+            raise AssertionError("oversized body must be rejected before parsing")
+
+    monkeypatch.setattr("rnaseq_agent.model_provider.requests.post", lambda *args, **kwargs: ResponsesResponse())
+    request = replace(base_request, api_mode="responses")
+
+    with pytest.raises(ProviderRequestError):
+        ModelProviderGateway().responses(request)
+
+
+def test_list_models_rejects_oversized_body(base_request, monkeypatch):
+    class ModelsResponse:
+        def read(self):
+            return b"x" * (MAX_RESPONSE_BYTES + 1)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("rnaseq_agent.model_provider.urllib.request.urlopen", lambda *args, **kwargs: ModelsResponse())
+
+    with pytest.raises(ProviderRequestError):
+        ModelProviderGateway().list_models(base_request.provider, base_request.credentials, 10)
