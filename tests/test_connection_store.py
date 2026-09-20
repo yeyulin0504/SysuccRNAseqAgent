@@ -33,7 +33,15 @@ from rnaseq_agent.connection_store import (
     load_llm,
     save_connection,
     save_llm,
+    ApprovedDataRoot,
+    BrowsePolicyConflictError,
+    browse_policy_revision,
+    load_browse_policy,
+    list_approved_data_roots,
+    approve_data_root,
+    revoke_data_root,
 )
+from rnaseq_agent.ssh_identity import SSHIdentity
 from rnaseq_agent.storage import ConnectionStoreCorruptError
 from rnaseq_agent import storage
 
@@ -73,6 +81,108 @@ class TestConnectionFilePath:
         path = connection_file_path()
         assert path.name == CONNECTION_FILE_NAME
         assert (tmp_path / "home") in path.parents
+
+
+def _root(**overrides):
+    values = dict(root_id="root_a", host="h.example", user="alice", port=22,
+                  requested_path="/srv/reads", canonical_path="/srv/reads",
+                  created_at="2026-09-17T00:00:00Z", revoked_at=None)
+    values.update(overrides)
+    return ApprovedDataRoot(**values)
+
+
+def test_legacy_store_without_roots_is_available_empty_policy(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is True
+    assert policy.identity == SSHIdentity("h.example", "alice", 22)
+    assert policy.roots == ()
+
+
+def test_missing_or_invalid_identity_is_unavailable_without_fake_identity(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example"}, store_dir=store)
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is False
+    assert policy.identity is None
+    assert policy.roots == ()
+
+
+def test_policy_revision_ignores_llm_and_unrelated_connection_fields(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22, "threads": 2}, store_dir=store)
+    before = load_browse_policy(store_dir=store).revision
+    save_llm({"model": "new"}, store_dir=store)
+    save_connection({"threads": 64}, store_dir=store)
+    assert load_browse_policy(store_dir=store).revision == before
+
+
+def test_policy_revision_changes_for_active_root_or_identity(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    before = load_browse_policy(store_dir=store).revision
+    approve_data_root(_root(), expected_revision=before, store_dir=store)
+    after_root = load_browse_policy(store_dir=store).revision
+    assert after_root != before
+    save_connection({"user": "bob"}, store_dir=store)
+    assert load_browse_policy(store_dir=store).revision != after_root
+
+
+def test_duplicate_active_canonical_root_is_idempotent(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    revision = load_browse_policy(store_dir=store).revision
+    first = approve_data_root(_root(), expected_revision=revision, store_dir=store)
+    second = approve_data_root(_root(root_id="root_b", requested_path="/srv/alias"), expected_revision=first.revision, store_dir=store)
+    assert second.revision == first.revision
+    assert second.roots == first.roots
+
+
+def test_more_than_32_active_roots_fails_closed_without_transport(tmp_path):
+    store = tmp_path / "store"
+    payload = {"host": "h.example", "user": "alice", "port": 22,
+               "approved_data_roots": [_root(root_id=f"root_{i}", requested_path=f"/srv/{i}", canonical_path=f"/srv/{i}").__dict__ for i in range(33)]}
+    from rnaseq_agent.private_files import ensure_private_directory
+    ensure_private_directory(store)
+    (store / "connection.json").write_text(json.dumps(payload), encoding="utf-8")
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is False and policy.identity is None and policy.roots == ()
+
+
+def test_approve_rechecks_root_identity_against_locked_live_payload(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    revision = load_browse_policy(store_dir=store).revision
+    with pytest.raises(BrowsePolicyConflictError):
+        approve_data_root(_root(host="other.example"), expected_revision=revision, store_dir=store)
+    assert list_approved_data_roots(store_dir=store) == ()
+
+
+def test_stale_approve_and_revoke_use_typed_revision_conflict(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    revision = load_browse_policy(store_dir=store).revision
+    approved = approve_data_root(_root(), expected_revision=revision, store_dir=store)
+    with pytest.raises(BrowsePolicyConflictError) as exc_info:
+        revoke_data_root("root_a", expected_revision=revision, store_dir=store)
+    assert exc_info.value.error_code == "REMOTE_ROOT_REVISION_CONFLICT"
+    revoked = revoke_data_root("root_a", expected_revision=approved.revision, store_dir=store)
+    assert revoked.roots == ()
+    assert revoked.available is True
+
+
+def test_invalid_root_collection_fails_closed_and_is_not_repaired(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    path = store / "connection.json"
+    payload = json.loads(path.read_text("utf-8"))
+    payload["approved_data_roots"] = [{"root_id": "broken"}]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is False and policy.identity is None and policy.roots == ()
+    with pytest.raises(ConnectionStoreCorruptError):
+        approve_data_root(_root(), expected_revision=policy.revision, store_dir=store)
 
 
 def test_concurrent_connection_and_llm_saves_preserve_both_blocks(tmp_path, monkeypatch):

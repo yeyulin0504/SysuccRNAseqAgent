@@ -80,6 +80,14 @@ def _tool_call(call_id: str, name: str, arguments: dict) -> dict:
     }
 
 
+def test_edit_connection_schema_has_no_approved_root_fields():
+    from rnaseq_agent.agent_tools import TOOL_SPECS
+
+    schema = TOOL_SPECS["edit_connection"].parameters
+    assert "approved_data_roots" not in schema.get("properties", {})
+    assert "remote_data_root" not in schema.get("properties", {})
+
+
 class FakeLLM:
     """Scripted model: each call returns the next queued turn.
 
