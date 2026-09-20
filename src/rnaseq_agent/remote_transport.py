@@ -275,6 +275,16 @@ class RemoteTransport(Protocol):
     def download(self, remote_file: str, local_path: Path) -> CommandResult: ...
 
 
+class DeadlineAwareRemoteTransport(RemoteTransport, Protocol):
+    def execute_bounded(
+        self,
+        remote_command: str,
+        *,
+        absolute_deadline: float,
+        max_capture_bytes: int,
+    ) -> CommandResult: ...
+
+
 def create_remote_transport(config: dict[str, Any]) -> RemoteTransport:
     server = config["server"]
     identity = normalize_ssh_identity(server)
@@ -351,6 +361,28 @@ class SystemSSHTransport:
             ],
             timeout_seconds=REMOTE_COMMAND_TIMEOUT_SECONDS,
             max_capture_bytes=MAX_REMOTE_CAPTURE_BYTES,
+        )
+
+    def execute_bounded(
+        self,
+        remote_command: str,
+        *,
+        absolute_deadline: float,
+        max_capture_bytes: int,
+    ) -> CommandResult:
+        remaining = _remaining_remote_time(absolute_deadline)
+        return run_command_bounded(
+            [
+                "ssh",
+                *self._ssh_options(),
+                "-l",
+                self.user,
+                "--",
+                self.host,
+                remote_command,
+            ],
+            timeout_seconds=remaining,
+            max_capture_bytes=max_capture_bytes,
         )
 
     def upload(self, local_paths: Sequence[Path], remote_dir: str) -> CommandResult:
@@ -501,7 +533,74 @@ class ParamikoTransport:
             returncode=returncode,
             stdout=stdout_text,
             stderr=stderr_text,
+            captured_bytes=captured_bytes,
         )
+        _raise_for_result(result)
+        return result
+
+    def execute_bounded(
+        self,
+        remote_command: str,
+        *,
+        absolute_deadline: float,
+        max_capture_bytes: int,
+    ) -> CommandResult:
+        # The Paramiko implementation already enforces the absolute deadline;
+        # this bounded entry point additionally applies the caller's byte cap.
+        if max_capture_bytes <= 0:
+            raise CommandOutputLimitError("remote output limit exhausted")
+        deadline = absolute_deadline
+        client = None
+        channel = None
+        try:
+            client = self._connect(deadline)
+            _, stdout, _ = client.exec_command(
+                remote_command,
+                timeout=_remaining_remote_time(deadline),
+            )
+            channel = stdout.channel
+            channel.settimeout(_remaining_remote_time(deadline))
+            stdout_capture = bytearray()
+            stderr_capture = bytearray()
+            captured_bytes = 0
+
+            def capture(target: bytearray, chunk: bytes) -> None:
+                nonlocal captured_bytes
+                if captured_bytes + len(chunk) > max_capture_bytes:
+                    raise CommandOutputLimitError(
+                        f"Remote command output exceeded the {max_capture_bytes}-byte capture limit."
+                    )
+                target.extend(chunk)
+                captured_bytes += len(chunk)
+
+            while True:
+                _remaining_remote_time(deadline)
+                progressed = False
+                if channel.recv_ready():
+                    capture(stdout_capture, channel.recv(64 * 1024))
+                    progressed = True
+                if channel.recv_stderr_ready():
+                    capture(stderr_capture, channel.recv_stderr(64 * 1024))
+                    progressed = True
+                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                    returncode = channel.recv_exit_status()
+                    break
+                if not progressed:
+                    time.sleep(min(0.01, _remaining_remote_time(deadline)))
+            result = CommandResult(
+                command=["ssh", self.target, remote_command],
+                returncode=returncode,
+                stdout=bytes(stdout_capture).decode("utf-8", errors="replace"),
+                stderr=bytes(stderr_capture).decode("utf-8", errors="replace"),
+                captured_bytes=captured_bytes,
+            )
+        except (socket.timeout, TimeoutError) as exc:
+            raise CommandTimeoutError("Remote command exceeded its deadline.") from exc
+        finally:
+            if channel is not None and not getattr(channel, "closed", False):
+                channel.close()
+            if client is not None:
+                client.close()
         _raise_for_result(result)
         return result
 

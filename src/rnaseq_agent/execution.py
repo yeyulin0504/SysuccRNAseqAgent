@@ -180,6 +180,7 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    captured_bytes: int = 0
 
 
 def run_command(
@@ -200,6 +201,7 @@ def run_command(
         returncode=completed.returncode,
         stdout=completed.stdout,
         stderr=completed.stderr,
+        captured_bytes=len(completed.stdout.encode("utf-8")) + len(completed.stderr.encode("utf-8")),
     )
     if check and result.returncode != 0:
         message = (
@@ -354,6 +356,7 @@ def run_command_bounded(
         returncode=int(process.returncode or 0),
         stdout=bytes(captures["stdout"]).decode("utf-8", errors="replace"),
         stderr=bytes(captures["stderr"]).decode("utf-8", errors="replace"),
+        captured_bytes=captured_bytes,
     )
     if check and result.returncode != 0:
         message = (

@@ -85,6 +85,24 @@ def test_bounded_command_decodes_utf8_and_replaces_invalid_bytes() -> None:
     assert result.stderr == "\ufffd"
 
 
+def test_bounded_command_reports_exact_raw_captured_bytes() -> None:
+    result = run_command_bounded(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write('你好'.encode()); "
+                "sys.stderr.buffer.write(b'\\xff')"
+            ),
+        ],
+        timeout_seconds=5,
+        max_capture_bytes=4096,
+    )
+
+    assert result.captured_bytes == len("你好".encode()) + 1
+
+
 def test_bounded_command_errors_do_not_echo_command_secrets() -> None:
     secret = "test-only-secret-sentinel"
 

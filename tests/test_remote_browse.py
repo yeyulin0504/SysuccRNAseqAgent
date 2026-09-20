@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pytest
+
+from rnaseq_agent.connection_store import ApprovedDataRoot, BrowsePolicy
+from rnaseq_agent.remote_browse import (
+    BrowseExecutionBudget,
+    BrowseDirectoryGroup,
+    BrowseSampleRow,
+    BrowseScanPayload,
+    BrowseContext,
+    BrowseResult,
+    REMOTE_PATH_INVALID,
+    browse_remote_fastqs,
+    contains_posix_path,
+    provider_browse_summary,
+)
+from rnaseq_agent.ssh_identity import SSHIdentity
+
+
+CONTEXT = BrowseContext(project_id="project-1", thread_id=None, source="workbench")
+IDENTITY = SSHIdentity(host="example.test", user="alice", port=22)
+
+
+def _root(path: str = "/data/root", *, root_id: str = "root-1") -> ApprovedDataRoot:
+    return ApprovedDataRoot(
+        root_id=root_id,
+        host=IDENTITY.host,
+        user=IDENTITY.user,
+        port=IDENTITY.port,
+        requested_path=path,
+        canonical_path=path,
+        created_at="2026-01-01T00:00:00Z",
+        revoked_at=None,
+    )
+
+
+def _policy(*roots: ApprovedDataRoot) -> BrowsePolicy:
+    return BrowsePolicy(
+        identity=IDENTITY,
+        roots=tuple(roots),
+        revision="sha256:revision",
+        available=True,
+    )
+
+
+class Spy:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        raise AssertionError("spy should not be called")
+
+
+class ScriptedTransport:
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.calls = []
+
+    def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes):
+        self.calls.append(command)
+        for path, result in self.mapping.items():
+            if path in command:
+                return result
+        raise AssertionError(command)
+
+
+def _command_result(stdout: str, returncode: int = 0):
+    from rnaseq_agent.execution import CommandResult
+
+    return CommandResult(["scripted"], returncode, stdout, "", len(stdout.encode()))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "relative/path",
+        "./data",
+        "/data/../secret",
+        "/data/./reads",
+        "/data//reads",
+        "/data/reads/",
+        "/data\x00/reads",
+        "/data\nreads",
+        "//server/share",
+        "C:/reads",
+        " /data/reads",
+        "/data/reads ",
+    ],
+)
+def test_invalid_lexical_path_short_circuits(value):
+    policy_spy = Spy()
+    transport_spy = Spy()
+    scanner_spy = Spy()
+    result = browse_remote_fastqs(
+        value,
+        CONTEXT,
+        policy_spy,
+        transport_spy,
+        scanner_spy,
+    )
+    assert isinstance(result, BrowseResult)
+    assert result.error_code == REMOTE_PATH_INVALID
+    assert policy_spy.calls == 0
+    assert transport_spy.calls == 0
+    assert scanner_spy.calls == 0
+
+
+def test_component_containment_uses_path_components():
+    assert contains_posix_path("/data/root", "/data/root/sample") is True
+    assert contains_posix_path("/data/root", "/data/root2/sample") is False
+
+
+def test_no_active_root_fails_before_transport():
+    transport = Spy()
+    scanner = Spy()
+    empty = BrowsePolicy(IDENTITY, (), "sha256:empty", True)
+    result = browse_remote_fastqs("/data/reads", CONTEXT, lambda: empty, transport, scanner)
+    assert result.error_code == "REMOTE_ROOT_NOT_APPROVED"
+    assert transport.calls == 0
+    assert scanner.calls == 0
+
+
+def test_exact_root_authorizes_injected_scanner():
+    root = _root()
+    policy = _policy(root)
+    transport = ScriptedTransport({
+        "/data/root": _command_result("/data/root\n"),
+    })
+    payload = BrowseScanPayload(
+        groups=(BrowseDirectoryGroup("g1", "/data/root", (BrowseSampleRow("s", "/data/root/a_R1.fastq", None),), ()),),
+        sample_count=1,
+        unmatched_count=0,
+        truncated=False,
+    )
+    calls = []
+    def scanner(canonical_target, canonical_root, runner, transport_obj):
+        calls.append((canonical_target, canonical_root))
+        return payload
+    result = browse_remote_fastqs("/data/root", CONTEXT, lambda: policy, lambda _: transport, scanner)
+    assert result.ok is True
+    assert result.authorization["root_id"] == "root-1"
+    assert calls == [("/data/root", "/data/root")]
+
+
+def test_policy_recheck_prevents_scan():
+    root = _root()
+    policy = _policy(root)
+    changed = BrowsePolicy(IDENTITY, (), "sha256:changed", True)
+    policies = iter([policy, changed])
+    transport = ScriptedTransport({"/data/root": _command_result("/data/root\n")})
+    scanner = Spy()
+    result = browse_remote_fastqs("/data/root", CONTEXT, lambda: next(policies), lambda _: transport, scanner)
+    assert result.error_code == "REMOTE_POLICY_CHANGED"
+    assert scanner.calls == 0
+
+
+def test_provider_summary_is_deidentified():
+    result = BrowseResult(
+        ok=True,
+        blocked=False,
+        error_code=None,
+        message="/data/root/secret.fastq",
+        groups=(BrowseDirectoryGroup("root-id", "/data/root", (BrowseSampleRow("unique-sample-basename", "/data/root/secret.fastq", None),), ()),),
+        sample_count=1,
+        unmatched_count=0,
+        truncated=False,
+        authorization={"root_id": "root-id", "canonical_target": "/data/root"},
+        audit=None,
+    )
+    summary = provider_browse_summary(result, "source-ref")
+    text = repr(summary)
+    for secret in ("secret.fastq", "/data/root", "root-id", "unique-sample-basename", "example.test", "alice"):
+        assert secret not in text
+
+
+def test_execution_budget_reuses_deadline_and_subtracts_raw_bytes():
+    from rnaseq_agent.execution import CommandResult
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes):
+            self.calls.append((command, absolute_deadline, max_capture_bytes))
+            return CommandResult([], 0, "\ufffd", "", 3)
+
+    runner = BrowseExecutionBudget.start(timeout_seconds=5, max_output_bytes=10)
+    transport = Transport()
+    runner.execute(transport, "one")
+    runner.execute(transport, "two")
+    assert transport.calls[0][1] == transport.calls[1][1]
+    assert transport.calls[0][2] == 10
+    assert transport.calls[1][2] == 7
+    assert runner.remaining_output_bytes == 4

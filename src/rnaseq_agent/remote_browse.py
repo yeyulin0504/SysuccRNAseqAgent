@@ -1,0 +1,687 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import shlex
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import PurePosixPath
+from typing import Callable, Literal
+
+from .connection_store import ApprovedDataRoot, BrowsePolicy
+from .execution import (
+    CommandOutputLimitError,
+    CommandResult,
+    CommandTimeoutError,
+)
+from .ssh_identity import SSHIdentity
+from .remote_transport import DeadlineAwareRemoteTransport
+
+REMOTE_PATH_INVALID = "REMOTE_PATH_INVALID"
+REMOTE_ROOT_NOT_APPROVED = "REMOTE_ROOT_NOT_APPROVED"
+REMOTE_ROOT_STALE = "REMOTE_ROOT_STALE"
+REMOTE_PATH_NOT_FOUND = "REMOTE_PATH_NOT_FOUND"
+REMOTE_PATH_NOT_DIRECTORY = "REMOTE_PATH_NOT_DIRECTORY"
+REMOTE_PATH_ESCAPE = "REMOTE_PATH_ESCAPE"
+REMOTE_POLICY_CHANGED = "REMOTE_POLICY_CHANGED"
+REMOTE_SCAN_TIMEOUT = "REMOTE_SCAN_TIMEOUT"
+REMOTE_SCAN_OUTPUT_LIMIT = "REMOTE_SCAN_OUTPUT_LIMIT"
+REMOTE_SCAN_INVALID_OUTPUT = "REMOTE_SCAN_INVALID_OUTPUT"
+REMOTE_SCAN_FAILED = "REMOTE_SCAN_FAILED"
+REMOTE_ROOT_REVISION_CONFLICT = "REMOTE_ROOT_REVISION_CONFLICT"
+REMOTE_SCAN_REFERENCE_INVALID = "REMOTE_SCAN_REFERENCE_INVALID"
+REMOTE_SCAN_REFERENCE_EXPIRED = "REMOTE_SCAN_REFERENCE_EXPIRED"
+REMOTE_SCAN_REFERENCE_USED = "REMOTE_SCAN_REFERENCE_USED"
+REMOTE_SCAN_STORE_FULL = "REMOTE_SCAN_STORE_FULL"
+REMOTE_SCAN_STORE_FAILED = "REMOTE_SCAN_STORE_FAILED"
+REMOTE_SECURITY_AUDIT_FAILED = "REMOTE_SECURITY_AUDIT_FAILED"
+PROJECT_NOT_FOUND = "PROJECT_NOT_FOUND"
+
+MAX_ACTIVE_ROOTS = 32
+MAX_SCAN_DEPTH = 2
+MAX_SCAN_CANDIDATES = 5_000
+SCAN_TIMEOUT_SECONDS = 60.0
+MAX_SCAN_OUTPUT_BYTES = 4 * 1024 * 1024
+MAX_RETURNED_SAMPLES = 2_500
+MAX_RETURNED_UNMATCHED = 500
+
+
+@dataclass
+class BrowseExecutionBudget:
+    absolute_deadline: float
+    remaining_output_bytes: int
+
+    @classmethod
+    def start(cls, *, timeout_seconds: float, max_output_bytes: int) -> "BrowseExecutionBudget":
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if max_output_bytes <= 0:
+            raise ValueError("max_output_bytes must be positive")
+        return cls(
+            absolute_deadline=time.monotonic() + timeout_seconds,
+            remaining_output_bytes=max_output_bytes,
+        )
+
+    def execute(self, transport: DeadlineAwareRemoteTransport, remote_command: str) -> CommandResult:
+        if self.remaining_output_bytes <= 0:
+            raise CommandOutputLimitError("browse output budget exhausted")
+        if time.monotonic() >= self.absolute_deadline:
+            raise CommandTimeoutError("browse execution deadline exceeded")
+        result = transport.execute_bounded(
+            remote_command,
+            absolute_deadline=self.absolute_deadline,
+            max_capture_bytes=self.remaining_output_bytes,
+        )
+        captured = int(getattr(result, "captured_bytes", 0))
+        if captured < 0 or captured > self.remaining_output_bytes:
+            raise CommandOutputLimitError("invalid browse output accounting")
+        self.remaining_output_bytes -= captured
+        return result
+
+
+@dataclass(frozen=True)
+class BrowseContext:
+    project_id: str
+    thread_id: str | None
+    source: Literal["workbench", "project_command", "rule_chat", "llm_tool"]
+
+
+@dataclass(frozen=True)
+class BrowseSampleRow:
+    sample_id: str
+    fastq_1: str
+    fastq_2: str | None
+
+
+@dataclass(frozen=True)
+class BrowseDirectoryGroup:
+    group_id: str
+    canonical_directory: str
+    samples: tuple[BrowseSampleRow, ...]
+    unmatched_basenames: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BrowseScanPayload:
+    groups: tuple[BrowseDirectoryGroup, ...]
+    sample_count: int
+    unmatched_count: int
+    truncated: bool
+
+
+BrowseScanner = Callable[[str, str, BrowseExecutionBudget, DeadlineAwareRemoteTransport], BrowseScanPayload]
+
+
+@dataclass(frozen=True)
+class BrowseAudit:
+    event_id: str
+    project_id: str
+    thread_id: str | None
+    source: str
+    identity_digest: str
+    requested_path_digest: str
+    canonical_target: str | None
+    root_id: str | None
+    browse_policy_revision: str | None
+    directory_count: int
+    sample_count: int
+    unmatched_count: int
+    truncated: bool
+    outcome: Literal["allowed", "denied", "failed"]
+    error_code: str | None
+    started_at: str
+    completed_at: str
+
+
+@dataclass(frozen=True)
+class BrowseResult:
+    ok: bool
+    blocked: bool
+    error_code: str | None
+    message: str
+    groups: tuple[BrowseDirectoryGroup, ...]
+    sample_count: int
+    unmatched_count: int
+    truncated: bool
+    authorization: dict[str, str] | None
+    audit: BrowseAudit
+
+
+def validate_remote_browse_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(REMOTE_PATH_INVALID)
+    if value != value.strip():
+        raise ValueError(REMOTE_PATH_INVALID)
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(REMOTE_PATH_INVALID)
+    if not value.startswith("/") or value.startswith("//"):
+        raise ValueError(REMOTE_PATH_INVALID)
+    if value != "/" and value.endswith("/"):
+        raise ValueError(REMOTE_PATH_INVALID)
+    pieces = value.split("/")
+    if any(piece in {"", ".", ".."} for piece in pieces[1:]):
+        raise ValueError(REMOTE_PATH_INVALID)
+    return value
+
+
+def contains_posix_path(root: str, candidate: str) -> bool:
+    root_parts = PurePosixPath(root).parts
+    candidate_parts = PurePosixPath(candidate).parts
+    return candidate_parts[: len(root_parts)] == root_parts
+
+
+def resolve_remote_directory(
+    requested_path: str,
+    runner: BrowseExecutionBudget,
+    transport: DeadlineAwareRemoteTransport,
+) -> str:
+    quoted = shlex.quote(requested_path)
+    command = (
+        f"resolved=$(realpath -e -- {quoted}) || exit 44; "
+        f"[ -d \"$resolved\" ] || exit 45; "
+        "printf '%s\\n' \"$resolved\""
+    )
+    result = runner.execute(transport, command)
+    if result.returncode == 44:
+        raise _BrowseResolutionError(REMOTE_PATH_NOT_FOUND)
+    if result.returncode == 45:
+        raise _BrowseResolutionError(REMOTE_PATH_NOT_DIRECTORY)
+    if result.returncode != 0:
+        diagnostics = f"{result.stdout}\n{result.stderr}".lower()
+        if "not a directory" in diagnostics or "not_directory" in diagnostics:
+            raise _BrowseResolutionError(REMOTE_PATH_NOT_DIRECTORY)
+        if "no such" in diagnostics or "not found" in diagnostics or "missing" in diagnostics:
+            raise _BrowseResolutionError(REMOTE_PATH_NOT_FOUND)
+        raise _BrowseResolutionError(REMOTE_SCAN_FAILED)
+    canonical = result.stdout.strip("\r\n")
+    try:
+        canonical = validate_remote_browse_path(canonical)
+    except ValueError as exc:
+        raise _BrowseResolutionError(REMOTE_PATH_ESCAPE) from exc
+    return canonical
+
+
+def provider_browse_summary(result: BrowseResult, source_ref: str | None) -> dict[str, object]:
+    return {
+        "ok": result.ok,
+        "blocked": result.blocked,
+        "error_code": result.error_code,
+        "source_ref": source_ref if result.ok else None,
+        "directory_count": len(result.groups),
+        "sample_count": result.sample_count,
+        "unmatched_count": result.unmatched_count,
+        "truncated": result.truncated,
+    }
+
+
+def browse_log_projection(event: BrowseAudit) -> dict[str, object]:
+    return {
+        "event_id": event.event_id,
+        "source": event.source,
+        "directory_count": event.directory_count,
+        "sample_count": event.sample_count,
+        "unmatched_count": event.unmatched_count,
+        "truncated": event.truncated,
+        "outcome": event.outcome,
+        "error_code": event.error_code,
+        "started_at": event.started_at,
+        "completed_at": event.completed_at,
+    }
+
+
+def scan_remote_fastqs(
+    canonical_target: str,
+    canonical_root: str,
+    runner: BrowseExecutionBudget,
+    transport: DeadlineAwareRemoteTransport,
+) -> BrowseScanPayload:
+    raise NotImplementedError
+
+
+def browse_remote_fastqs(
+    requested_path: str,
+    context: BrowseContext,
+    policy_reader: Callable[[], BrowsePolicy],
+    transport_factory: Callable[[SSHIdentity], DeadlineAwareRemoteTransport],
+    scanner: BrowseScanner,
+) -> BrowseResult:
+    started_at = _utc_now()
+    event_id = uuid.uuid4().hex
+    requested_digest = _digest(requested_path)
+
+    try:
+        target = validate_remote_browse_path(requested_path)
+    except ValueError:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=None,
+            requested_path=requested_path,
+            canonical_target=None,
+            root_id=None,
+            revision=None,
+            error_code=REMOTE_PATH_INVALID,
+            message="Remote browse path is invalid.",
+        )
+
+    try:
+        initial = policy_reader()
+    except Exception:
+        initial = None
+    if (
+        initial is None
+        or not initial.available
+        or initial.identity is None
+        or not initial.roots
+    ):
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=None if initial is None else initial.identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=None if initial is None else initial.revision,
+            error_code=REMOTE_ROOT_NOT_APPROVED,
+            message="Remote browse root is not approved.",
+        )
+
+    identity = initial.identity
+    assert identity is not None
+    active_roots = tuple(
+        root
+        for root in initial.roots
+        if (root.host, root.user, root.port) == (identity.host, identity.user, identity.port)
+        and root.revoked_at is None
+        and root.requested_path != "/"
+        and root.canonical_path != "/"
+    )
+    if not active_roots:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=initial.revision,
+            error_code=REMOTE_ROOT_NOT_APPROVED,
+            message="Remote browse root is not approved.",
+        )
+    try:
+        transport = transport_factory(identity)
+    except Exception:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_FAILED,
+            message="Remote browse failed.",
+        )
+    runner = BrowseExecutionBudget.start(
+        timeout_seconds=SCAN_TIMEOUT_SECONDS,
+        max_output_bytes=MAX_SCAN_OUTPUT_BYTES,
+    )
+
+    resolved_roots: list[tuple[ApprovedDataRoot, str]] = []
+    for root in active_roots:
+        try:
+            canonical = resolve_remote_directory(root.requested_path, runner, transport)
+        except _BrowseResolutionError:
+            return _result(
+                context=context,
+                event_id=event_id,
+                started_at=started_at,
+                identity=identity,
+                requested_path=target,
+                canonical_target=None,
+                root_id=root.root_id,
+                revision=initial.revision,
+                error_code=REMOTE_ROOT_STALE,
+                message="An approved remote root is stale.",
+            )
+        except (CommandTimeoutError, CommandOutputLimitError):
+            return _result(
+                context=context,
+                event_id=event_id,
+                started_at=started_at,
+                identity=identity,
+                requested_path=target,
+                canonical_target=None,
+                root_id=None,
+                revision=initial.revision,
+                error_code=REMOTE_ROOT_STALE,
+                message="An approved remote root is stale.",
+            )
+        except Exception:
+            return _result(
+                context=context,
+                event_id=event_id,
+                started_at=started_at,
+                identity=identity,
+                requested_path=target,
+                canonical_target=None,
+                root_id=None,
+                revision=initial.revision,
+                error_code=REMOTE_ROOT_STALE,
+                message="An approved remote root is stale.",
+            )
+        if canonical != root.canonical_path:
+            return _result(
+                context=context,
+                event_id=event_id,
+                started_at=started_at,
+                identity=identity,
+                requested_path=target,
+                canonical_target=None,
+                root_id=root.root_id,
+                revision=initial.revision,
+                error_code=REMOTE_ROOT_STALE,
+                message="An approved remote root is stale.",
+            )
+        resolved_roots.append((root, canonical))
+
+    try:
+        canonical_target = resolve_remote_directory(target, runner, transport)
+    except _BrowseResolutionError as exc:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=initial.revision,
+            error_code=exc.code,
+            message="Remote browse target could not be resolved.",
+        )
+    except (CommandTimeoutError, CommandOutputLimitError):
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=initial.revision,
+            error_code=REMOTE_PATH_ESCAPE,
+            message="Remote browse target is outside the approved root.",
+        )
+    except Exception:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=None,
+            root_id=None,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_FAILED,
+            message="Remote browse failed.",
+        )
+
+    selected: tuple[ApprovedDataRoot, str] | None = None
+    for item in resolved_roots:
+        if contains_posix_path(item[1], canonical_target) and (
+            selected is None
+            or len(PurePosixPath(item[1]).parts) > len(PurePosixPath(selected[1]).parts)
+        ):
+            selected = item
+    if selected is None:
+        lexical_match = any(contains_posix_path(root.requested_path, target) for root, _ in resolved_roots)
+        code = REMOTE_PATH_ESCAPE if lexical_match else REMOTE_ROOT_NOT_APPROVED
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=None,
+            revision=initial.revision,
+            error_code=code,
+            message="Remote browse target is outside the approved root." if code == REMOTE_PATH_ESCAPE else "Remote browse root is not approved.",
+        )
+
+    try:
+        current = policy_reader()
+    except Exception:
+        current = None
+    if not _same_authorization_snapshot(current, initial, selected[0]):
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_POLICY_CHANGED,
+            message="Remote browse policy changed; retry the request.",
+        )
+
+    try:
+        payload = scanner(canonical_target, selected[1], runner, transport)
+        _validate_scan_payload(payload)
+    except CommandTimeoutError:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_TIMEOUT,
+            message="Remote browse timed out.",
+        )
+    except CommandOutputLimitError:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_OUTPUT_LIMIT,
+            message="Remote browse output exceeded its limit.",
+        )
+    except _InvalidScanPayload:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_INVALID_OUTPUT,
+            message="Remote browse returned invalid output.",
+        )
+    except Exception:
+        return _result(
+            context=context,
+            event_id=event_id,
+            started_at=started_at,
+            identity=identity,
+            requested_path=target,
+            canonical_target=canonical_target,
+            root_id=selected[0].root_id,
+            revision=initial.revision,
+            error_code=REMOTE_SCAN_FAILED,
+            message="Remote browse failed.",
+        )
+
+    authorization = {
+        "root_id": selected[0].root_id,
+        "canonical_root": selected[1],
+        "canonical_target": canonical_target,
+        "policy_revision": initial.revision,
+    }
+    return _result(
+        context=context,
+        event_id=event_id,
+        started_at=started_at,
+        identity=identity,
+        requested_path=target,
+        canonical_target=canonical_target,
+        root_id=selected[0].root_id,
+        revision=initial.revision,
+        payload=payload,
+        authorization=authorization,
+    )
+
+
+class _BrowseResolutionError(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class _InvalidScanPayload(ValueError):
+    pass
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()
+
+
+def _identity_digest(identity: SSHIdentity | None) -> str:
+    if identity is None:
+        return _digest("")
+    return _digest(f"{identity.host}\x00{identity.user}\x00{identity.port}")
+
+
+def _result(
+    *,
+    context: BrowseContext,
+    event_id: str,
+    started_at: str,
+    identity: SSHIdentity | None,
+    requested_path: object,
+    canonical_target: str | None,
+    root_id: str | None,
+    revision: str | None,
+    error_code: str | None = None,
+    message: str = "",
+    payload: BrowseScanPayload | None = None,
+    authorization: dict[str, str] | None = None,
+) -> BrowseResult:
+    payload = payload or BrowseScanPayload((), 0, 0, False)
+    ok = error_code is None
+    if ok:
+        outcome: Literal["allowed", "denied", "failed"] = "allowed"
+    elif error_code in {
+        REMOTE_SCAN_TIMEOUT,
+        REMOTE_SCAN_OUTPUT_LIMIT,
+        REMOTE_SCAN_INVALID_OUTPUT,
+        REMOTE_SCAN_FAILED,
+    }:
+        outcome = "failed"
+    else:
+        outcome = "denied"
+    audit = BrowseAudit(
+        event_id=event_id,
+        project_id=context.project_id,
+        thread_id=context.thread_id,
+        source=context.source,
+        identity_digest=_identity_digest(identity),
+        requested_path_digest=_digest(requested_path),
+        canonical_target=canonical_target,
+        root_id=root_id,
+        browse_policy_revision=revision,
+        directory_count=len(payload.groups),
+        sample_count=payload.sample_count,
+        unmatched_count=payload.unmatched_count,
+        truncated=payload.truncated,
+        outcome=outcome,
+        error_code=error_code,
+        started_at=started_at,
+        completed_at=_utc_now(),
+    )
+    return BrowseResult(
+        ok=ok,
+        blocked=not ok,
+        error_code=error_code,
+        message=message,
+        groups=payload.groups,
+        sample_count=payload.sample_count,
+        unmatched_count=payload.unmatched_count,
+        truncated=payload.truncated,
+        authorization=authorization,
+        audit=audit,
+    )
+
+
+def _same_authorization_snapshot(
+    current: BrowsePolicy | None,
+    initial: BrowsePolicy,
+    selected: ApprovedDataRoot,
+) -> bool:
+    if current is None or not current.available or current.identity != initial.identity:
+        return False
+    if current.revision != initial.revision:
+        return False
+    match = next((root for root in current.roots if root.root_id == selected.root_id), None)
+    return match == selected
+
+
+def _validate_scan_payload(payload: object) -> None:
+    if not isinstance(payload, BrowseScanPayload):
+        raise _InvalidScanPayload()
+    if not isinstance(payload.groups, tuple):
+        raise _InvalidScanPayload()
+    if len(payload.groups) > MAX_SCAN_DEPTH * MAX_SCAN_CANDIDATES:
+        raise _InvalidScanPayload()
+    if not isinstance(payload.sample_count, int) or not 0 <= payload.sample_count <= MAX_RETURNED_SAMPLES:
+        raise _InvalidScanPayload()
+    if not isinstance(payload.unmatched_count, int) or not 0 <= payload.unmatched_count <= MAX_RETURNED_UNMATCHED:
+        raise _InvalidScanPayload()
+    if not isinstance(payload.truncated, bool):
+        raise _InvalidScanPayload()
+    for group in payload.groups:
+        if not isinstance(group, BrowseDirectoryGroup):
+            raise _InvalidScanPayload()
+        if not isinstance(group.group_id, str) or not isinstance(group.canonical_directory, str):
+            raise _InvalidScanPayload()
+        try:
+            validate_remote_browse_path(group.canonical_directory)
+        except ValueError as exc:
+            raise _InvalidScanPayload() from exc
+        if not isinstance(group.samples, tuple) or not isinstance(group.unmatched_basenames, tuple):
+            raise _InvalidScanPayload()
+        if len(group.samples) > MAX_RETURNED_SAMPLES or len(group.unmatched_basenames) > MAX_RETURNED_UNMATCHED:
+            raise _InvalidScanPayload()
+        for sample in group.samples:
+            if not isinstance(sample, BrowseSampleRow):
+                raise _InvalidScanPayload()
+            if not isinstance(sample.sample_id, str) or not isinstance(sample.fastq_1, str):
+                raise _InvalidScanPayload()
+            if sample.fastq_2 is not None and not isinstance(sample.fastq_2, str):
+                raise _InvalidScanPayload()
+    if sum(len(group.samples) for group in payload.groups) != payload.sample_count:
+        raise _InvalidScanPayload()
+    if sum(len(group.unmatched_basenames) for group in payload.groups) != payload.unmatched_count:
+        raise _InvalidScanPayload()
