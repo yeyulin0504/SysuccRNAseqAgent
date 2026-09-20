@@ -45,10 +45,12 @@ langgraph 缺失时本模块不可用（``build_chat_graph`` 抛错），调用�
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import secrets
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypedDict
@@ -96,13 +98,29 @@ from .agent_tools import (
 #: 一轮对话最多允许的工具往返次数，防止模型陷入自我循环。
 MAX_TOOL_ITERATIONS = 8
 
-#: ``ToolExecutor`` 契约：``(工具名, 参数, 项目目录, 是否已获人工批准) -> 结果``。
+#: ``ToolExecutor`` 契约：工具执行始终携带精确项目/线程上下文；结果分成
+#: request-local、provider、generic-log 与 authoritative-audit 四个通道。
 #: 结果至少含 ``{"ok": bool, "reply": str}``，可附带 ``gate`` / ``samples`` /
 #: ``summary`` 等结构化字段供前端渲染。
 #:
 #: 执行器由调用方注入（依赖倒置）：本模块不 import ``webapp``（会造成循环依赖），
 #: 也不自己构造 ``ProjectSession``——真实写盘链路只有一条，必须复用。
-ToolExecutor = Callable[[str, dict[str, Any], Path, bool], dict[str, Any]]
+@dataclass(frozen=True)
+class ToolExecutionContext:
+    project_id: str
+    thread_id: str | None
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    local: dict[str, Any]
+    model: dict[str, Any]
+    log_projection: dict[str, Any]
+    security_audit: Any | None
+
+
+ToolExecutor = Callable[[str, dict[str, Any], Path, bool, ToolExecutionContext], ToolExecutionResult]
+ToolResultFinalizer = Callable[[ToolExecutionResult, Path | None], ToolExecutionResult]
 
 #: ``ConfigReader`` 契约：``(项目目录) -> 当前配置``（读不到就返回 ``{}``）。
 #: 只用来在确认卡片上渲染「旧值 → 新值」，**必须只读**——它会跑在侧效应敏感的位置。
@@ -489,6 +507,7 @@ def build_chat_graph(
     clock: Callable[[], datetime] | None = None,
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS,
     tool_mode_reader: ToolModeReader | None = None,
+    result_finalizer: ToolResultFinalizer | None = None,
 ):
     """Compile the conversation graph.
 
@@ -501,6 +520,10 @@ def build_chat_graph(
 
     now = clock or (lambda: datetime.now(timezone.utc))
     ttl_seconds = max(1, int(approval_ttl_seconds))
+    try:
+        _executor_accepts_context = len(inspect.signature(executor).parameters) >= 5
+    except (TypeError, ValueError):
+        _executor_accepts_context = True
 
     def _live_tool_mode() -> str:
         try:
@@ -1136,37 +1159,66 @@ def build_chat_graph(
             name = str(call.get("name") or "")
             arguments = call.get("arguments") or {}
             try:
-                result = executor(name, arguments, project_dir, approved)
+                execution_context = ToolExecutionContext(
+                    project_id=str(state.get("project_id") or project_dir.name),
+                    thread_id=state.get("thread_id"),
+                )
+                if _executor_accepts_context:
+                    result = executor(name, arguments, project_dir, approved, execution_context)
+                else:
+                    # Compatibility for installations still injecting the pre-Task-6
+                    # four-argument executor; production webapp uses the typed path.
+                    result = executor(name, arguments, project_dir, approved)  # type: ignore[call-arg]
             except Exception as exc:  # noqa: BLE001 - the loop must survive
                 result = {
                     "ok": False,
                     "error": f"工具执行失败（{type(exc).__name__}）：{exc}",
                 }
+            if isinstance(result, ToolExecutionResult):
+                if result_finalizer is not None:
+                    result = result_finalizer(result, project_dir)
+                provider_result = result.model
+                log_result = result.log_projection
+                ok_value = bool(provider_result.get("ok", True))
+                reply_value = provider_result.get("reply") or provider_result.get("message")
+            else:
+                provider_result = result if isinstance(result, dict) else {"ok": False, "error": "工具返回了非预期的结果。"}
+                log_result = provider_result
+                ok_value = bool(provider_result.get("ok", True))
+                reply_value = provider_result.get("reply")
             if not isinstance(result, dict):
-                result = {"ok": False, "error": "工具返回了非预期的结果。"}
+                if not isinstance(result, ToolExecutionResult):
+                    result = {"ok": False, "error": "工具返回了非预期的结果。"}
             result_summaries.append(
                 {
                     "call_id": str(call.get("call_id") or ""),
                     "name": name,
-                    "ok": bool(result.get("ok", True)),
-                    "has_reply": bool(result.get("reply")),
+                    "ok": ok_value,
+                    "has_reply": bool(reply_value),
                 }
             )
             log.append(
                 {
                     "name": name,
                     "risk": risk_of(name),
-                    "arguments": arguments,
-                    "ok": bool(result.get("ok", True)),
+                    "arguments_hash": _canonical_hash(arguments),
+                    "argument_projection": (
+                        {"path": "<redacted>"}
+                        if name == "browse_remote_samples"
+                        else {key: value for key, value in arguments.items()
+                              if key not in {"password", "api_key", "secret", "token", "private_key"}}
+                    ),
+                    "ok": ok_value,
+                    "projection": log_result,
                 }
             )
-            if result.get("reply"):
-                latest_reply = str(result["reply"])
+            if reply_value:
+                latest_reply = str(reply_value)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": str(call.get("call_id") or ""),
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                    "content": json.dumps(provider_result, ensure_ascii=False, default=str),
                 }
             )
 

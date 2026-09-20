@@ -512,7 +512,8 @@ def browse_remote_fastqs(
 ) -> BrowseResult:
     scanner = scanner or scan_remote_fastqs
     started_at = _utc_now()
-    event_id = uuid.uuid4().hex
+    # Authoritative audit records use a stable, self-describing opaque id.
+    event_id = "audit_" + uuid.uuid4().hex
     requested_digest = _digest(requested_path)
 
     try:

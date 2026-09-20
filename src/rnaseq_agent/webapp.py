@@ -69,6 +69,12 @@ from .threads import (
 from .webchat import ChatIntent, execute_intent, route_intent
 from .remote_transport import create_remote_transport, test_server_connection
 from .remote_browse import (
+    BrowseContext,
+    browse_log_projection,
+    browse_remote_fastqs,
+    BrowseResult,
+    provider_browse_summary,
+    scan_remote_fastqs,
     BrowseExecutionBudget,
     MAX_SCAN_OUTPUT_BYTES,
     REMOTE_PATH_ESCAPE,
@@ -82,6 +88,9 @@ from .remote_browse import (
     resolve_remote_directory,
     validate_remote_browse_path,
 )
+from .remote_scan_store import RemoteScanReference, store_remote_scan, discard_remote_scan
+from .security_audit import AuditCommitUncertainError, _record_browse_audit, browse_history_projection
+from .chat_graph import ToolExecutionContext, ToolExecutionResult
 from .project_intake import (
     append_history,
     derive_visible_state,
@@ -169,6 +178,14 @@ def _live_llm_tool_mode() -> str:
         return TOOL_MODE_DISABLED
 
 
+def _browse_connection_config() -> dict[str, Any] | None:
+    shared = load_connection()
+    if not shared.get("host"):
+        return None
+    _restore_runtime_credential(shared)
+    return {"server": dict(shared)}
+
+
 def _connection_as_config() -> dict[str, Any] | None:
     """Wrap the shared connection as a minimal ``{"server": ...}`` config.
 
@@ -214,9 +231,124 @@ def _remote_root_error(code: str, *, status_code: int | None = None) -> JSONResp
     )
 
 
+# Task 6 browse boundary helpers are module-level so every route and tests can
+# exercise the same service even though ``create_app`` owns the HTTP closures.
 def _remote_policy_for_settings() -> Any:
-    """Return the live policy; callers must reject unavailable identities."""
     return load_browse_policy()
+
+
+def _browse_result_payload(result: BrowseResult) -> dict[str, Any]:
+    return {
+        "ok": result.ok,
+        "blocked": result.blocked,
+        "error_code": result.error_code,
+        "message": result.message,
+        "groups": [{
+            "group_id": group.group_id,
+            "canonical_directory": group.canonical_directory,
+            "samples": [asdict(sample) for sample in group.samples],
+            "unmatched_basenames": list(group.unmatched_basenames),
+        } for group in result.groups],
+        "sample_count": result.sample_count,
+        "unmatched_count": result.unmatched_count,
+        "truncated": result.truncated,
+        "authorization": result.authorization,
+    }
+
+
+def _execute_browse_attempt(
+    requested_path: str,
+    project_dir: Path,
+    context: BrowseContext,
+    *,
+    tool_mode: str | None = None,
+) -> ToolExecutionResult:
+    from dataclasses import replace
+    from .remote_browse import _result as browse_result
+
+    if context.source in {"rule_chat", "llm_tool"} and (tool_mode or _live_llm_tool_mode()) == "disabled":
+        denied = browse_result(
+            context=context, event_id="audit_" + uuid.uuid4().hex,
+            started_at=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            identity=None, requested_path=requested_path, canonical_target=None,
+            root_id=None, revision=None, error_code="TOOL_MODE_DISABLED",
+            message="LLM 工具当前已禁用。",
+        )
+        return ToolExecutionResult(
+            local={"ok": False, "error_code": denied.error_code, "message": denied.message},
+            model=provider_browse_summary(denied, None),
+            log_projection=browse_log_projection(denied.audit),
+            security_audit=denied.audit,
+        )
+    config = _browse_connection_config()
+
+    def policy_reader() -> Any:
+        return load_browse_policy()
+
+    def transport_factory(identity: Any) -> Any:
+        live = load_browse_policy()
+        if live.identity != identity:
+            raise RuntimeError("REMOTE_POLICY_CHANGED")
+        if config is None:
+            raise RuntimeError("REMOTE_CONNECTION_INVALID")
+        server = config.get("server") or {}
+        try:
+            configured_identity = normalize_ssh_identity(server)
+        except Exception as exc:
+            raise RuntimeError("REMOTE_CONNECTION_INVALID") from exc
+        if configured_identity != identity:
+            raise RuntimeError("REMOTE_POLICY_CHANGED")
+        return create_remote_transport(config)
+
+    result = browse_remote_fastqs(
+        requested_path,
+        context,
+        policy_reader,
+        transport_factory,
+        scanner=scan_remote_fastqs,
+    )
+    reference = None
+    if result.ok:
+        try:
+            reference = store_remote_scan(project_dir, result)
+        except Exception:
+            failed_audit = replace(result.audit, outcome="failed", error_code="REMOTE_SCAN_STORE_FAILED")
+            result = replace(result, ok=False, blocked=True, error_code="REMOTE_SCAN_STORE_FAILED",
+                             message="远程扫描结果暂时无法安全保存。", groups=(), sample_count=0,
+                             unmatched_count=0, truncated=False, authorization=None, audit=failed_audit)
+    source_ref = reference.source_ref if reference is not None else None
+    local = {"result": _browse_result_payload(result)}
+    if reference is not None:
+        local["reference"] = asdict(reference)
+    return ToolExecutionResult(local=local, model=provider_browse_summary(result, source_ref),
+                               log_projection=browse_log_projection(result.audit), security_audit=result.audit)
+
+
+def _finalize_tool_execution_result(result: ToolExecutionResult, project_dir: Path | None) -> ToolExecutionResult:
+    event = result.security_audit
+    if event is None:
+        return result
+    try:
+        _record_browse_audit(event)
+        if project_dir is not None:
+            append_history(project_dir, {"type": "remote_browse_audit", "name": "远程目录浏览",
+                                         "state": event.outcome, "details": browse_history_projection(event)})
+        return ToolExecutionResult(result.local, result.model, result.log_projection, None)
+    except Exception as exc:
+        # A definitively failed pre-publication audit must not leave an exact
+        # pending scan retrievable.  Uncertain publication deliberately keeps
+        # the record for reconciliation; discard_remote_scan is idempotent and
+        # only removes a still-pending reference.
+        reference_data = result.local.get("reference") if isinstance(result.local, dict) else None
+        if not isinstance(exc, AuditCommitUncertainError) and project_dir is not None and isinstance(reference_data, dict):
+            try:
+                discard_remote_scan(project_dir, RemoteScanReference(**reference_data))
+            except Exception:
+                pass
+        return ToolExecutionResult(
+            local={"ok": False, "error_code": "REMOTE_SECURITY_AUDIT_FAILED", "message": "远程浏览审计暂时不可用。"},
+            model={"ok": False, "blocked": True, "error_code": "REMOTE_SECURITY_AUDIT_FAILED", "source_ref": None},
+            log_projection={"ok": False, "error_code": "REMOTE_SECURITY_AUDIT_FAILED"}, security_audit=None)
 
 
 def _resolve_settings_remote_path(requested_path: str) -> tuple[Any, str]:
@@ -608,7 +740,10 @@ def create_app(
 
     def _project_dir_or_404(project_id: str) -> Path:
         if workspace.get_project(project_id) is None:
-            raise HTTPException(status_code=404, detail=f"项目 {project_id!r} 不存在。")
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "PROJECT_NOT_FOUND", "message": "项目不存在。"},
+            )
         return workspace.project_dir(project_id)
 
     def _route_statuses() -> dict[str, dict[str, object]]:
@@ -1661,11 +1796,22 @@ def create_app(
         _guard(request)
         payload = await request.json()
         remote_dir = str(payload.get("path") or "").strip()
+        explicit_project = str(payload.get("project_id") or request.query_params.get("project") or "").strip()
+        if explicit_project and workspace.get_project(explicit_project) is None:
+            return JSONResponse({"ok": False, "error_code": "PROJECT_NOT_FOUND", "message": "项目不存在。"}, status_code=404)
         session = _session_for(_legacy_dir_for(request, payload))
-        scan_config = session.config or _connection_as_config()
-        if not remote_dir or scan_config is None:
+        if not remote_dir:
             return {"ok": False, "message": "请先保存服务器配置并填写远程 FASTQ 目录"}
-        return _scan_remote_samples(scan_config, remote_dir)
+        project_id = explicit_project or "legacy:default"
+        final = _finalize_tool_execution_result(
+            _execute_browse_attempt(
+                remote_dir,
+                session.project_dir,
+                BrowseContext(project_id, None, "workbench"),
+            ),
+            session.project_dir,
+        )
+        return final.local.get("result", final.local)
 
     def _configure_project_from_chat(
         project_id: str | None,
@@ -1823,6 +1969,7 @@ def create_app(
         intent: Any,
         config: dict[str, Any] | None,
         connection_config: dict[str, Any] | None,
+        thread_id: str | None = None,
     ) -> dict[str, Any]:
         """Read-only remote FASTQ discovery, shared by both chat paths."""
         browse_config = config or connection_config
@@ -1835,16 +1982,25 @@ def create_app(
         ).strip()
         if not remote_dir:
             return {"reply": "请告诉我要浏览的绝对目录，或先保存远程工作目录。", "state": session.state}
-        result = _scan_remote_samples(browse_config, remote_dir)
-        if not result.get("ok"):
-            return {"reply": result.get("message", "远程目录扫描失败"), "state": session.state}
-        count = len(result["samples"])
+        project_id = session.project_dir.name
+        final = _finalize_tool_execution_result(
+            _execute_browse_attempt(
+                remote_dir,
+                session.project_dir,
+                BrowseContext(project_id, thread_id, "rule_chat"),
+            ),
+            session.project_dir,
+        )
+        payload = final.local.get("result", final.local)
+        count = int(payload.get("sample_count") or 0)
+        if not payload.get("ok"):
+            return {**payload, "reply": payload.get("message", "远程目录扫描失败"), "state": session.state}
         return {
-            **result,
+            **payload,
             "action": "browse_samples",
             "state": session.state,
             "scanned_path": remote_dir,
-            "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。请检查后再应用到样本表。",
+            "reply": f"已只读扫描，识别到 {count} 个配对样本。请检查后再应用到样本表。",
         }
 
     def _execute_chat_intent(session: ProjectSession, intent: Any) -> dict[str, Any]:
@@ -1910,6 +2066,7 @@ def create_app(
         with sqlite_checkpointer_for(project_dir) as checkpointer:
             graph = build_chat_graph(
                 executor=_run_tool,
+                result_finalizer=_finalize_tool_execution_result,
                 llm_config=llm_config,
                 checkpointer=checkpointer,
                 # 确认卡片要写「旧值 → 新值」，所以守卫节点需要读项目配置。
@@ -2205,7 +2362,8 @@ def create_app(
         arguments: dict[str, Any],
         project_dir: Path,
         approved: bool,
-    ) -> dict[str, Any]:
+        execution_context: ToolExecutionContext | None = None,
+    ) -> ToolExecutionResult | dict[str, Any]:
         """Execute one LLM-requested tool against the audited session.
 
         这是对话图与真实系统之间**唯一**的桥。每个工具都必须映射到既有的确定性
@@ -2293,19 +2451,12 @@ def create_app(
 
         if name == "browse_remote_samples":
             remote_dir = str(arguments.get("path") or "").strip()
-            scan_config = session.config or _connection_as_config()
-            if scan_config is None:
-                return {"ok": False, "error": "请先保存服务器连接配置。"}
-            result = _scan_remote_samples(scan_config, remote_dir)
-            if not result.get("ok"):
-                return {"ok": False, "error": result.get("message", "远程目录扫描失败")}
-            count = len(result.get("samples") or [])
-            return {
-                **result,
-                "ok": True,
-                "scanned_path": remote_dir,
-                "reply": f"已只读扫描 {remote_dir}，识别到 {count} 个配对样本。",
-            }
+            context = execution_context or ToolExecutionContext(project_dir.name, None)
+            return _execute_browse_attempt(
+                remote_dir,
+                project_dir,
+                BrowseContext(context.project_id, context.thread_id, "llm_tool"),
+            )
 
         if name == "refresh_project_status":
             if session.config is None:
@@ -2841,7 +2992,7 @@ def create_app(
             if blocked is not None:
                 return blocked
         if intent is not None and intent.action == "browse_samples":
-            return _browse_samples_reply(session, intent, config, connection_config)
+            return _browse_samples_reply(session, intent, config, connection_config, "main")
 
         # 该端点没有 durable 确认 / resume 能力。风险意图不能退回旧规则执行器，
         # 否则模型不可用时反而能绕过正常工具图的确认门禁。
@@ -3074,7 +3225,7 @@ def create_app(
                     )
                 elif intent is not None and intent.action == "browse_samples":
                     yield step("tool", f"执行操作：{intent_label}", "running")
-                    result = _browse_samples_reply(session, intent, config, connection_config)
+                    result = _browse_samples_reply(session, intent, config, connection_config, requested_thread or "main")
                     reply = str(result.get("reply") or "")
                     yield step("tool", f"执行操作：{intent_label}", "done")
                     payload_extra = {
@@ -3678,19 +3829,12 @@ def create_app(
             session = _session_for(project_dir)
             if session.config is None:
                 return {"error_code": "NO_SESSION", "message": "项目还没有分析会话，请先创建输入会话。"}
-            try:
-                result = _scan_remote_samples(session.config, remote_dir)
-            except SessionError as exc:
-                return {"error_code": "NOT_EVALUABLE", "message": str(exc)}
-            # Finding：_scan_remote_samples 对失败返回 {ok:False,...} 而不抛异常；
-            # 只有 ok=True 才把 fastq_scan/ready 写进审计 history，失败必须透传
-            # 给调用者，绝不把失败记为成功事实。
-            if not result.get("ok"):
-                return {**result, "error_code": "NOT_EVALUABLE",
-                        "action": "scan_remote_fastq", "history": history_items(project_dir)}
-            append_history(project_dir, {"type": "fastq_scan", "name": remote_dir or "remote_scan",
-                                         "state": "ready", "details": {"sample_count": len(result.get("samples", []))}})
-            return {**result, "action": "scan_remote_fastq", "history": history_items(project_dir)}
+            context = BrowseContext(project_id, None, "project_command")
+            final = _finalize_tool_execution_result(
+                _execute_browse_attempt(remote_dir, project_dir, context), project_dir
+            )
+            payload_result = final.local.get("result", final.local)
+            return {**payload_result, "action": "scan_remote_fastq", "history": history_items(project_dir)}
 
         # plan / confirm: drive the audited session state machine.
         session = _session_for(project_dir)
