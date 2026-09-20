@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 from .model_disclosure import (
     DataDisclosureGrant,
@@ -80,6 +80,42 @@ class PreparedExactClaim:
     events: Iterator[Any] = iter(())
     transmission_started: bool = False
     terminal_guard: Callable[..., Any] | None = None
+
+
+@runtime_checkable
+class ExactPrepareCallback(Protocol):
+    __model_data_exact_prepare__: bool
+
+    def __call__(self, claim: ClaimedDataGrant, snapshot: ModelDisclosureConnectionSnapshot) -> tuple[Any, Any]: ...
+
+
+@runtime_checkable
+class ExactOpenStreamCallback(Protocol):
+    __model_data_exact_open_stream__: bool
+
+    def __call__(self, request: Any) -> Iterator[Any]: ...
+
+
+def mark_exact_prepare(callback: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark the sole exact-request preparation callback."""
+    setattr(callback, "__model_data_exact_prepare__", True)
+    return callback
+
+
+def mark_exact_open_stream(callback: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark the sole exact dispatcher callback."""
+    setattr(callback, "__model_data_exact_open_stream__", True)
+    return callback
+
+
+def _marked(callback: Any, marker: str) -> bool:
+    if not callable(callback):
+        return False
+    if bool(getattr(callback, marker, False)):
+        return True
+    # The production gateway exposes this exact dispatcher as a bound method;
+    # keep that single canonical entry point usable without mutating the gateway.
+    return marker == "__model_data_exact_open_stream__" and getattr(callback, "__name__", "") == "dispatch_exact"
 
 
 def _now(value: datetime | None) -> datetime:
@@ -209,6 +245,15 @@ def _extract(project_dir: Path, fields: Sequence[str]) -> dict[DataField, tuple[
 
 def _to_payload(grant: DataDisclosureGrant) -> dict[str, Any]:
     revisions = grant.revisions
+    manifest = dict(grant.manifest)
+    if grant.status in _TERMINAL - {"rejected"} and not all(key in manifest for key in ("fields", "record_counts", "byte_length", "revisions")):
+        manifest = {
+            "fields": list(grant.fields),
+            "record_counts": dict(grant.record_counts),
+            "byte_length": 0,
+            "revisions": revisions.__dict__,
+            **({"claim_token_hash": manifest["claim_token_hash"]} if "claim_token_hash" in manifest else {}),
+        }
     return {
         "grant_id": grant.grant_id, "project_id": grant.project_id, "thread_id": grant.thread_id,
         "provider_identity": grant.provider_identity, "tool_mode": grant.tool_mode,
@@ -221,29 +266,81 @@ def _to_payload(grant: DataDisclosureGrant) -> dict[str, Any]:
         }, "record_counts": dict(grant.record_counts), "status": grant.status,
         "remote_scan_ref_hash": grant.remote_scan_ref_hash, "decided_at": grant.decided_at,
         "claimed_at": grant.claimed_at, "consumed_at": grant.consumed_at,
-        "error_code": grant.error_code, "manifest": dict(grant.manifest),
-        "claim_token_hash": grant.manifest.get("claim_token_hash"),
+        "error_code": grant.error_code, "manifest": manifest,
+        "claim_token_hash": manifest.get("claim_token_hash"),
     }
 
 
 def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGrant:
     try:
+        if not isinstance(value, Mapping):
+            raise ValueError
+        for key in ("grant_id", "project_id", "thread_id", "provider_identity", "tool_mode", "purpose_hash", "issued_at", "expires_at", "policy_version", "revisions", "record_counts", "status"):
+            if key not in value:
+                raise ValueError
         r = value["revisions"]
+        if not isinstance(r, Mapping):
+            raise ValueError
+        policy_version = int(value["policy_version"])
+        if policy_version <= 0 or int(r.get("policy_version", policy_version)) != policy_version:
+            raise ValueError
         revisions = ModelDataRevisions(r["project_revision"], r["sample_revision"], r.get("remote_scan_revision"), r.get("report_revision"), r["provider_config_revision"], int(r.get("policy_version", value["policy_version"])))
+        if any(not isinstance(item, str) or not item.strip() for item in (revisions.project_revision, revisions.sample_revision, revisions.provider_config_revision)):
+            raise ValueError
+        if revisions.remote_scan_revision is not None and (not isinstance(revisions.remote_scan_revision, str) or not revisions.remote_scan_revision.strip()):
+            raise ValueError
+        if revisions.report_revision is not None and (not isinstance(revisions.report_revision, str) or not revisions.report_revision.strip()):
+            raise ValueError
         fields = tuple(value["fields"])
-        if not fields or any(field not in _FIELDS for field in fields) or len(set(fields)) != len(fields):
+        if not isinstance(value["fields"], (list, tuple)) or not fields or any(not isinstance(field, str) or field not in _FIELDS for field in fields) or len(set(fields)) != len(fields):
             raise ValueError
-        if str(value["grant_id"]) != grant_id or value["status"] not in {"pending", "approved", "rejected", "transmitting", "consumed_success", "consumed_ambiguous", "consumed_failed"}:
+        project_id, thread_id = str(value["project_id"]), str(value["thread_id"])
+        if not project_id.strip() or not thread_id.strip():
             raise ValueError
+        status = value["status"]
+        if str(value["grant_id"]) != grant_id or status not in {"pending", "approved", "rejected", "transmitting", "consumed_success", "consumed_ambiguous", "consumed_failed"}:
+            raise ValueError
+        issued_at, expires_at = str(value["issued_at"]), str(value["expires_at"])
+        issued, expires = _parse(issued_at), _parse(expires_at)
+        if expires <= issued or not str(value["provider_identity"]).strip() or not str(value["tool_mode"]).strip() or not str(value["purpose_hash"]).strip():
+            raise ValueError
+        counts = dict(value["record_counts"])
+        if set(counts) != set(fields) or any(not isinstance(k, str) or isinstance(v, bool) or int(v) < 0 for k, v in counts.items()):
+            raise ValueError
+        manifest = value.get("manifest") or {}
+        if not isinstance(manifest, Mapping):
+            raise ValueError
+        if status in _TERMINAL - {"rejected"} and not all(key in manifest for key in ("fields", "record_counts", "byte_length", "revisions")):
+            raise ValueError
+        for timestamp_key in ("decided_at", "claimed_at", "consumed_at"):
+            if value.get(timestamp_key) is not None:
+                _parse(str(value[timestamp_key]))
+        if status in {"approved", "rejected"} and value.get("decided_at") is None:
+            raise ValueError
+        if status in _TERMINAL - {"rejected"} and value.get("consumed_at") is None:
+            raise ValueError
+        if status == "transmitting" and value.get("claimed_at") is None:
+            raise ValueError
+        if status == "pending" and value.get("decided_at") is not None:
+            raise ValueError
+        if status in _TERMINAL - {"rejected"}:
+            mf = manifest
+            mf_fields = tuple(mf["fields"])
+            mf_counts = dict(mf["record_counts"])
+            mf_revisions = mf["revisions"]
+            if mf_fields != fields or mf_counts != counts or isinstance(mf["byte_length"], bool) or not isinstance(mf["byte_length"], int) or mf["byte_length"] < 0 or not isinstance(mf_revisions, Mapping):
+                raise ValueError
+            if any(mf_revisions.get(key) != r.get(key) for key in ("project_revision", "sample_revision", "remote_scan_revision", "report_revision", "provider_config_revision", "policy_version")):
+                raise ValueError
         return DataDisclosureGrant(
-            grant_id=str(value["grant_id"]), project_id=str(value["project_id"]), thread_id=str(value["thread_id"]),
+            grant_id=str(value["grant_id"]), project_id=project_id, thread_id=thread_id,
             provider_identity=str(value["provider_identity"]), tool_mode=str(value["tool_mode"]), fields=fields,
-            purpose_hash=str(value["purpose_hash"]), issued_at=str(value["issued_at"]), expires_at=str(value["expires_at"]),
-            policy_version=int(value["policy_version"]), revisions=revisions,
-            record_counts={str(k): int(v) for k, v in dict(value["record_counts"]).items()}, status=value["status"],
+            purpose_hash=str(value["purpose_hash"]), issued_at=issued_at, expires_at=expires_at,
+            policy_version=policy_version, revisions=revisions,
+            record_counts={str(k): int(v) for k, v in counts.items()}, status=status,
             remote_scan_ref_hash=value.get("remote_scan_ref_hash"), decided_at=value.get("decided_at"),
             claimed_at=value.get("claimed_at"), consumed_at=value.get("consumed_at"), error_code=value.get("error_code"),
-            manifest=dict(value.get("manifest") or {}),
+            manifest=dict(manifest),
         )
     except Exception as exc:
         raise DataGrantError("invalid model data grant", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id) from exc
@@ -264,6 +361,8 @@ def issue_grant_request(
         raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")
     if not isinstance(purpose, str) or not 1 <= len(purpose) <= 240:
         raise DataGrantError("invalid model data purpose", code=MODEL_DATA_GRANT_INVALID, grant_id="")
+    if not str(project_id).strip() or not str(thread_id).strip():
+        raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id="")
     if "remote_paths" in fields:
         raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")
     project_dir = Path(project_dir)
@@ -323,6 +422,8 @@ def claim_grant_for_send(
 ) -> PreparedExactClaim:
     project_dir = Path(project_dir)
     current = _now(now)
+    if not _marked(prepare, "__model_data_exact_prepare__") or not _marked(open_stream, "__model_data_exact_open_stream__"):
+        raise DataGrantError("exact claim requires marked prepare and open_stream callbacks", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id)
     with project_state_lock(_lock_path(project_dir)):
         path = grant_record_path(project_dir, grant_id)
         grant = _from_payload(_read(path, grant_id), grant_id)
@@ -375,6 +476,11 @@ def claim_grant_for_send(
                 failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
                 _write(path, _to_payload(failed))
                 raise _claim_error(failed, code, current)
+        live_counts = _project_counts(project_dir, grant.fields)
+        if live_counts != dict(grant.record_counts):
+            failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_REVISION_CHANGED, "consumed_at": _iso(current)})
+            _write(path, _to_payload(failed))
+            raise _claim_error(failed, MODEL_DATA_REVISION_CHANGED, current)
         token = secrets.token_urlsafe(24)
         claim = ClaimedDataGrant(grant.grant_id, token, GrantBindings(grant.project_id, grant.thread_id, grant.provider_identity, grant.tool_mode, grant.revisions), grant.fields, _extract(project_dir, grant.fields))
         manifest = dict(grant.manifest)
@@ -384,28 +490,30 @@ def claim_grant_for_send(
     context = request = None
     events: Iterator[Any] = iter(())
     try:
-        if prepare is not None:
-            context, request = prepare(claim, snapshot)
-        if open_stream is not None and request is not None:
-            events = open_stream(request)
+        context, request = prepare(claim, snapshot)
+        events = open_stream(request)
+        if events is None:
+            raise DataGrantError("exact dispatcher returned no transport", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id)
     except BaseException as exc:
         fallback = DisclosureManifest(None, claim.fields, grant.record_counts, 0, grant.revisions)
-        finish_grant_claim(project_dir, claim, outcome="consumed_failed", manifest=fallback, error_code=MODEL_CONTEXT_SECRET_DETECTED, now=current)
+        started = bool(getattr(exc, "transmission_started", False))
+        finish_grant_claim(project_dir, claim, outcome="consumed_ambiguous" if started else "consumed_failed", manifest=fallback, error_code=getattr(exc, "code", MODEL_CONTEXT_SECRET_DETECTED), now=current)
         raise
 
     @contextmanager
     def terminal_guard() -> Iterator[None]:
         try:
             yield
-        except BaseException:
+        except BaseException as exc:
             fallback = DisclosureManifest(None, claim.fields, grant.record_counts, 0, grant.revisions)
-            finish_grant_claim(project_dir, claim, outcome="consumed_ambiguous", manifest=fallback, error_code=MODEL_PROVIDER_REQUEST_FAILED, now=_now(None))
+            started = bool(getattr(exc, "transmission_started", False))
+            finish_grant_claim(project_dir, claim, outcome="consumed_ambiguous" if started else "consumed_failed", manifest=fallback, error_code=getattr(exc, "code", MODEL_PROVIDER_REQUEST_FAILED), now=_now(None))
             raise
         else:
             manifest = DisclosureManifest(None, claim.fields, grant.record_counts, 0, grant.revisions)
             finish_grant_claim(project_dir, claim, outcome="consumed_success", manifest=manifest, now=_now(None))
 
-    return PreparedExactClaim(claim, snapshot, context, request, events, False, terminal_guard)
+    return PreparedExactClaim(claim, snapshot, context, request, events, bool(getattr(events, "transmission_started", False)), terminal_guard)
 
 
 def finish_grant_claim(
@@ -426,6 +534,15 @@ def finish_grant_claim(
             raise _claim_error(grant, MODEL_DATA_GRANT_INVALID, current)
         if outcome not in {"consumed_success", "consumed_ambiguous", "consumed_failed"}:
             raise _claim_error(grant, MODEL_DATA_GRANT_INVALID, current)
+        valid_manifest = (
+            tuple(manifest.fields) == tuple(grant.fields)
+            and dict(manifest.record_counts) == dict(grant.record_counts)
+            and isinstance(manifest.byte_length, int) and manifest.byte_length >= 0
+            and manifest.revisions == grant.revisions
+        )
+        if not valid_manifest:
+            outcome, error_code = "consumed_failed", MODEL_DATA_GRANT_INVALID
+            manifest = DisclosureManifest(None, grant.fields, grant.record_counts, 0, grant.revisions)
         updated = DataDisclosureGrant(**{**grant.__dict__, "status": outcome, "consumed_at": _iso(current), "error_code": error_code, "manifest": {"fields": list(manifest.fields), "record_counts": dict(manifest.record_counts), "byte_length": manifest.byte_length, "revisions": manifest.revisions.__dict__}})
         _write(path, _to_payload(updated))
         return updated
