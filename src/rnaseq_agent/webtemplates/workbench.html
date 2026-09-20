@@ -1042,6 +1042,7 @@ function applyRemoteScanGroup() {
     if (d.state) setState(d.state);
     window.remoteScanReference = null;
     window.remoteScanGroups = [];
+    window.remoteScanTruncated = false;
     loadWizardData();
   });
 }
