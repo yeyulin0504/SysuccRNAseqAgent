@@ -54,7 +54,7 @@ from .session import (
     SessionError,
     _load_changesets,
 )
-from .storage import load_json
+from .storage import load_json, project_state_lock, save_json
 from .threads import (
     ThreadError,
     append_message,
@@ -87,7 +87,12 @@ from .remote_browse import (
     resolve_remote_directory,
     validate_remote_browse_path,
 )
-from .remote_scan_store import RemoteScanReference, store_remote_scan, discard_remote_scan
+from .remote_scan_store import (
+    RemoteScanReference,
+    consume_remote_scan,
+    discard_remote_scan,
+    store_remote_scan,
+)
 from .security_audit import AuditCommitUncertainError, _record_browse_audit, browse_history_projection
 from .chat_graph import ToolExecutionContext, ToolExecutionResult
 from .project_intake import (
@@ -112,6 +117,7 @@ from .connection_store import (
     connection_file_path,
     llm_model_name,
     load_browse_policy,
+    locked_browse_policy,
     list_all_approved_data_roots,
     load_connection,
     load_llm,
@@ -325,10 +331,6 @@ def _finalize_tool_execution_result(result: ToolExecutionResult, project_dir: Pa
         return result
     try:
         _record_browse_audit(event)
-        if project_dir is not None:
-            append_history(project_dir, {"type": "remote_browse_audit", "name": "远程目录浏览",
-                                         "state": event.outcome, "details": browse_history_projection(event)})
-        return ToolExecutionResult(result.local, result.model, result.log_projection, None)
     except Exception as exc:
         # A definitively failed pre-publication audit must not leave an exact
         # pending scan retrievable.  Uncertain publication deliberately keeps
@@ -344,6 +346,17 @@ def _finalize_tool_execution_result(result: ToolExecutionResult, project_dir: Pa
             local={"ok": False, "error_code": "REMOTE_SECURITY_AUDIT_FAILED", "message": "远程浏览审计暂时不可用。"},
             model={"ok": False, "blocked": True, "error_code": "REMOTE_SECURITY_AUDIT_FAILED", "source_ref": None},
             log_projection={"ok": False, "error_code": "REMOTE_SECURITY_AUDIT_FAILED"}, security_audit=None)
+
+    # The authoritative audit commit has completed.  A best-effort History
+    # projection failure must never roll back or discard the exact pending
+    # scan: History is a de-identified UI index, not the security sink.
+    if project_dir is not None:
+        try:
+            append_history(project_dir, {"type": "remote_browse_audit", "name": "远程目录浏览",
+                                         "state": event.outcome, "details": browse_history_projection(event)})
+        except Exception:
+            pass
+    return ToolExecutionResult(result.local, result.model, result.log_projection, None)
 
 
 def _resolve_settings_remote_path(requested_path: str) -> tuple[Any, str]:
@@ -1794,7 +1807,20 @@ def create_app(
             ),
             session.project_dir,
         )
-        return final.local.get("result", final.local)
+        payload_result = dict(final.local.get("result", final.local))
+        groups = payload_result.get("groups") or []
+        if groups:
+            payload_result["samples"] = groups[0].get("samples") or []
+            payload_result["unmatched"] = groups[0].get("unmatched_basenames") or []
+        reference = final.local.get("reference") if isinstance(final.local, dict) else None
+        if isinstance(reference, dict):
+            # The browser receives only opaque selection fields.  Exact group
+            # rows remain local display data and are never treated as authority
+            # by the apply endpoint.
+            payload_result["reference"] = reference
+            payload_result["scan_id"] = reference.get("scan_id")
+            payload_result["result_revision"] = reference.get("result_revision")
+        return payload_result
 
     def _configure_project_from_chat(
         project_id: str | None,
@@ -3066,6 +3092,15 @@ def create_app(
                 media_type="text/event-stream",
             )
 
+        explicit_project = str(
+            request.query_params.get("project") or payload.get("project_id") or ""
+        ).strip()
+        if explicit_project and workspace.get_project(explicit_project) is None:
+            return JSONResponse(
+                {"ok": False, "error_code": "PROJECT_NOT_FOUND", "message": "项目不存在。"},
+                status_code=404,
+            )
+
         session = _session_for(_legacy_dir_for(request, payload))
         config = session.config
         connection_config = _connection_as_config()
@@ -3806,6 +3841,181 @@ def create_app(
         return {
             "state": session.state,
             "gate": gate.formatted(),
+            "intake": intake,
+            "history": history_items(project_dir),
+        }
+
+    def _apply_remote_scan_group(
+        project_id: str,
+        project_dir: Path,
+        group: Any,
+        claim_id: str,
+        *,
+        scan_id: str,
+        result_revision: str,
+    ) -> None:
+        """Atomically materialize a server-verified group as a filename-only draft.
+
+        The callback is deliberately the only place where a consumed scan can
+        mutate project state.  It receives the selected group from the private
+        scan store; request JSON never supplies a path or sample row.  A bounded
+        opaque receipt makes retries after a process crash idempotent.
+        """
+        config_path = project_dir / "project.json"
+
+        def mutate(current: dict[str, Any]) -> dict[str, Any]:
+            receipts = current.get("remote_scan_apply_receipts")
+            if not isinstance(receipts, list):
+                receipts = []
+            for receipt in receipts:
+                if isinstance(receipt, dict) and receipt.get("apply_claim_id") == claim_id:
+                    return current
+
+            rows = []
+            for sample in group.samples:
+                row = {
+                    "sample_id": sample.sample_id,
+                    "condition": "",
+                    "fastq_1": sample.fastq_1,
+                }
+                if sample.fastq_2:
+                    row["fastq_2"] = sample.fastq_2
+                rows.append(row)
+
+            if current:
+                updated = dict(current)
+            else:
+                updated = _default_config(
+                    project_dir,
+                    {
+                        "project_id": project_id,
+                        "data_source": "remote_path",
+                        "remote_fastq_dir": group.canonical_directory,
+                        "samples": rows,
+                    },
+                )
+            samples = dict(updated.get("samples") or {})
+            samples.update(
+                {
+                    "source": "remote_path",
+                    "remote_prestaged": True,
+                    "remote_data_dir": group.canonical_directory,
+                    "items": rows,
+                }
+            )
+            updated["samples"] = samples
+            # Receipt records only opaque identifiers and a timestamp.  Keep a
+            # small bounded ledger and never copy paths, basenames, or samples.
+            receipts.append(
+                {
+                    "apply_claim_id": claim_id,
+                    "scan_id": scan_id,
+                    "result_revision": result_revision,
+                    "group_id": group.group_id,
+                    "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                }
+            )
+            updated["remote_scan_apply_receipts"] = receipts[-32:]
+            return updated
+
+        with project_state_lock(config_path):
+            current = load_json(config_path) if config_path.is_file() else {}
+            save_json(config_path, mutate(current))
+
+        # A scan can be applied to a project created from the workspace page,
+        # where project.json/session.json do not exist yet.  Create the normal
+        # session after the atomic config+receipt write so plan/confirm use the
+        # existing state machine.  A retry repairs this step if a crash occurs.
+        session_path = project_dir / "session.json"
+        if not session_path.is_file():
+            try:
+                created = ProjectSession(project_dir)
+                created.new_project(load_json(config_path))
+                workspace.touch(project_id, created.state)
+            except SessionError:
+                # Another worker may have created the session concurrently; a
+                # later idempotent retry will observe it.  Do not rewrite the
+                # receipt or generate a second claim.
+                if not session_path.is_file():
+                    raise
+
+    @app.post("/api/projects/{project_id}/fastq/scan-apply")
+    async def api_project_fastq_scan_apply(project_id: str, request: Request):
+        """Apply one server-verified remote scan group to the workbench draft."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error_code": "REMOTE_SCAN_REFERENCE_INVALID", "message": "请求体必须是 JSON 对象。"}, status_code=400)
+        scan_id = payload.get("scan_id")
+        result_revision = payload.get("result_revision")
+        group_id = payload.get("group_id")
+        accept_truncated = bool(payload.get("accept_truncated", False))
+        if not all(isinstance(value, str) and value for value in (scan_id, result_revision, group_id)):
+            return JSONResponse({"ok": False, "error_code": "REMOTE_SCAN_REFERENCE_INVALID", "message": "缺少有效的 scan_id、result_revision 或 group_id。"}, status_code=400)
+
+        try:
+            with locked_browse_policy() as policy:
+                group = consume_remote_scan(
+                    project_dir,
+                    scan_id=scan_id,
+                    result_revision=result_revision,
+                    group_id=group_id,
+                    expected_policy=policy,
+                    expected_context=BrowseContext(project_id, None, "workbench"),
+                    accept_truncated=accept_truncated,
+                    apply=lambda selected, claim: _apply_remote_scan_group(
+                        project_id,
+                        project_dir,
+                        selected,
+                        claim,
+                        scan_id=scan_id,
+                        result_revision=result_revision,
+                    ),
+                )
+        except ValueError as exc:
+            code = str(exc) or "REMOTE_SCAN_REFERENCE_INVALID"
+            statuses = {
+                "REMOTE_SCAN_REFERENCE_EXPIRED": 410,
+                "REMOTE_SCAN_REFERENCE_USED": 409,
+                "REMOTE_SCAN_TRUNCATED_ACK_REQUIRED": 409,
+                "REMOTE_SCAN_STORE_FAILED": 503,
+            }
+            return JSONResponse({"ok": False, "error_code": code, "message": code}, status_code=statuses.get(code, 400))
+        except RuntimeError as exc:
+            return JSONResponse({"ok": False, "error_code": "REMOTE_SCAN_STORE_FAILED", "message": str(exc)}, status_code=503)
+
+        # Intake is a local UI projection.  It intentionally stores only the
+        # authorized canonical directory and filename-only rows; no provider or
+        # generic tool log receives this payload.
+        intake = save_intake(
+            project_dir,
+            {
+                "route": "bulk_rna",
+                "input_type": "remote_fastq",
+                "state": "input_ready",
+                "fastq": {"data_source": "remote_path", "remote_fastq_dir": group.canonical_directory},
+                "samples": [asdict(sample) for sample in group.samples],
+            },
+        )
+        append_history(
+            project_dir,
+            {
+                "type": "remote_scan_apply",
+                "name": "远程样本组已应用",
+                "state": "ready",
+                "details": {"sample_count": len(group.samples), "directory_count": 1},
+            },
+        )
+        session = _session_for(project_dir)
+        return {
+            "ok": True,
+            "state": derive_visible_state(project_dir, session.state),
+            "group": {
+                "group_id": group.group_id,
+                "canonical_directory": group.canonical_directory,
+                "samples": [asdict(sample) for sample in group.samples],
+            },
             "intake": intake,
             "history": history_items(project_dir),
         }

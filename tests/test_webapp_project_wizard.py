@@ -376,6 +376,69 @@ def test_fastq_session_from_detected_samples_enters_input_ready(tmp_path: Path) 
     assert intake["fastq"]["remote_fastq_dir"] == "/hwdata/home/yeyulin/demo_fastq"
 
 
+def test_remote_scan_apply_persists_filename_only_group_and_rejects_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A workbench apply consumes server state, ignoring browser exact-data fields."""
+    from rnaseq_agent.connection_store import ApprovedDataRoot, BrowsePolicy
+    from rnaseq_agent.remote_browse import BrowseContext, BrowseDirectoryGroup, BrowseSampleRow, BrowseScanPayload, _result
+    from rnaseq_agent.remote_scan_store import store_remote_scan
+    from rnaseq_agent.ssh_identity import SSHIdentity
+    import rnaseq_agent.connection_store as connection_store
+    import rnaseq_agent.webapp as webapp_module
+    from contextlib import contextmanager
+
+    client = TestClient(create_app(project_dir=tmp_path / "legacy"))
+    token = _token(client)
+    h = _headers(token)
+    _create_project(client, token, "wiz_apply")
+    revision = "sha256:" + "a" * 64
+    identity = SSHIdentity("example.test", "alice", 22)
+    root = ApprovedDataRoot("root_1", "example.test", "alice", 22, "/srv/team", "/srv/team", "2026-01-01T00:00:00Z", None)
+    monkeypatch.setattr(connection_store, "load_browse_policy", lambda: BrowsePolicy(identity, (root,), revision, True))
+    @contextmanager
+    def _policy_lock():
+        yield BrowsePolicy(identity, (root,), revision, True)
+    monkeypatch.setattr(webapp_module, "locked_browse_policy", _policy_lock)
+    context = BrowseContext("wiz_apply", None, "workbench")
+    group = BrowseDirectoryGroup(
+        "group_1", "/srv/team/run-a",
+        (BrowseSampleRow("S1", "S1_R1.fastq.gz", "S1_R2.fastq.gz"),), (),
+    )
+    result = _result(
+        context=context, event_id="audit_" + "3" * 32,
+        started_at="2026-09-17T12:00:00Z", identity=identity,
+        requested_path="/srv/team/run-a", canonical_target="/srv/team/run-a",
+        root_id="root_1", revision=revision,
+        payload=BrowseScanPayload((group,), 1, 0, False), authorization={},
+    )
+    project_dir = tmp_path / "wiz_apply"
+    ref = store_remote_scan(project_dir, result)
+    body = client.post(
+        "/api/projects/wiz_apply/fastq/scan-apply",
+        json={
+            "scan_id": ref.scan_id,
+            "result_revision": ref.result_revision,
+            "group_id": group.group_id,
+            "canonical_directory": "/attacker/posted/path",
+            "samples": [{"sample_id": "attacker", "fastq_1": "/attacker.fastq.gz"}],
+        },
+        headers=h,
+    )
+    assert body.status_code == 200, body.text
+    project = __import__("json").loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    assert project["samples"]["remote_data_dir"] == "/srv/team/run-a"
+    assert project["samples"]["items"] == [{"sample_id": "S1", "condition": "", "fastq_1": "S1_R1.fastq.gz", "fastq_2": "S1_R2.fastq.gz"}]
+    receipt = project["remote_scan_apply_receipts"]
+    assert len(receipt) == 1
+    assert set(receipt[0]) == {"apply_claim_id", "scan_id", "result_revision", "group_id", "applied_at"}
+    replay = client.post(
+        "/api/projects/wiz_apply/fastq/scan-apply",
+        json={"scan_id": ref.scan_id, "result_revision": ref.result_revision, "group_id": group.group_id},
+        headers=h,
+    )
+    assert replay.status_code == 409
+    assert replay.json()["error_code"] == "REMOTE_SCAN_REFERENCE_USED"
+
+
 def test_fastq_session_rejects_samples_not_a_list(tmp_path: Path) -> None:
     """Finding 1：samples 传 dict 而非 list → INVALID_SAMPLES，不得 500."""
     client = TestClient(create_app(project_dir=tmp_path / "legacy"))

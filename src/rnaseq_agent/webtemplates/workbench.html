@@ -981,14 +981,68 @@ function scanRemoteFastq() {
   scanBox.innerHTML = "<div class='muted'>正在通过 SSH 扫描…</div>";
   api("POST", legacy("/api/samples/scan-remote"), { path }).then(d => {
     if (!d.ok) { scanBox.innerHTML = `<span class="err">${escapeHtml(d.message)}</span>`; return; }
-    const rows = d.samples || [];
+    window.remoteScanReference = d.reference || null;
+    window.remoteScanGroups = Array.isArray(d.groups) ? d.groups : [];
+    window.remoteScanTruncated = Boolean(d.truncated);
+    const groups = window.remoteScanGroups;
+    const selected = groups.length === 1 ? groups[0] : null;
+    const rows = selected ? (selected.samples || []) : (d.samples || []);
     const wrap = document.getElementById("fastqSampleRows");
     if (wrap) wrap.innerHTML = "";
     rows.forEach(s => addFastqSampleRow({ sample_id: s.sample_id, condition: "", fastq_1: s.fastq_1, fastq_2: s.fastq_2 }));
     const ta = document.getElementById("fastqGroups");
     if (ta) ta.value = rows.map(s => s.sample_id + "\t").join("\n");
     if (editor) editor.classList.remove("hidden");
-    scanBox.innerHTML = `<span class="ok">识别 ${rows.length} 个配对样本</span> · ${d.unmatched.length} 个文件未配对。在下方补充分组后生成会话。`;
+    let groupsHtml = "";
+    if (groups.length > 1) {
+      groupsHtml = `<div class="step">发现 ${groups.length} 个远程目录组，请明确选择一个：</div>`
+        + groups.map(g => `<label class="step"><input type="radio" name="remoteScanGroup" value="${escapeHtml(g.group_id)}" onchange="selectRemoteScanGroup('${escapeHtml(g.group_id)}')"> ${escapeHtml(g.canonical_directory)}（${(g.samples || []).length} 个样本）</label>`).join("");
+    }
+    const truncationWarning = d.truncated ? `<div class="step err">扫描结果已截断；应用前需要明确确认完整性风险。<label><input id="remoteScanAcceptTruncated" type="checkbox"> 我确认仅应用当前截断结果</label></div>` : "";
+    const apply = d.reference && (selected || groups.length > 1)
+      ? `<button class="secondary small" onclick="applyRemoteScanGroup()">应用已选择的服务器目录</button>` : "";
+    scanBox.innerHTML = `<span class="ok">识别 ${rows.length} 个配对样本</span> · ${(d.unmatched || []).length} 个文件未配对。${truncationWarning}${groupsHtml}${apply}`;
+  });
+}
+
+function selectRemoteScanGroup(groupId) {
+  const groups = window.remoteScanGroups || [];
+  const group = groups.find(g => g.group_id === groupId);
+  if (!group) return;
+  const wrap = document.getElementById("fastqSampleRows");
+  if (wrap) wrap.innerHTML = "";
+  (group.samples || []).forEach(s => addFastqSampleRow({ sample_id: s.sample_id, condition: "", fastq_1: s.fastq_1, fastq_2: s.fastq_2 }));
+  const ta = document.getElementById("fastqGroups");
+  if (ta) ta.value = (group.samples || []).map(s => s.sample_id + "\t").join("\n");
+  window.remoteScanSelectedGroup = groupId;
+}
+
+function applyRemoteScanGroup() {
+  const ref = window.remoteScanReference || {};
+  const groups = window.remoteScanGroups || [];
+  const groupId = window.remoteScanSelectedGroup || (groups.length === 1 ? groups[0].group_id : "");
+  if (!currentProject || !ref.scan_id || !ref.result_revision || !groupId) {
+    msg("fastqMsg", "请先选择一个服务器目录组。", "err");
+    return;
+  }
+  const truncated = Boolean(window.remoteScanTruncated);
+  const acceptTruncated = !truncated || Boolean(document.getElementById("remoteScanAcceptTruncated")?.checked);
+  if (truncated && !acceptTruncated) {
+    msg("fastqMsg", "扫描结果已截断；请先确认后再应用。", "err");
+    return;
+  }
+  api("POST", wizardPath("/fastq/scan-apply"), {
+    scan_id: ref.scan_id,
+    result_revision: ref.result_revision,
+    group_id: groupId,
+    accept_truncated: acceptTruncated
+  }).then(d => {
+    if (!d.ok) { msg("fastqMsg", escapeHtml(d.message || d.error_code || "应用扫描结果失败"), "err"); return; }
+    msg("fastqMsg", "已应用服务器目录组；请补充样本分组后生成计划。", "ok");
+    if (d.state) setState(d.state);
+    window.remoteScanReference = null;
+    window.remoteScanGroups = [];
+    loadWizardData();
   });
 }
 
