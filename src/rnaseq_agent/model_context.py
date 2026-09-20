@@ -12,8 +12,13 @@ from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
 
-from .model_disclosure import ModelDataRevisions
-from .model_provider import ProviderConfig, provider_config_revision
+from .model_disclosure import (
+    DisclosureManifest,
+    ModelContext,
+    ModelDataRevisions,
+    ProviderIdentity,
+)
+from .model_provider import ProviderConfig, provider_config_revision, provider_identity
 from .storage import load_json
 
 MODEL_PROJECTION_VERSION = 1
@@ -570,3 +575,79 @@ def read_model_data_revisions(
         report_revision=_file_sha256(project_dir / "report.md"),
         provider_config_revision=provider_config_revision(provider),
     )
+
+
+def _context_free_revisions(provider: ProviderConfig) -> ModelDataRevisions:
+    """Return deterministic revisions for a request with no project context."""
+    empty_revision = canonical_json_sha256({})
+    return ModelDataRevisions(
+        project_revision=empty_revision,
+        sample_revision=empty_revision,
+        remote_scan_revision=None,
+        report_revision=None,
+        provider_config_revision=provider_config_revision(provider),
+    )
+
+
+class ModelContextBuilder:
+    """Construct provider-safe context without implicitly discovering projects.
+
+    ``project_dir=None`` is the explicit context-free mode used by router and
+    connection-test calls.  It intentionally emits only the caller's fixed
+    system prompt and user-authored message.  A real, existing project may add
+    the bounded summary projection; no exact grant data is accepted here.
+    """
+
+    @staticmethod
+    def build(
+        *,
+        project_dir: Path | None,
+        project_id: str,
+        thread_id: str,
+        provider: ProviderConfig,
+        system_prompt: str,
+        current_user_message: str,
+        durable_messages: Any,
+        claimed_grant: Any = None,
+    ) -> ModelContext:
+        del project_id, thread_id, claimed_grant
+        messages: list[dict[str, Any]] = []
+        revisions = _context_free_revisions(provider)
+
+        # Context-free callers must never probe a project path.  Existing
+        # project summaries are still bounded and allowlisted when explicitly
+        # supplied by a caller.
+        if project_dir is not None and Path(project_dir).is_dir():
+            summary = build_safe_project_summary(Path(project_dir))
+            messages.append({
+                "role": "system",
+                "name": "model_summary_v1",
+                "content": json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            })
+            revisions = read_model_data_revisions(Path(project_dir), provider)
+
+        if str(system_prompt):
+            messages.append({"role": "system", "content": str(system_prompt)})
+
+        for item in durable_messages or ():
+            if not isinstance(item, Mapping):
+                continue
+            role = str(item.get("role") or "").strip()
+            content = item.get("content")
+            if role not in {"system", "user", "assistant"} or not isinstance(content, str):
+                continue
+            messages.append({"role": role, "content": content})
+
+        messages.append({"role": "user", "content": str(current_user_message)})
+        manifest = DisclosureManifest(
+            grant_id_hash=None,
+            fields=(),
+            record_counts={},
+            byte_length=0,
+            revisions=revisions,
+        )
+        return ModelContext(
+            messages=tuple(messages),
+            disclosure_manifest=manifest,
+            provider_identity=provider_identity(provider),
+        )

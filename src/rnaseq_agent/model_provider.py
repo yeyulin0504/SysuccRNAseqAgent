@@ -8,6 +8,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
@@ -448,3 +449,57 @@ def provider_config_revision(config: ProviderConfig) -> str:
         "model": config.model,
         "api_mode": config.api_mode,
     })
+
+
+def context_free_prepared_request(
+    *,
+    config: ProviderConfig,
+    credentials: ProviderCredentials,
+    context: Any,
+    timeout_seconds: float,
+    stream: bool = False,
+    response_schema: Mapping[str, Any] | None = None,
+    codex_executable: Path | None = None,
+    codex_home: Path | None = None,
+) -> PreparedModelRequest:
+    """Prepare a provider request from an already-built safe context.
+
+    This constructor deliberately has no project or grant inputs.  It also
+    never adds tools or tool choice, making it suitable for router and legacy
+    context-free calls.
+    """
+    messages = [dict(item) for item in context.messages]
+    if config.api_mode == "responses":
+        system_parts = [str(item.get("content") or "") for item in messages if item.get("role") == "system"]
+        input_parts = [item for item in messages if item.get("role") != "system"]
+        payload: dict[str, Any] = {
+            "model": config.model,
+            "instructions": "\n".join(system_parts),
+            "input": input_parts,
+            "store": False,
+        }
+        if stream:
+            payload["stream"] = True
+        prompt = ""
+    elif config.api_mode == "codex_cli":
+        payload = {}
+        prompt = "\n".join(f"{item.get('role', '')}: {item.get('content', '')}" for item in messages)
+    else:
+        payload = {"model": config.model, "messages": messages}
+        if stream:
+            payload["stream"] = True
+        prompt = ""
+    return PreparedModelRequest(
+        provider=config,
+        identity=provider_identity(config),
+        api_mode=config.api_mode,
+        payload=payload,
+        credentials=credentials,
+        timeout_seconds=timeout_seconds,
+        stream=stream,
+        prompt=prompt,
+        response_schema=response_schema,
+        codex_executable=codex_executable,
+        codex_home=codex_home,
+        disclosure_manifest=None,
+    )

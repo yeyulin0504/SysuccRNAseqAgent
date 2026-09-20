@@ -9,8 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .model_disclosure import PreparedModelRequest, ProviderCredentials
-from .model_provider import MAX_RESPONSE_BYTES, ModelProviderGateway, normalize_provider_config, provider_identity
+from .model_context import ModelContextBuilder
+from .model_disclosure import ProviderCredentials
+from .model_provider import (
+    MAX_RESPONSE_BYTES,
+    ModelProviderGateway,
+    context_free_prepared_request,
+    normalize_provider_config,
+)
 
 
 ALLOWED_ACTIONS = {
@@ -123,6 +129,17 @@ class OpenAICompatibleClient:
 
     def decide(self, user_text: str, *, has_project: bool) -> LLMDecision:
         system_prompt = _router_system_prompt(has_project)
+        provider = self.provider_config
+        context = ModelContextBuilder.build(
+            project_dir=None,
+            project_id="",
+            thread_id="",
+            provider=provider,
+            system_prompt=system_prompt,
+            current_user_message=user_text,
+            durable_messages=(),
+            claimed_grant=None,
+        )
         if self.resolved_api_mode == "responses":
             payload = {
                 "model": self.model,
@@ -130,7 +147,7 @@ class OpenAICompatibleClient:
                 "input": user_text,
                 "store": False,
             }
-            response = self._post_json("/responses", payload)
+            response = self._post_json("/responses", payload, context=context)
             content = _extract_responses_text(response)
         else:
             payload = {
@@ -141,7 +158,7 @@ class OpenAICompatibleClient:
                     {"role": "user", "content": user_text},
                 ],
             }
-            response = self._post_json("/chat/completions", payload)
+            response = self._post_json("/chat/completions", payload, context=context)
             try:
                 content = response["choices"][0]["message"]["content"]
             except (KeyError, IndexError, TypeError) as exc:
@@ -164,17 +181,26 @@ class OpenAICompatibleClient:
             raise LLMError("模型列表接口请求失败。") from exc
         return {"data": models}
 
-    def _post_json(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(self, endpoint: str, payload: dict[str, Any], *, context=None) -> dict[str, Any]:
         if endpoint not in {"/responses", "/chat/completions"}:
             raise LLMError("不支持的模型 POST 接口。")
         mode = "responses" if endpoint == "/responses" else "chat_completions"
         provider = self._provider_config(api_mode=mode)
-        request = PreparedModelRequest(
-            provider=provider,
-            identity=provider_identity(provider),
-            api_mode=mode,
-            payload=payload,
+        if context is None:
+            context = ModelContextBuilder.build(
+                project_dir=None,
+                project_id="",
+                thread_id="",
+                provider=provider,
+                system_prompt="",
+                current_user_message="",
+                durable_messages=payload.get("messages") or (),
+                claimed_grant=None,
+            )
+        request = context_free_prepared_request(
+            config=provider,
             credentials=ProviderCredentials(api_key=self.api_key),
+            context=context,
             timeout_seconds=self.timeout_seconds,
         )
         try:
@@ -249,20 +275,25 @@ class CodexCLIClient:
             "required": ["action", "message", "path"],
             "additionalProperties": False,
         }
-        prompt = (
-            f"{_router_system_prompt(has_project)}\n"
-            "Do not call tools, inspect files, or run commands. Answer immediately.\n"
-            f"User input: {user_text}"
+        provider = self.provider_config
+        context = ModelContextBuilder.build(
+            project_dir=None,
+            project_id="",
+            thread_id="",
+            provider=provider,
+            system_prompt=(
+                f"{_router_system_prompt(has_project)}\n"
+                "Do not call tools, inspect files, or run commands. Answer immediately."
+            ),
+            current_user_message=user_text,
+            durable_messages=(),
+            claimed_grant=None,
         )
-
-        request = PreparedModelRequest(
-            provider=self.provider_config,
-            identity=provider_identity(self.provider_config),
-            api_mode="codex_cli",
-            payload={},
+        request = context_free_prepared_request(
+            config=provider,
             credentials=ProviderCredentials(),
+            context=context,
             timeout_seconds=self.timeout_seconds,
-            prompt=prompt,
             response_schema=schema,
             codex_executable=self.executable,
             codex_home=self.codex_home,

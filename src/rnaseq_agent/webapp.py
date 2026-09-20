@@ -97,8 +97,13 @@ from .remote_scan_store import (
 )
 from .security_audit import AuditCommitUncertainError, _record_browse_audit, browse_history_projection
 from .chat_graph import ToolExecutionContext, ToolExecutionResult
-from .model_disclosure import PreparedModelRequest, ProviderCredentials, ProviderRequestError
-from .model_provider import ModelProviderGateway, normalize_provider_config, provider_identity
+from .model_context import ModelContextBuilder
+from .model_disclosure import ProviderCredentials, ProviderRequestError
+from .model_provider import (
+    ModelProviderGateway,
+    context_free_prepared_request,
+    normalize_provider_config,
+)
 from .project_intake import (
     append_history,
     derive_visible_state,
@@ -595,7 +600,22 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
     try:
         llm = config.get("llm", config)
         provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": llm.get("api_mode") or "chat_completions"})
-        request = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": _llm_messages(text), "temperature": 0.2}, credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")), timeout_seconds=timeout)
+        context = ModelContextBuilder.build(
+            project_dir=None,
+            project_id="",
+            thread_id="",
+            provider=provider,
+            system_prompt=_llm_messages(text)[0]["content"],
+            current_user_message=text,
+            durable_messages=(),
+            claimed_grant=None,
+        )
+        request = context_free_prepared_request(
+            config=provider,
+            credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")),
+            context=context,
+            timeout_seconds=timeout,
+        )
         return ModelProviderGateway().complete(request).text.strip() or None
     except Exception:  # noqa: BLE001 - any failure falls back to the rule router
         return None
@@ -615,7 +635,23 @@ def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0)
     try:
         llm = config.get("llm", config)
         provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": llm.get("api_mode") or "chat_completions"})
-        request = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": _llm_messages(text), "temperature": 0.2, "stream": True}, credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")), timeout_seconds=timeout, stream=True)
+        context = ModelContextBuilder.build(
+            project_dir=None,
+            project_id="",
+            thread_id="",
+            provider=provider,
+            system_prompt=_llm_messages(text)[0]["content"],
+            current_user_message=text,
+            durable_messages=(),
+            claimed_grant=None,
+        )
+        request = context_free_prepared_request(
+            config=provider,
+            credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")),
+            context=context,
+            timeout_seconds=timeout,
+            stream=True,
+        )
         streamed = False
         for event in ModelProviderGateway().stream(request):
             if event.kind == "delta":
@@ -1757,8 +1793,24 @@ def create_app(
             return {"ok": False, "message": "请先保存 API Base、API Key 和模型"}
         try:
             provider = normalize_provider_config({"backend": llm.get("backend") or "api", "provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm["model"], "api_mode": llm.get("api_mode") or "chat_completions"})
-            prepared = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": [{"role": "user", "content": "请只回复：连接正常"}], "temperature": 0}, credentials=ProviderCredentials(api_key=str(llm["api_key"])), timeout_seconds=30)
-            reply = ModelProviderGateway().complete(prepared).text.strip()
+            context = ModelContextBuilder.build(
+                project_dir=None,
+                project_id="",
+                thread_id="",
+                provider=provider,
+                system_prompt="你是连接测试助手。",
+                current_user_message="请只回复：连接正常",
+                durable_messages=(),
+                claimed_grant=None,
+            )
+            prepared = context_free_prepared_request(
+                config=provider,
+                credentials=ProviderCredentials(api_key=str(llm["api_key"])),
+                context=context,
+                timeout_seconds=30,
+            )
+            gateway = ModelProviderGateway()
+            reply = (gateway.responses(prepared) if provider.api_mode == "responses" else gateway.complete(prepared)).text.strip()
             return {"ok": True, "message": "LLM API 连接成功", "reply": reply}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"LLM API 连接失败：{type(exc).__name__}"}
