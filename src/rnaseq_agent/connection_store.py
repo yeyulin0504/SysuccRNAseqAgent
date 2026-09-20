@@ -302,6 +302,30 @@ def list_approved_data_roots(*, store_dir: Path | None = None) -> tuple[Approved
     return policy.roots if policy.available else ()
 
 
+def list_all_approved_data_roots(
+    *, store_dir: Path | None = None,
+) -> tuple[ApprovedDataRoot, ...]:
+    """Return valid root records for the live identity, including revoked ones.
+
+    ``BrowsePolicy.roots`` intentionally contains only active authorization
+    records. Settings needs the historical records as well so it can render
+    revoked roots without opening the connection document itself.
+    """
+    directory = _resolve_store_dir(store_dir)
+    payload, _exists, valid_payload = _read_browse_payload(directory)
+    if not valid_payload or not isinstance(payload, dict):
+        return ()
+    try:
+        identity = normalize_ssh_identity(payload)
+        roots = _parse_roots(payload)
+    except (SSHIdentityError, TypeError, ValueError, KeyError):
+        return ()
+    return tuple(
+        root for root in roots
+        if (root.host, root.user, root.port) == (identity.host, identity.user, identity.port)
+    )
+
+
 def _mutation_conflict() -> BrowsePolicyConflictError:
     return BrowsePolicyConflictError("REMOTE_ROOT_REVISION_CONFLICT")
 
@@ -537,6 +561,89 @@ def _open_directory_no_follow(directory: Path) -> int:
         raise
 
 
+def _open_windows_payload_fd(
+    directory: Path,
+    expected_directory: os.stat_result,
+    expected_file: os.stat_result,
+) -> int:
+    """Open the payload relative to a Windows directory handle.
+
+    ``CreateFileW`` protects the validated directory handle from reparse
+    traversal; ``NtCreateFile`` performs the child open relative to that
+    handle, so later pathname replacement cannot redirect the read.
+    """
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.windll.kernel32
+    ntdll = ctypes.windll.ntdll
+    invalid = ctypes.c_void_p(-1).value
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_ALL = 0x7
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+    class OBJECT_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE), ("ObjectName", ctypes.POINTER(UNICODE_STRING)), ("Attributes", wintypes.ULONG), ("SecurityDescriptor", ctypes.c_void_p), ("SecurityQualityOfService", ctypes.c_void_p)]
+    class IO_STATUS_BLOCK(ctypes.Structure):
+        _fields_ = [("Status", wintypes.LONG), ("Information", ctypes.c_size_t)]
+    class FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+    kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, wintypes.INT, ctypes.c_void_p, wintypes.DWORD]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    ntdll.NtCreateFile.argtypes = [ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, ctypes.POINTER(OBJECT_ATTRIBUTES), ctypes.POINTER(IO_STATUS_BLOCK), ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG]
+    ntdll.NtCreateFile.restype = ctypes.c_long
+
+    def reject_reparse(handle: wintypes.HANDLE) -> None:
+        info = FILE_ATTRIBUTE_TAG_INFO()
+        if not kernel.GetFileInformationByHandleEx(handle, 9, ctypes.byref(info), ctypes.sizeof(info)) or info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("private path contains a reparse point")
+
+    directory_handle = kernel.CreateFileW(str(directory), GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, None)
+    if directory_handle == invalid:
+        raise OSError("CreateFileW failed for private store directory")
+    try:
+        reject_reparse(directory_handle)
+        directory_fd = msvcrt.open_osfhandle(directory_handle, os.O_RDONLY)
+        directory_handle = None
+        opened_directory = os.fstat(directory_fd)
+        if not _same_file_identity(expected_directory, opened_directory):
+            os.close(directory_fd)
+            raise OSError("private store directory changed during secure open")
+        name = ctypes.create_unicode_buffer(CONNECTION_FILE_NAME)
+        object_name = UNICODE_STRING(len(CONNECTION_FILE_NAME) * 2, (len(CONNECTION_FILE_NAME) + 1) * 2, ctypes.cast(name, ctypes.c_void_p))
+        attrs = OBJECT_ATTRIBUTES(ctypes.sizeof(OBJECT_ATTRIBUTES), msvcrt.get_osfhandle(directory_fd), ctypes.pointer(object_name), 0x40, None, None)
+        status_block = IO_STATUS_BLOCK()
+        child = wintypes.HANDLE()
+        status = ntdll.NtCreateFile(ctypes.byref(child), GENERIC_READ | 0x00100000, ctypes.byref(attrs), ctypes.byref(status_block), None, 0, FILE_SHARE_ALL, 1, 0x40 | 0x20 | FILE_FLAG_OPEN_REPARSE_POINT, None, 0)
+        if status < 0 or not child.value:
+            os.close(directory_fd)
+            raise OSError(f"NtCreateFile failed: 0x{status & 0xffffffff:08x}")
+        os.close(directory_fd)
+        try:
+            fd = msvcrt.open_osfhandle(child.value, os.O_RDONLY)
+        except BaseException:
+            kernel.CloseHandle(child)
+            raise
+        opened = os.fstat(fd)
+        if not _same_file_identity(expected_file, opened) or not stat.S_ISREG(opened.st_mode):
+            os.close(fd)
+            raise OSError("connection payload changed during secure open")
+        return fd
+    finally:
+        kernel.CloseHandle(directory_handle)
+
+
 def _read_payload_state(directory: Path, *, secure: bool = False) -> tuple[dict[str, Any], bool, bool]:
     """Return ``(payload, exists, valid_object)`` for the shared settings file.
 
@@ -596,26 +703,10 @@ def _read_payload_state(directory: Path, *, secure: bool = False) -> tuple[dict[
                 os.close(fd)
                 fd = None
                 return {}, True, False
+        elif secure and os.name == "nt":
+            fd = _open_windows_payload_fd(directory, directory_identity, info)
         else:
-            # Windows has no dir_fd/O_NOFOLLOW equivalent in the Python
-            # standard library.  Open by pathname, then verify both the
-            # directory and final-file identities again before parsing.  A
-            # detected replacement fails closed; the remaining limitation is
-            # documented at the call site rather than silently treated safe.
             fd = os.open(path, flags)
-            if secure:
-                current_directory = os.lstat(directory)
-                current_file = os.lstat(path)
-                opened_file = os.fstat(fd)
-                if (
-                    not _same_file_identity(directory_identity, current_directory)
-                    or not _same_file_identity(info, current_file)
-                    or not _same_file_identity(info, opened_file)
-                    or not stat.S_ISREG(opened_file.st_mode)
-                ):
-                    os.close(fd)
-                    fd = None
-                    return {}, True, False
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = None
             raw = json.load(handle)

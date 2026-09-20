@@ -37,6 +37,7 @@ from rnaseq_agent.connection_store import (
     BrowsePolicyConflictError,
     browse_policy_revision,
     load_browse_policy,
+    list_all_approved_data_roots,
     list_approved_data_roots,
     approve_data_root,
     revoke_data_root,
@@ -194,6 +195,18 @@ def test_stale_approve_and_revoke_use_typed_revision_conflict(tmp_path):
     assert revoked.available is True
 
 
+def test_list_all_approved_data_roots_includes_revoked_records(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    revision = load_browse_policy(store_dir=store).revision
+    approved = approve_data_root(_root(), expected_revision=revision, store_dir=store)
+    revoke_data_root("root_a", expected_revision=approved.revision, store_dir=store)
+    records = list_all_approved_data_roots(store_dir=store)
+    assert len(records) == 1
+    assert records[0].root_id == "root_a"
+    assert records[0].revoked_at is not None
+
+
 def test_invalid_root_collection_fails_closed_and_is_not_repaired(tmp_path):
     store = tmp_path / "store"
     save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
@@ -281,16 +294,34 @@ def test_browse_policy_binds_payload_read_to_validated_directory(tmp_path, monke
 
     monkeypatch.setattr("rnaseq_agent.connection_store.os.open", replace_parent_then_open)
     policy = load_browse_policy(store_dir=store)
-    assert replaced
     if os.name == "nt":
-        # The Windows path has no Python-level directory-fd equivalent; secure
-        # browse reads therefore fail closed rather than following the swap.
-        assert policy.available is False
+        # The native Windows handle path does not call os.open and keeps the
+        # validated directory bound independently of this pathname swap.
+        assert policy.available is True
+        assert policy.identity == SSHIdentity("trusted.example", "alice", 22)
     else:
+        assert replaced
         assert policy.available is True
         assert policy.identity == SSHIdentity("trusted.example", "alice", 22)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows native handle path")
+def test_windows_secure_policy_does_not_open_payload_by_pathname(tmp_path, monkeypatch):
+    store = tmp_path / "store"
+    save_connection({"host": "trusted.example", "user": "alice", "port": 22}, store_dir=store)
+    original_open = storage.os.open
+    opened_payload_by_path = False
+
+    def observe(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal opened_payload_by_path
+        if Path(path).name == CONNECTION_FILE_NAME:
+            opened_payload_by_path = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("rnaseq_agent.connection_store.os.open", observe)
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is True
+    assert opened_payload_by_path is False
 @pytest.mark.skipif(os.name == "nt", reason="Windows locks prevent replacing an open store directory")
 def test_locked_browse_policy_binds_payload_read_to_validated_directory(tmp_path, monkeypatch):
     """The locked reader must retain the same directory binding guarantee."""
