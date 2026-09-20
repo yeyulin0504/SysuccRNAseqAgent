@@ -8,8 +8,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import stat
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +34,19 @@ from rnaseq_agent.connection_store import (
     save_connection,
     save_llm,
 )
+from rnaseq_agent.storage import ConnectionStoreCorruptError
+
+
+def _save_connection_worker(store_dir: Path, barrier) -> None:
+    os.environ["RNASEQ_AGENT_HOME"] = str(store_dir)
+    barrier.wait(timeout=10)
+    save_connection({"host": "h"}, store_dir=store_dir)
+
+
+def _save_llm_worker(store_dir: Path, barrier) -> None:
+    os.environ["RNASEQ_AGENT_HOME"] = str(store_dir)
+    barrier.wait(timeout=10)
+    save_llm({"model": "m"}, store_dir=store_dir)
 
 
 @pytest.fixture
@@ -44,6 +60,103 @@ class TestConnectionFilePath:
         path = connection_file_path()
         assert path.name == CONNECTION_FILE_NAME
         assert (tmp_path / "home") in path.parents
+
+
+def test_concurrent_connection_and_llm_saves_preserve_both_blocks(tmp_path, monkeypatch):
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(3)
+    first = context.Process(target=_save_connection_worker, args=(tmp_path, barrier))
+    second = context.Process(target=_save_llm_worker, args=(tmp_path, barrier))
+    first.start(); second.start(); barrier.wait(timeout=5)
+    first.join(10); second.join(10)
+    assert first.exitcode == second.exitcode == 0
+    saved = json.loads((tmp_path / "connection.json").read_text("utf-8"))
+    assert saved["host"] == "h"
+    assert saved["llm"]["model"] == "m"
+
+
+def test_reader_never_observes_partial_json_during_writes(tmp_path):
+    path = tmp_path / "connection.json"
+    save_connection({"host": "before"}, store_dir=tmp_path)
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        try:
+            for i in range(100):
+                save_connection({"host": f"h-{i}"}, store_dir=tmp_path)
+        finally:
+            stop.set()
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                payload = json.loads(path.read_text("utf-8"))
+                assert isinstance(payload, dict)
+            except PermissionError:
+                time.sleep(0.001)
+                continue
+            except Exception as exc:
+                errors.append(exc)
+                stop.set()
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert not errors
+
+
+def test_corrupt_existing_document_is_rejected_unchanged(tmp_path):
+    path = tmp_path / "connection.json"
+    raw = b"{not valid json"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    with pytest.raises(ConnectionStoreCorruptError):
+        save_connection({"host": "h"}, store_dir=tmp_path)
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration test")
+def test_windows_connection_file_has_protected_current_user_dacl(tmp_path):
+    from rnaseq_agent.private_files import _read_windows_acl, _windows_sid
+    save_connection({"host": "h"}, store_dir=tmp_path)
+    path = tmp_path / CONNECTION_FILE_NAME
+    adv = __import__("ctypes").windll.advapi32
+    kernel = __import__("ctypes").windll.kernel32
+    ctypes = __import__("ctypes")
+    sd = ctypes.c_void_p(); dacl = ctypes.c_void_p(); owner = ctypes.c_void_p()
+    assert adv.GetNamedSecurityInfoW(str(path), 1, 4, ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(sd)) == 0
+    try:
+        control = ctypes.c_ushort(); revision = ctypes.c_ubyte()
+        assert adv.GetSecurityDescriptorControl(sd, ctypes.byref(control), ctypes.byref(revision))
+        assert control.value & 0x1000
+        protected, trustees = _read_windows_acl(path)
+        assert protected
+        assert set(trustees) in ({_windows_sid(), "SY"}, {_windows_sid(), "S-1-5-18"})
+    finally:
+        kernel.LocalFree(sd)
+
+
+def test_transaction_callback_waits_for_shared_lock(tmp_path):
+    from rnaseq_agent.storage import locked_json_transaction, project_state_lock
+
+    save_connection({"host": "h"}, store_dir=tmp_path)
+    entered = threading.Event()
+    ready = threading.Event()
+    release = threading.Event()
+    path = tmp_path / "connection.json"
+
+    def contender() -> None:
+        ready.set()
+        locked_json_transaction(path, lambda current: (entered.set() or current))
+
+    with project_state_lock(path):
+        thread = threading.Thread(target=contender)
+        thread.start()
+        assert ready.wait(2)
+        assert not entered.wait(0.2)
+    thread.join(2)
+    assert entered.is_set()
 
 
 class TestSaveAndLoad:

@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .storage import locked_json_transaction
+
 CONNECTION_FILE_NAME = "connection.json"
 HOME_ENV_VAR = "RNASEQ_AGENT_HOME"
 DEFAULT_HOME_DIR_NAME = ".rnaseq_agent"
@@ -182,25 +184,24 @@ def save_connection(values: dict[str, Any], *, store_dir: Path | None = None) ->
     keeps whatever was stored; passing an empty string clears it.
     """
     directory = _resolve_store_dir(store_dir)
-    directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONNECTION_FILE_NAME
 
-    merged = dict(_read_payload(directory))
-    auth_mode = str(values.get("auth_mode") or merged.get("auth_mode") or "key")
-    for key in SHARED_FIELDS:
-        if key in values and values[key] is not None:
-            merged[key] = values[key]
-
-    if "password" in values:
-        new_password = str(values.get("password") or "")
-        if auth_mode == "password" and new_password:
-            merged[_PASSWORD_KEY] = _protect(new_password)
-        elif not new_password and auth_mode != "password":
+    def mutate(merged: dict[str, Any]) -> dict[str, Any]:
+        auth_mode = str(values.get("auth_mode") or merged.get("auth_mode") or "key")
+        for key in SHARED_FIELDS:
+            if key in values and values[key] is not None:
+                merged[key] = values[key]
+        if "password" in values:
+            new_password = str(values.get("password") or "")
+            if auth_mode == "password" and new_password:
+                merged[_PASSWORD_KEY] = _protect(new_password)
+            elif not new_password and auth_mode != "password":
+                merged.pop(_PASSWORD_KEY, None)
+        if auth_mode != "password":
             merged.pop(_PASSWORD_KEY, None)
-    if auth_mode != "password":
-        merged.pop(_PASSWORD_KEY, None)
+        return merged
 
-    _write_payload(path, merged)
+    locked_json_transaction(path, mutate)
     return load_connection(store_dir=store_dir)
 
 
@@ -210,11 +211,11 @@ def clear_password(*, store_dir: Path | None = None) -> None:
     path = directory / CONNECTION_FILE_NAME
     if not path.is_file():
         return
-    payload = _read_payload(directory)
-    if not payload:
-        return
-    payload.pop(_PASSWORD_KEY, None)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    def mutate(payload: dict[str, Any]) -> dict[str, Any]:
+        payload.pop(_PASSWORD_KEY, None)
+        return payload
+
+    locked_json_transaction(path, mutate)
 
 
 def load_llm(*, store_dir: Path | None = None) -> dict[str, Any]:
@@ -273,26 +274,25 @@ def save_llm(values: dict[str, Any], *, store_dir: Path | None = None) -> dict[s
         )
 
     directory = _resolve_store_dir(store_dir)
-    directory.mkdir(parents=True, exist_ok=True)
     path = directory / CONNECTION_FILE_NAME
-    payload = _read_payload(directory)
 
-    block = payload.get(LLM_BLOCK_KEY)
-    if not isinstance(block, dict):
-        block = {}
-    for key in LLM_FIELDS:
-        if key in normalized_values and normalized_values[key] is not None:
-            block[key] = normalized_values[key]
+    def mutate(payload: dict[str, Any]) -> dict[str, Any]:
+        block = payload.get(LLM_BLOCK_KEY)
+        if not isinstance(block, dict):
+            block = {}
+        for key in LLM_FIELDS:
+            if key in normalized_values and normalized_values[key] is not None:
+                block[key] = normalized_values[key]
+        if "api_key" in normalized_values:
+            new_key = str(normalized_values.get("api_key") or "")
+            if new_key:
+                block[_LLM_API_KEY_KEY] = _protect(new_key)
+            else:
+                block.pop(_LLM_API_KEY_KEY, None)
+        payload[LLM_BLOCK_KEY] = block
+        return payload
 
-    if "api_key" in normalized_values:
-        new_key = str(normalized_values.get("api_key") or "")
-        if new_key:
-            block[_LLM_API_KEY_KEY] = _protect(new_key)
-        else:
-            block.pop(_LLM_API_KEY_KEY, None)
-
-    payload[LLM_BLOCK_KEY] = block
-    _write_payload(path, payload)
+    locked_json_transaction(path, mutate)
     return load_llm(store_dir=store_dir)
 
 

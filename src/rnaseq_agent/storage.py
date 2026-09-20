@@ -2,10 +2,99 @@ from __future__ import annotations
 
 import json
 import os
+import copy
+import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+
+class ConnectionStoreCorruptError(ValueError):
+    """The shared connection document exists but is not a JSON object."""
+
+
+def shared_file_lock(path: Path):
+    return project_state_lock(Path(path).resolve())
+
+
+def _read_json_object_or_raise(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise ConnectionStoreCorruptError(f"unsafe connection store path: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConnectionStoreCorruptError(f"invalid connection store: {path}") from exc
+    if not isinstance(value, dict):
+        raise ConnectionStoreCorruptError(f"connection store must contain an object: {path}")
+    return value
+
+
+def _atomic_replace_json(path: Path, payload: dict[str, Any]) -> None:
+    from .private_files import create_private_temp, ensure_private_directory, verify_private_path
+
+    path = Path(path)
+    ensure_private_directory(path.parent)
+    if path.exists() or path.is_symlink():
+        verify_private_path(path)
+    fd = None
+    temp_path = None
+    try:
+        fd, temp_path = create_private_temp(path.parent, prefix=f".{path.name}.")
+        handle = os.fdopen(fd, "w", encoding="utf-8", closefd=True)
+        fd = None
+        with handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        verify_private_path(temp_path)
+        for attempt in range(20):
+            try:
+                os.replace(temp_path, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 19:
+                    raise
+                time.sleep(0.005)
+        temp_path = None
+        verify_private_path(path)
+        if os.name != "nt":
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                Path(temp_path).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def locked_json_transaction(
+    path: Path,
+    mutate: Callable[[dict[str, Any]], dict[str, Any]],
+) -> dict[str, Any]:
+    path = Path(path).resolve()
+    from .private_files import ensure_private_directory, ensure_private_file
+
+    ensure_private_directory(path.parent)
+    if path.exists() or path.is_symlink():
+        ensure_private_file(path)
+    with shared_file_lock(path):
+        current = _read_json_object_or_raise(path)
+        updated = mutate(copy.deepcopy(current))
+        if not isinstance(updated, dict):
+            raise TypeError("transaction callback must return a JSON object")
+        _atomic_replace_json(path, updated)
+        return copy.deepcopy(updated)
 
 
 _PROJECT_STATE_LOCKS_GUARD = threading.Lock()
@@ -27,7 +116,10 @@ class _ProjectStateLock:
         try:
             if depth == 0:
                 self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-                handle = self._lock_path.open("a+b")
+                from .private_files import ensure_private_file
+
+                ensure_private_file(self._lock_path)
+                handle = self._lock_path.open("r+b")
                 handle.seek(0, os.SEEK_END)
                 if handle.tell() == 0:
                     handle.write(b"\0")
