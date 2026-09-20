@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-import shlex
 import socket
 import threading
 import time
@@ -98,11 +97,7 @@ from .project_intake import (
     load_intake,
     save_intake,
 )
-from .sample_detection import (
-    detect_fastq_pairs,
-    preview_expression_matrix,
-    read_counts_samples,
-)
+from .sample_detection import preview_expression_matrix, read_counts_samples
 from .container_service import (
     ContainerSettingsError,
     build_pull_command,
@@ -624,25 +619,13 @@ def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0)
 
 
 def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, Any]:
-    """Read a shallow FASTQ listing through the configured SSH transport."""
-    if not remote_dir.startswith("/") or any(ch in remote_dir for ch in ("\n", "\r", "\x00")):
-        return {"ok": False, "message": "远程样本目录必须是绝对 POSIX 路径"}
-    try:
-        transport = create_remote_transport(config)
-        command = (
-            "find " + shlex.quote(remote_dir)
-            + " -maxdepth 2 -type f \\( -name '*.fastq.gz' -o -name '*.fq.gz'"
-            + " -o -name '*.fastq' -o -name '*.fq' \\) -print"
-        )
-        result = transport.execute(command)
-        if result.returncode != 0:
-            return {"ok": False, "message": "远程目录扫描失败"}
-        detected = detect_fastq_pairs(
-            [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        )
-        return {"ok": True, "scanned_path": remote_dir, **detected}
-    except Exception as exc:  # noqa: BLE001 - sanitized response
-        return {"ok": False, "message": f"远程目录扫描失败：{_connection_error_hint(exc)}"}
+    """Compatibility shim; all production browsing uses the shared boundary."""
+    project_dir = Path.cwd()
+    context = BrowseContext(project_dir.name, None, "workbench")
+    final = _finalize_tool_execution_result(
+        _execute_browse_attempt(remote_dir, project_dir, context), project_dir
+    )
+    return final.local.get("result", final.local)
 def _interrupt_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract the JSON-safe payload(s) of a LangGraph interrupt result.
 
@@ -1973,13 +1956,32 @@ def create_app(
     ) -> dict[str, Any]:
         """Read-only remote FASTQ discovery, shared by both chat paths."""
         browse_config = config or connection_config
-        if browse_config is None:
-            return {"reply": "请先保存服务器连接配置。", "state": session.state}
         remote_dir = str(
             intent.params.get("path")
-            or browse_config.get("server", {}).get("remote_workdir")
+            or (browse_config or {}).get("server", {}).get("remote_workdir")
             or ""
         ).strip()
+        # Disabled browse is still a first-class audited denial.  It must not
+        # require a connection snapshot or touch policy/transport state.
+        if _live_llm_tool_mode() == "disabled":
+            final = _finalize_tool_execution_result(
+                _execute_browse_attempt(
+                    remote_dir,
+                    session.project_dir,
+                    BrowseContext(session.project_dir.name, thread_id, "rule_chat"),
+                    tool_mode="disabled",
+                ),
+                session.project_dir,
+            )
+            payload = final.local.get("result", final.local)
+            return {
+                **payload,
+                "reply": payload.get("message", "LLM 工具当前已禁用。"),
+                "state": session.state,
+                "via": "blocked",
+            }
+        if browse_config is None:
+            return {"reply": "请先保存服务器连接配置。", "state": session.state}
         if not remote_dir:
             return {"reply": "请告诉我要浏览的绝对目录，或先保存远程工作目录。", "state": session.state}
         project_id = session.project_dir.name
@@ -2392,6 +2394,19 @@ def create_app(
             tool_mode_block,
         )
 
+        # Browse performs the live mode check inside the shared attempt
+        # wrapper so a disabled request still receives one authoritative audit
+        # event and never touches policy/credential/transport state.
+        if name == "browse_remote_samples":
+            remote_dir = str(arguments.get("path") or "").strip()
+            context = execution_context or ToolExecutionContext(project_dir.name, None)
+            return _execute_browse_attempt(
+                remote_dir,
+                project_dir,
+                BrowseContext(context.project_id, context.thread_id, "llm_tool"),
+                tool_mode=_live_llm_tool_mode(),
+            )
+
         blocked = tool_mode_block(name, _live_llm_tool_mode())
         if blocked is not None:
             return blocked
@@ -2448,15 +2463,6 @@ def create_app(
                 f"链特异性 {payload['strandedness'] or '未设置'}。"
             )
             return payload
-
-        if name == "browse_remote_samples":
-            remote_dir = str(arguments.get("path") or "").strip()
-            context = execution_context or ToolExecutionContext(project_dir.name, None)
-            return _execute_browse_attempt(
-                remote_dir,
-                project_dir,
-                BrowseContext(context.project_id, context.thread_id, "llm_tool"),
-            )
 
         if name == "refresh_project_status":
             if session.config is None:
@@ -2895,6 +2901,10 @@ def create_app(
         from .agent_tools import tool_mode_block
 
         action = str(getattr(intent, "action", "") or "")
+        # Browse owns its own audited disabled denial in _browse_samples_reply.
+        # Do not short-circuit it here.
+        if action == "browse_samples":
+            return None
         blocked = tool_mode_block(_rule_intent_tool_name(intent), _live_llm_tool_mode())
         if blocked is None:
             return None
@@ -2971,6 +2981,15 @@ def create_app(
         text = str(payload.get("message", "")).strip()
         if not text:
             return {"reply": "请输入想做的事。"}
+
+        explicit_project = str(
+            request.query_params.get("project") or payload.get("project_id") or ""
+        ).strip()
+        if explicit_project and workspace.get_project(explicit_project) is None:
+            return JSONResponse(
+                {"ok": False, "error_code": "PROJECT_NOT_FOUND", "message": "项目不存在。"},
+                status_code=404,
+            )
 
         session = _session_for(_legacy_dir_for(request, payload))
         config = session.config

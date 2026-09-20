@@ -20,6 +20,27 @@ class AuditCommitUncertainError(RuntimeError):
 
 
 _EVENT_RE = re.compile(r"^audit_[0-9a-f]{32}$")
+_AUDIT_FIELDS = frozenset(
+    {
+        "event_id", "project_id", "thread_id", "source", "identity_digest",
+        "requested_path_digest", "canonical_target", "root_id",
+        "browse_policy_revision", "directory_count", "sample_count",
+        "unmatched_count", "truncated", "outcome", "error_code",
+        "started_at", "completed_at",
+    }
+)
+_AUDIT_SOURCES = frozenset({"workbench", "project_command", "rule_chat", "llm_tool"})
+_AUDIT_OUTCOMES = frozenset({"allowed", "denied", "failed"})
+_MAX_AUDIT_COUNT = 2_500
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate audit field")
+        result[key] = value
+    return result
 
 
 def _audit_dir() -> Path:
@@ -77,8 +98,61 @@ def _write(path: Path, raw: bytes) -> None:
 def _parse(path: Path) -> bytes:
     verify_private_path(path)
     raw = path.read_bytes()
-    json.loads(raw)
-    return raw
+    if len(raw) > 32 * 1024:
+        raise ValueError("audit record exceeds bounded size")
+    try:
+        value = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid audit record JSON") from exc
+    if not isinstance(value, dict) or set(value) != _AUDIT_FIELDS:
+        raise ValueError("invalid audit record schema")
+    event_id = value.get("event_id")
+    if not isinstance(event_id, str) or not _EVENT_RE.fullmatch(event_id):
+        raise ValueError("invalid audit event id")
+    expected_name = f"event-{hashlib.sha256(event_id.encode('ascii')).hexdigest()}.record"
+    if path.name != expected_name:
+        raise ValueError("audit event filename mismatch")
+    for key in ("project_id", "source", "identity_digest", "requested_path_digest", "started_at", "completed_at"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise ValueError("invalid audit text field")
+    if value["source"] not in _AUDIT_SOURCES:
+        raise ValueError("invalid audit source")
+    for key in ("thread_id", "canonical_target", "root_id", "browse_policy_revision", "error_code"):
+        if value[key] is not None and not isinstance(value[key], str):
+            raise ValueError("invalid audit optional field")
+    for key in ("directory_count", "sample_count", "unmatched_count"):
+        if type(value[key]) is not int or not 0 <= value[key] <= _MAX_AUDIT_COUNT:
+            raise ValueError("invalid audit count")
+    if type(value["truncated"]) is not bool or value["outcome"] not in _AUDIT_OUTCOMES:
+        raise ValueError("invalid audit outcome")
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if raw != canonical:
+        raise ValueError("non-canonical audit record")
+    return canonical
+
+
+def _reconcile_published(path: Path, event: BrowseAudit) -> Literal["committed", "absent", "uncertain"]:
+    try:
+        if _parse(path) != _canonical(event):
+            return "uncertain"
+        # Re-flush the published file and its containing directory before
+        # treating a post-replace failure as committed.
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if os.name != "nt":
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        return "committed"
+    except FileNotFoundError:
+        return "absent"
+    except Exception:
+        return "uncertain"
 
 
 def _record_browse_audit(event: BrowseAudit) -> str:
@@ -98,7 +172,11 @@ def _record_browse_audit(event: BrowseAudit) -> str:
             # containing-directory fsync fails.  Preserve that record and make
             # the durability state explicit to the finalizer/reconciler.
             if path.exists():
-                raise AuditCommitUncertainError("audit publication durability is uncertain") from exc
+                state = _reconcile_published(path, event)
+                if state == "committed":
+                    return event.event_id
+                if state == "uncertain":
+                    raise AuditCommitUncertainError("audit publication durability is uncertain") from exc
             raise
     return event.event_id
 
@@ -107,13 +185,9 @@ def reconcile_browse_audit(event: BrowseAudit) -> Literal["committed", "absent",
     directory = _audit_dir()
     path = _path(directory, event)
     try:
-        if _parse(path) == _canonical(event):
-            return "committed"
-        return "uncertain"
+        return _reconcile_published(path, event)
     except FileNotFoundError:
         return "absent"
-    except Exception:
-        return "uncertain"
 
 
 def browse_history_projection(event: BrowseAudit) -> dict[str, object]:

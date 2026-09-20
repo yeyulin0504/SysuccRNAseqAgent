@@ -48,6 +48,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import secrets
 from copy import deepcopy
 from dataclasses import dataclass
@@ -118,9 +119,59 @@ class ToolExecutionResult:
     log_projection: dict[str, Any]
     security_audit: Any | None
 
+    # Temporary compatibility for callers that inspected the old dict result.
+    # New provider/checkpoint paths must use the named channels above.
+    def __getitem__(self, key: str) -> Any:
+        return self.local[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.local.get(key, default)
+
 
 ToolExecutor = Callable[[str, dict[str, Any], Path, bool, ToolExecutionContext], ToolExecutionResult]
 ToolResultFinalizer = Callable[[ToolExecutionResult, Path | None], ToolExecutionResult]
+
+_LEGACY_MODEL_KEYS = frozenset(
+    {
+        "ok", "blocked", "error", "error_code", "message", "reply", "state",
+        "has_session", "layout", "strandedness", "pipeline", "status", "run_state",
+        "action", "via", "confirmation_required", "tool_mode", "tool", "steps",
+        "summary", "gate", "contract_id", "gate_ok", "gate_reasons", "gate_warnings",
+        "warnings", "requested", "design", "stage", "result",
+    }
+)
+_LEGACY_EXACT_KEYS = frozenset(
+    {
+        "samples", "sample_id", "fastq_1", "fastq_2", "path", "scanned_path",
+        "remote_fastq_dir", "fastq_dir", "report_path", "report", "reference",
+        "config", "local_data_dir", "remote_data_dir", "canonical_target", "root_id",
+        "identity", "identity_digest", "browse_policy_revision", "stdout", "stderr",
+    }
+)
+_PATH_TEXT_RE = re.compile(r"(?<![\w])(?:[A-Za-z]:[\\/]|/)[^\s,，。；;]+")
+_FASTQ_TEXT_RE = re.compile(r"(?<![\w])[^\s,，。；;]+\.(?:fastq|fq)(?:\.gz)?", re.IGNORECASE)
+
+
+def _legacy_model_projection(value: Any) -> Any:
+    """Keep legacy dict executors provider-safe until all tools are typed."""
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            lowered = key.lower()
+            if lowered in _LEGACY_EXACT_KEYS or lowered in {item.lower() for item in _LEGACY_EXACT_KEYS}:
+                continue
+            if key not in _LEGACY_MODEL_KEYS:
+                continue
+            projected[key] = _legacy_model_projection(item)
+        return projected
+    if isinstance(value, list):
+        return [_legacy_model_projection(item) for item in value[:64]]
+    if isinstance(value, str):
+        return _FASTQ_TEXT_RE.sub("<redacted-fastq>", _PATH_TEXT_RE.sub("<redacted-path>", value))
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 #: ``ConfigReader`` 契约：``(项目目录) -> 当前配置``（读不到就返回 ``{}``）。
 #: 只用来在确认卡片上渲染「旧值 → 新值」，**必须只读**——它会跑在侧效应敏感的位置。
@@ -1182,8 +1233,16 @@ def build_chat_graph(
                 ok_value = bool(provider_result.get("ok", True))
                 reply_value = provider_result.get("reply") or provider_result.get("message")
             else:
-                provider_result = result if isinstance(result, dict) else {"ok": False, "error": "工具返回了非预期的结果。"}
-                log_result = provider_result
+                # Legacy executors still return internal dicts.  Treat them as
+                # request-local data and project a conservative provider/log
+                # view so sample names, paths and report excerpts never enter
+                # messages, checkpoints, or generic tool_log.
+                provider_result = (
+                    _legacy_model_projection(result)
+                    if isinstance(result, dict)
+                    else {"ok": False, "error": "工具返回了非预期的结果。"}
+                )
+                log_result = _legacy_model_projection(provider_result)
                 ok_value = bool(provider_result.get("ok", True))
                 reply_value = provider_result.get("reply")
             if not isinstance(result, dict):

@@ -226,6 +226,22 @@ def _session_json_exists(tmp_path: Path, project_id: str) -> bool:
 
 
 class TestExecutorPermissionDefense:
+    def test_disabled_browse_uses_typed_wrapper_and_auditable_denial(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent import webapp as webapp_module
+        from rnaseq_agent.chat_graph import ToolExecutionResult
+        from rnaseq_agent.connection_store import save_llm
+
+        save_llm({"tool_mode": "disabled"})
+        result = client.app.state.llm_tool_executor(
+            "browse_remote_samples", {"path": "/remote/fastq"}, tmp_path / "p", True
+        )
+
+        assert isinstance(result, ToolExecutionResult)
+        assert result.security_audit is not None
+        assert result.model["error_code"] == "TOOL_MODE_DISABLED"
+
     def test_direct_executor_call_still_obeys_the_live_kill_switch(
         self, client, tmp_path
     ) -> None:
@@ -1539,7 +1555,8 @@ class TestReadAndDerivedArtifactTools:
         assert report_path.is_file()
         assert project_id in report_path.read_text(encoding="utf-8")
         tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
-        assert Path(tool_result["report_path"]) == report_path
+        assert "report_path" not in tool_result
+        assert str(report_path) not in json.dumps(tool_result, ensure_ascii=False)
 
     def test_read_only_mode_blocks_report_without_creating_a_file(
         self, client, tmp_path, monkeypatch

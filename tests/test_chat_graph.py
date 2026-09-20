@@ -580,6 +580,33 @@ class TestChatGraphToolLoop:
         assert tool_messages, second_turn
         assert tool_messages[0]["tool_call_id"] == "c1"
 
+    def test_legacy_dict_result_is_projected_before_provider_and_log(self, monkeypatch, tmp_path) -> None:
+        secret_path = "/secret/SAMPLE_R1.fastq.gz"
+
+        def executor(name, arguments, project_dir, approved):
+            return {
+                "ok": True,
+                "reply": f"已读取 {secret_path}",
+                "samples": [{"sample_id": "SECRET_SAMPLE", "fastq_1": secret_path}],
+                "report_path": secret_path,
+            }
+
+        graph, _recorded, fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "read_project_state", {})]},
+                {"content": "已完成。"},
+            ],
+            executor=executor,
+        )
+        result = graph.invoke(_initial(tmp_path, "状态"), config={"configurable": {"thread_id": "projection"}})
+
+        serialized = json.dumps(fake.seen_messages[1:], ensure_ascii=False)
+        assert "SECRET_SAMPLE" not in serialized
+        assert secret_path not in serialized
+        assert "SECRET_SAMPLE" not in json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
+        assert secret_path not in json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
+
     def test_invalid_arguments_go_back_to_the_model_for_correction(
         self, monkeypatch, tmp_path
     ) -> None:
