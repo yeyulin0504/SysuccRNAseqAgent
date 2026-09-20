@@ -485,7 +485,15 @@ def discard_remote_scan(project_dir: Path, reference: RemoteScanReference) -> No
         path = remote_scan_lookup_path(directory, reference.scan_id, kind="scan")
         try: scan = _load(path)
         except FileNotFoundError: return
-        if scan.source_ref != reference.source_ref or scan.result_revision != reference.result_revision or scan.project_id != reference.project_id or scan.apply_state != "pending":
+        if (
+            scan.source_ref != reference.source_ref
+            or scan.result_revision != reference.result_revision
+            or scan.project_id != reference.project_id
+            or scan.thread_id != reference.thread_id
+            or scan.source != reference.source
+            or scan.expires_at != reference.expires_at
+            or scan.apply_state != "pending"
+        ):
             return
         try: path.unlink()
         except FileNotFoundError: pass
