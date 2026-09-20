@@ -58,10 +58,30 @@ def _save_llm_worker(store_dir: Path, barrier) -> None:
     save_llm({"model": "m"}, store_dir=store_dir)
 
 
-def _transaction_contender_worker(path: str, attempting, acquired, entered) -> None:
+def _transaction_contender_worker(path: str, blocked, acquired, entered) -> None:
     from rnaseq_agent.storage import locked_json_transaction, shared_file_lock
 
-    attempting.set()
+    lock_path = Path(path).parent / ".project-state.lock"
+    with lock_path.open("r+b") as handle:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                blocked.set()
+            else:  # pragma: no cover - the parent must hold the lock in this test
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                blocked.set()
+            else:  # pragma: no cover - the parent must hold the lock in this test
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def mutate(current):
         entered.set()
@@ -185,6 +205,36 @@ def test_invalid_root_collection_fails_closed_and_is_not_repaired(tmp_path):
     assert policy.available is False and policy.identity is None and policy.roots == ()
     with pytest.raises(ConnectionStoreCorruptError):
         approve_data_root(_root(), expected_revision=policy.revision, store_dir=store)
+
+
+def test_invalid_inactive_root_identity_makes_policy_unavailable(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    path = store / CONNECTION_FILE_NAME
+    payload = json.loads(path.read_text("utf-8"))
+    payload["approved_data_roots"] = [
+        _root(root_id="bad", host="bad host", user="bad user").__dict__
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is False
+    assert policy.identity is None
+    assert policy.roots == ()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink behavior")
+def test_browse_policy_rejects_connection_file_symlink(tmp_path):
+    store = tmp_path / "store"
+    save_connection({"host": "h.example", "user": "alice", "port": 22}, store_dir=store)
+    path = store / CONNECTION_FILE_NAME
+    external = tmp_path / "external.json"
+    external.write_text(path.read_text("utf-8"), encoding="utf-8")
+    path.unlink()
+    path.symlink_to(external)
+    policy = load_browse_policy(store_dir=store)
+    assert policy.available is False
+    assert policy.identity is None
+    assert policy.roots == ()
 
 
 def test_concurrent_connection_and_llm_saves_preserve_both_blocks(tmp_path, monkeypatch):
@@ -340,6 +390,8 @@ def test_windows_connection_store_directory_is_private_and_broad_directory_is_re
 
     store = tmp_path / "store"
     save_connection({"host": "h"}, store_dir=store)
+    path = store / CONNECTION_FILE_NAME
+    before = path.read_bytes()
     protected, trustees = _read_windows_acl(store)
     assert protected
     assert set(trustees) in ({_windows_sid(), "SY"}, {_windows_sid(), "S-1-5-18"})
@@ -364,6 +416,7 @@ def test_windows_connection_store_directory_is_private_and_broad_directory_is_re
 
     with pytest.raises((OSError, PermissionError)):
         save_connection({"host": "after"}, store_dir=store)
+    assert path.read_bytes() == before
 
 
 def test_transaction_callback_waits_for_shared_lock(tmp_path):
@@ -396,17 +449,17 @@ def test_transaction_callback_waits_for_shared_lock_across_processes(tmp_path):
     path = store / "connection.json"
     save_connection({"host": "h"}, store_dir=store)
     context = multiprocessing.get_context("spawn")
-    attempting = context.Event()
+    blocked = context.Event()
     acquired = context.Event()
     entered = context.Event()
     process = context.Process(
         target=_transaction_contender_worker,
-        args=(str(path), attempting, acquired, entered),
+        args=(str(path), blocked, acquired, entered),
     )
 
     with shared_file_lock(path):
         process.start()
-        assert attempting.wait(5)
+        assert blocked.wait(5)
         assert not acquired.wait(0.5)
         assert not entered.is_set()
     process.join(10)

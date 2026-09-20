@@ -171,6 +171,12 @@ def _parse_root_record(value: Any) -> ApprovedDataRoot:
         raise ValueError("root user must be a non-empty string")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("root port must be an integer from 1 to 65535")
+    try:
+        normalized = normalize_ssh_identity({"host": host, "user": user, "port": port})
+    except SSHIdentityError as exc:
+        raise ValueError("approved_data_roots contains an invalid SSH identity") from exc
+    if (normalized.host, normalized.user, normalized.port) != (host, user, port):
+        raise ValueError("approved_data_roots contains a non-normalized SSH identity")
     requested_path = _validate_root_path(value.get("requested_path"), "requested_path", reject_root=True)
     canonical_path = _validate_root_path(value.get("canonical_path"), "canonical_path", reject_root=True)
     created_at = _validate_timestamp(value.get("created_at"), allow_none=False)
@@ -233,8 +239,24 @@ def _policy_from_payload(payload: dict[str, Any]) -> BrowsePolicy:
         return _invalid_policy()
 
 
+def _read_browse_payload(directory: Path) -> tuple[dict[str, Any], bool, bool]:
+    try:
+        from .private_files import verify_private_path
+
+        if directory.exists() or directory.is_symlink():
+            verify_private_path(directory)
+        payload, _exists, valid_payload = _read_payload_state(directory)
+        path = directory / CONNECTION_FILE_NAME
+        if path.exists() or path.is_symlink():
+            verify_private_path(path)
+    except (OSError, PermissionError):
+        return {}, True, False
+    return payload, _exists, valid_payload
+
+
 def load_browse_policy(*, store_dir: Path | None = None) -> BrowsePolicy:
-    payload, _exists, valid_payload = _read_payload_state(_resolve_store_dir(store_dir))
+    directory = _resolve_store_dir(store_dir)
+    payload, _exists, valid_payload = _read_browse_payload(directory)
     if not valid_payload:
         return _invalid_policy()
     return _policy_from_payload(payload)
@@ -247,7 +269,7 @@ def locked_browse_policy(*, store_dir: Path | None = None) -> Iterator[BrowsePol
     from .storage import project_state_lock
 
     with project_state_lock(path):
-        payload, _exists, valid_payload = _read_payload_state(directory)
+        payload, _exists, valid_payload = _read_browse_payload(directory)
         yield _policy_from_payload(payload) if valid_payload else _invalid_policy()
 
 
