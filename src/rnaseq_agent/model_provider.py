@@ -62,7 +62,7 @@ def scan_outbound_payload(serialized_payload: bytes, credentials: ProviderCreden
         values.append(("known_secret", credentials.api_key))
     values.extend(("known_secret", value) for value in credentials.known_secrets if value)
     values.extend(("protected_value", value) for value in credentials.protected_values if value)
-    if re.search(r"-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----", text):
+    if re.search(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----|-----BEGIN PGP PRIVATE KEY BLOCK-----", text):
         raise _secret_error("private_key_marker")
     if re.search(r"https?://[^\s/@]+:[^\s/@]+@", text, flags=re.IGNORECASE):
         raise _secret_error("url_userinfo")
@@ -146,6 +146,8 @@ class ModelProviderGateway:
             sequence = 0
             total = 0
             content: list[str] = []
+            tool_ids: set[str] = set()
+            tool_fragment_total = 0
             try:
                 for raw in response.iter_lines(decode_unicode=True):
                     if not raw:
@@ -178,7 +180,14 @@ class ModelProviderGateway:
                         yield ProviderEvent("delta", value, sequence)
                     for tool in delta.get("tool_calls") or []:
                         function = tool.get("function") if isinstance(tool, dict) else {}
-                        yield ProviderEvent("tool_call_fragment", {"id": str((tool or {}).get("id") or ""), "name": str((function or {}).get("name") or ""), "arguments": str((function or {}).get("arguments") or "")}, sequence)
+                        tool_id = str((tool or {}).get("id") or "")
+                        arguments = str((function or {}).get("arguments") or "")
+                        if tool_id:
+                            tool_ids.add(tool_id)
+                        tool_fragment_total += len(arguments.encode("utf-8"))
+                        if len(tool_ids) > MAX_TOOL_IDS or tool_fragment_total > MAX_TOOL_FRAGMENT_BYTES:
+                            raise ProviderRequestError("模型工具调用片段超过限制。", code=MODEL_EXACT_TOOL_CALL_REJECTED, transmission_started=True)
+                        yield ProviderEvent("tool_call_fragment", {"id": tool_id, "name": str((function or {}).get("name") or ""), "arguments": arguments}, sequence)
                 yield ProviderEvent("message", {"content": "".join(content)}, sequence + 1)
             except ProviderRequestError:
                 raise
@@ -201,7 +210,8 @@ class ModelProviderGateway:
                 raise _request_error(f"模型接口返回 HTTP {getattr(response, 'status_code', 0)}。", started=started)
             data = _bounded_json(response.json())
             text = str(data.get("output_text") or data.get("text") or "")
-            return ProviderReply(text=text, raw={"text": text})
+            tool_calls = data.get("tool_calls") or data.get("function_calls") or []
+            return ProviderReply(text=text, raw={"text": text, "tool_calls": tool_calls})
         except ProviderRequestError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -220,12 +230,14 @@ class ModelProviderGateway:
             output = str(result.stdout or "")
             if len(output.encode("utf-8")) > MAX_RESPONSE_BYTES:
                 raise _request_error("模型响应超过大小限制。", started=started)
+            parsed: Any = {}
             try:
                 parsed = json.loads(output)
                 text = str(parsed.get("output_text") or parsed.get("text") or "") if isinstance(parsed, dict) else output
             except Exception:
                 text = output
-            return ProviderReply(text=text, raw={"text": text})
+            tool_calls = parsed.get("tool_calls") if isinstance(parsed, dict) else []
+            return ProviderReply(text=text, raw={"text": text, "tool_calls": tool_calls or []})
         except ProviderRequestError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -234,16 +246,31 @@ class ModelProviderGateway:
     def dispatch_exact(self, request: PreparedModelRequest):
         if not request.exact_attempt:
             raise ProviderRequestError("精确数据请求必须由已批准的一次性授权触发。", code=MODEL_EXACT_TOOL_CALL_REJECTED, transmission_started=False)
-        exact = replace(request, payload={**dict(request.payload), "tools": None, "tool_choice": None}, exact_attempt=True)
+        exact_payload = dict(request.payload)
+        exact_payload.pop("tools", None)
+        exact_payload.pop("tool_choice", None)
+        exact = replace(request, payload=exact_payload, exact_attempt=True)
         if exact.api_mode == "chat_completions":
-            return self.stream(replace(exact, stream=True))
+            # Buffer the bounded event stream before exposing anything to the
+            # caller.  Exact sends must never reveal a text delta if a later
+            # frame contains a tool call or violates the protocol.
+            buffered = list(self.stream(replace(exact, stream=True)))
+            if any(event.kind == "tool_call_fragment" for event in buffered):
+                raise ProviderRequestError("精确请求返回了工具调用。", code=MODEL_EXACT_TOOL_CALL_REJECTED, transmission_started=True)
+            return iter(buffered)
         if exact.api_mode == "responses":
             reply = self.responses(exact)
         elif exact.api_mode == "codex_cli":
             reply = self.codex_exec(exact)
         else:
             raise ProviderRequestError("不支持的精确请求模式。", code=MODEL_PROVIDER_REQUEST_FAILED, transmission_started=False)
-        return iter((ProviderEvent("message", {"content": reply.text}, 1),))
+        if reply.raw.get("tool_calls"):
+            raise ProviderRequestError("精确请求返回了工具调用。", code=MODEL_EXACT_TOOL_CALL_REJECTED, transmission_started=True)
+        events: list[ProviderEvent] = []
+        if reply.text:
+            events.append(ProviderEvent("delta", reply.text, 1))
+        events.append(ProviderEvent("message", {"content": reply.text}, len(events) + 1))
+        return iter(events)
 
     def list_models(self, config: ProviderConfig, credentials: ProviderCredentials, timeout_seconds: float) -> list[str]:
         endpoint = config.api_base.rstrip("/") + "/models"

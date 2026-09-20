@@ -1743,17 +1743,9 @@ def create_app(
         if not llm.get("api_base") or not llm.get("api_key"):
             return {"ok": False, "message": "请先保存 API Base 和 API Key", "models": []}
         try:
-            import requests as http_requests
-            response = http_requests.get(
-                str(llm["api_base"]).rstrip("/") + "/models",
-                headers={"Authorization": f"Bearer {llm['api_key']}"}, timeout=20,
-            )
-            response.raise_for_status()
-            models = sorted({str(item.get("id")) for item in response.json().get("data", []) if item.get("id")})
+            provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm.get("model") or "gpt-4o-mini"})
+            models = ModelProviderGateway().list_models(provider, ProviderCredentials(api_key=str(llm["api_key"])), 20)
             return {"ok": True, "models": models}
-        except http_requests.HTTPError as exc:
-            status = getattr(exc.response, "status_code", "unknown")
-            return {"ok": False, "message": f"模型列表拉取失败：HTTP {status}", "models": []}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"模型列表拉取失败：{type(exc).__name__}", "models": []}
 
@@ -1764,19 +1756,10 @@ def create_app(
         if not llm.get("api_base") or not llm.get("api_key") or not llm.get("model"):
             return {"ok": False, "message": "请先保存 API Base、API Key 和模型"}
         try:
-            import requests as http_requests
-            response = http_requests.post(
-                str(llm["api_base"]).rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {llm['api_key']}", "Content-Type": "application/json"},
-                json={"model": llm["model"], "messages": [{"role": "user", "content": "请只回复：连接正常"}], "temperature": 0},
-                timeout=30,
-            )
-            response.raise_for_status()
-            reply = str(response.json()["choices"][0]["message"]["content"]).strip()
+            provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm["api_base"], "model": llm["model"], "api_mode": "chat_completions"})
+            prepared = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": [{"role": "user", "content": "请只回复：连接正常"}], "temperature": 0}, credentials=ProviderCredentials(api_key=str(llm["api_key"])), timeout_seconds=30)
+            reply = ModelProviderGateway().complete(prepared).text.strip()
             return {"ok": True, "message": "LLM API 连接成功", "reply": reply}
-        except http_requests.HTTPError as exc:
-            status = getattr(exc.response, "status_code", "unknown")
-            return {"ok": False, "message": f"LLM API 连接失败：HTTP {status}"}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "message": f"LLM API 连接失败：{type(exc).__name__}"}
 

@@ -112,6 +112,40 @@ def test_exact_attempt_is_required(base_request):
     assert caught.value.code == MODEL_EXACT_TOOL_CALL_REJECTED
 
 
+def test_exact_request_omits_tools_keys_and_buffers_tool_failures(base_request, monkeypatch):
+    seen = []
+
+    class ExactResponse(_Response):
+        def iter_lines(self, **kwargs):
+            yield b'data: {"choices":[{"delta":{"content":"safe"}}]}'
+            yield b'data: {"choices":[{"delta":{"tool_calls":[{"id":"x1","function":{"name":"evil","arguments":"{}"}}]}}]}'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}'
+            yield b"data: [DONE]"
+
+    def post(*args, **kwargs):
+        seen.append(kwargs["data"])
+        return ExactResponse()
+
+    monkeypatch.setattr("rnaseq_agent.model_provider.requests.post", post)
+    request = replace(base_request, exact_attempt=True, payload={**base_request.payload, "tools": [{"type": "function"}], "tool_choice": "auto", "stream": True})
+    with pytest.raises(ProviderRequestError) as caught:
+        list(ModelProviderGateway().dispatch_exact(request))
+    assert caught.value.code == MODEL_EXACT_TOOL_CALL_REJECTED
+    assert b'"tools"' not in seen[0]
+    assert b'"tool_choice"' not in seen[0]
+
+
+@pytest.mark.parametrize("marker", [
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN DSA PRIVATE KEY-----",
+    "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+])
+def test_gateway_blocks_all_private_key_markers(base_request, marker):
+    with pytest.raises(ProviderRequestError) as caught:
+        ModelProviderGateway().complete(replace(base_request, payload={"messages": [{"role": "user", "content": marker}]}))
+    assert caught.value.code == MODEL_CONTEXT_SECRET_DETECTED
+
+
 def test_transport_error_marks_transmission_started(base_request, monkeypatch):
     def fail(*args, **kwargs):
         raise OSError("network failed")
