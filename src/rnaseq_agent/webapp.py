@@ -97,6 +97,8 @@ from .remote_scan_store import (
 )
 from .security_audit import AuditCommitUncertainError, _record_browse_audit, browse_history_projection
 from .chat_graph import ToolExecutionContext, ToolExecutionResult
+from .model_disclosure import PreparedModelRequest, ProviderCredentials, ProviderRequestError
+from .model_provider import ModelProviderGateway, normalize_provider_config, provider_identity
 from .project_intake import (
     append_history,
     derive_visible_state,
@@ -590,20 +592,11 @@ def _llm_reply_or_none(config: dict[str, Any], text: str, timeout: float = 30.0)
     endpoint = _llm_endpoint(config)
     if endpoint is None:
         return None
-    url, api_key, model = endpoint
     try:
-        import requests
-
-        resp = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": _llm_messages(text), "temperature": 0.2},
-            timeout=timeout,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        return str(data["choices"][0]["message"]["content"]).strip()
+        llm = config.get("llm", config)
+        provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": "chat_completions"})
+        request = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": _llm_messages(text), "temperature": 0.2}, credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")), timeout_seconds=timeout)
+        return ModelProviderGateway().complete(request).text.strip() or None
     except Exception:  # noqa: BLE001 - any failure falls back to the rule router
         return None
 
@@ -619,43 +612,25 @@ def _llm_stream_chunks(config: dict[str, Any], text: str, timeout: float = 60.0)
     endpoint = _llm_endpoint(config)
     if endpoint is None:
         return
-    url, api_key, model = endpoint
-    streamed = False
     try:
-        import requests
-
-        with requests.post(
-            url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": _llm_messages(text), "temperature": 0.2, "stream": True},
-            timeout=timeout,
-            stream=True,
-        ) as resp:
-            if resp.status_code == 200:
-                for raw in resp.iter_lines(decode_unicode=True):
-                    if not raw:
-                        continue
-                    line = raw.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[len("data:"):].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(payload)
-                    except ValueError:
-                        continue
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    piece = (choices[0].get("delta") or {}).get("content")
-                    if piece:
-                        streamed = True
-                        yield piece
-    except Exception:  # noqa: BLE001 - fall through to the non-streaming call
+        llm = config.get("llm", config)
+        provider = normalize_provider_config({"provider": llm.get("provider") or "openai", "api_base": llm.get("api_base"), "model": llm.get("model") or "gpt-4o-mini", "api_mode": "chat_completions"})
+        request = PreparedModelRequest(provider=provider, identity=provider_identity(provider), api_mode="chat_completions", payload={"model": provider.model, "messages": _llm_messages(text), "temperature": 0.2, "stream": True}, credentials=ProviderCredentials(api_key=str(llm.get("api_key") or "")), timeout_seconds=timeout, stream=True)
         streamed = False
-    if streamed:
-        return
+        for event in ModelProviderGateway().stream(request):
+            if event.kind == "delta":
+                streamed = True
+                yield str(event.value)
+        if streamed:
+            return
+    except ProviderRequestError as exc:
+        # Once the gateway has entered transport, retrying would duplicate a
+        # possibly accepted request.  Only pre-transport failures may use the
+        # legacy non-streaming fallback.
+        if exc.transmission_started:
+            return
+    except Exception:  # noqa: BLE001 - fall through to the non-streaming call
+        pass
     reply = _llm_reply_or_none(config, text, timeout=timeout)
     if reply:
         yield reply

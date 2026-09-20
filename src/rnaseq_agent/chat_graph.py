@@ -96,6 +96,8 @@ from .agent_tools import (
     tool_schemas,
     validate_call,
 )
+from .model_disclosure import PreparedModelRequest, ProviderCredentials, ProviderRequestError
+from .model_provider import ModelProviderGateway, normalize_provider_config, provider_identity
 from .model_context import (
     EphemeralToolCallStore,
     project_assistant_tool_call,
@@ -283,6 +285,7 @@ def _stream_chat_completion(
     messages: list[dict[str, Any]],
     *,
     timeout: float = 60.0,
+    gateway: ModelProviderGateway | None = None,
 ) -> Iterator[tuple[str, Any]]:
     """Stream one assistant turn, yielding ``("delta", text)`` then ``("message", ...)``.
 
@@ -314,66 +317,32 @@ def _stream_chat_completion(
     accumulator = ToolCallAccumulator()
     content_parts: list[str] = []
     finish_reason = ""
+    if gateway is None:
+        gateway = ModelProviderGateway()
     try:
-        import requests
-
-        with requests.post(
-            url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=timeout,
-            stream=True,
-        ) as response:
-            if response.status_code != 200:
-                detail = response.text[:300] if response.text else ""
-                yield ("error", f"模型接口返回 HTTP {response.status_code}。{detail}")
-                return
-            for raw in response.iter_lines(decode_unicode=True):
-                if not raw:
-                    continue
-                line = raw.strip()
-                if not line.startswith("data:"):
-                    continue
-                chunk_text = line[len("data:"):].strip()
-                if chunk_text == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(chunk_text)
-                except ValueError:
-                    continue
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0]
-                if choice.get("finish_reason"):
-                    finish_reason = str(choice["finish_reason"])
-                delta = choice.get("delta") or {}
-                piece = delta.get("content")
-                if piece:
-                    content_parts.append(str(piece))
-                    yield ("delta", str(piece))
-                if delta.get("tool_calls"):
-                    accumulator.add_delta(delta["tool_calls"])
-    except Exception as exc:  # noqa: BLE001 - surfaced to the user as a reply
-        yield ("error", f"调用模型失败：{type(exc).__name__}: {exc}")
+        config = normalize_provider_config({"provider": llm_block.get("provider") or "openai", "api_base": llm_block.get("api_base"), "model": model, "api_mode": "chat_completions"})
+        request = PreparedModelRequest(provider=config, identity=provider_identity(config), api_mode="chat_completions", payload=payload, credentials=ProviderCredentials(api_key=api_key), timeout_seconds=timeout, stream=True)
+        events = gateway.stream(request)
+        for event in events:
+            if event.kind == "delta":
+                streamed_value = str(event.value)
+                content_parts.append(streamed_value)
+                yield ("delta", streamed_value)
+            elif event.kind == "tool_call_fragment":
+                fragment = event.value if isinstance(event.value, dict) else {}
+                accumulator.add_delta([{"id": fragment.get("id", ""), "function": {"name": fragment.get("name", ""), "arguments": fragment.get("arguments", "")}}])
+            elif event.kind == "message":
+                message_value = event.value if isinstance(event.value, dict) else {}
+                finish_reason = str(message_value.get("finish_reason") or "stop")
+        calls = accumulator.finish()
+        yield ("message", {"content": "".join(content_parts), "tool_calls": [{"id": call.call_id, "type": "function", "function": {"name": call.name, "arguments": call.raw_arguments}} for call in calls], "finish_reason": finish_reason})
         return
-
-    calls = accumulator.finish()
-    yield (
-        "message",
-        {
-            "content": "".join(content_parts),
-            "tool_calls": [
-                {
-                    "id": call.call_id,
-                    "type": "function",
-                    "function": {"name": call.name, "arguments": call.raw_arguments},
-                }
-                for call in calls
-            ],
-            "finish_reason": finish_reason,
-        },
-    )
+    except ProviderRequestError as exc:
+        yield ("error", str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001
+        yield ("error", f"调用模型失败：{type(exc).__name__}")
+        return
 
 
 # -- 图 ---------------------------------------------------------------------
