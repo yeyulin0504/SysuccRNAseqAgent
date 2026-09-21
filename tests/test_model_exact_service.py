@@ -121,6 +121,42 @@ def test_send_exact_disclosure_rejects_unapproved_grant(tmp_path: Path) -> None:
     assert result["error_code"] in {"MODEL_DATA_GRANT_CONSUMED", "MODEL_DATA_GRANT_INVALID"}
 
 
+def test_send_exact_disclosure_rejects_prompt_that_contains_unapproved_path_data(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="核对样本命名",
+    )
+    decide_grant(project, grant.grant_id, approved=True)
+    called = False
+
+    def forbidden_dispatch(self, request):
+        nonlocal called
+        called = True
+        return iter(())
+
+    monkeypatch.setattr(
+        "rnaseq_agent.model_provider.ModelProviderGateway.dispatch_exact",
+        forbidden_dispatch,
+    )
+    result = send_exact_disclosure(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        grant_id=grant.grant_id,
+        prompt="请读取 /remote/secret/S1_R1.fastq.gz 并核对样本名",
+    )
+
+    assert result["ok"] is False
+    assert result["error_code"] == "MODEL_DATA_SCOPE_UNSUPPORTED"
+    assert called is False
+
+
 def test_send_exact_disclosure_never_accepts_remote_source_ref(tmp_path: Path) -> None:
     project = _project(tmp_path)
     with pytest.raises(DataGrantError) as caught:

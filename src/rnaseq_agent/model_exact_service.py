@@ -9,6 +9,7 @@ state, grant JSON, or application logs.
 from __future__ import annotations
 
 import hashlib
+import re
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +50,10 @@ class _ExactServiceContext:
 
 _EXACT_SERVICE_CONTEXT: ContextVar[_ExactServiceContext | None] = ContextVar(
     "model_exact_service_context", default=None
+)
+_UNAPPROVED_EXACT_PROMPT_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|/)[^\s,，。；;]+|\b[^\s,，。；;]+\.(?:fastq|fq)(?:\.gz)?\b",
+    re.IGNORECASE,
 )
 
 
@@ -162,6 +167,8 @@ def send_exact_disclosure(
     """
     if not isinstance(prompt, str) or not prompt.strip():
         return {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID}
+    if _UNAPPROVED_EXACT_PROMPT_RE.search(prompt):
+        return {"ok": False, "error_code": "MODEL_DATA_SCOPE_UNSUPPORTED"}
 
     project_dir = Path(project_dir)
 
