@@ -6,10 +6,12 @@
 ## 当前实现状态（2026-09-21）
 
 summary-only 默认边界、主要 provider gateway、approved-root 扫描和 metadata-only
-grant 基础设施已经落地并有测试。exact grant 还没有接入 ChatGraph/Web 确认卡和真实
-provider 发送路径；`remote_paths` 与 remote `source_ref` 继续 fail closed。当前可以
-把“默认摘要不泄露精确信息”作为已实现契约，不能把“确认后模型读取远程 FASTQ 精确
-路径”当成已上线能力。分阶段验收见
+grant 基础设施已经落地并有测试。local `sample_ids` exact grant 已通过独立的
+project-scoped Web API 接入真实 provider 发送；自然语言 ChatGraph 的 exact intent 和
+前端 disclosure card 仍未接通。`fastq_filenames`、`report_excerpt`、`remote_paths` 与
+remote `source_ref` 继续 fail closed。当前可以把“默认摘要不泄露精确信息”和“用户显式
+批准后 local sample_ids 只在一次 request-local provider 请求中可见”作为已实现契约，
+不能把“确认后模型读取远程 FASTQ 精确路径”当成已上线能力。分阶段验收见
 [LLM 数据披露发布路线图](superpowers/plans/2026-09-21-llm-disclosure-release-roadmap.md)。
 
 ## 核心原则
@@ -87,6 +89,11 @@ thread、provider identity、字段类别、项目与数据 revision；只供一
 provider 请求最终都由同一 `ModelContextBuilder` 通过显式 allowlist 构造，并在发送
 前检查已知凭据和私钥标记。详细设计见
 `docs/superpowers/specs/2026-09-17-llm-data-disclosure-design.md`。
+
+当前 local `sample_ids` 的结构化入口是：先创建 metadata-only grant，再用严格的
+JSON 布尔批准/拒绝，最后调用一次性 send endpoint。send endpoint 返回的正文只属于
+当前 HTTP 请求；它不会追加到对话 History、ChatState、checkpoint、通用日志或 grant
+JSON。普通工具确认卡不能创建这个 grant，也不能借助它扩大写入或执行权限。
 
 ## 三个相互独立的权限轴
 

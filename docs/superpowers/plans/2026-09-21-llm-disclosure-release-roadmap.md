@@ -17,12 +17,13 @@
 - approved remote root、`tool_mode`、`data_scope` 是三条独立权限轴。
 - remote scan 的结构化 UI 可以显示本地精确信息，provider 默认只收到数量、配对统计和不透明 `source_ref`。
 - metadata-only grant store 已具备 TTL、project/thread/provider/tool-mode/revision 绑定、单次 claim 和 terminal 状态。
+- local `sample_ids` 已有独立的结构化 Web API：创建元数据卡、布尔批准/拒绝、一次性 exact provider send；返回正文只存在当前请求，不写入 History、ChatState 或 grant JSON。
 
 仍然明确关闭或未接通的部分：
 
-- exact grant 尚未接入 ChatGraph、Web 确认卡和真实 provider 请求。
-- `ModelContextBuilder` 当前不会注入 exact grant；`remote_paths` 和 remote `source_ref` 仍拒绝。
-- claim、connection snapshot、approved-root 复核和 exact response collector 尚未形成一个业务闭环。
+- exact grant 已接入独立的结构化 Web API 和真实 provider 请求；自然语言 ChatGraph 的 exact 意图、前端 disclosure card 和 Graph → claim → dispatch 仍未接通。
+- 当前只开放 local `sample_ids`；`fastq_filenames`、`report_excerpt`、`remote_paths` 和 remote `source_ref` 仍拒绝。
+- claim、connection snapshot、revision 复核和 exact response collector 已在这条 local API 中形成闭环；approved-root remote exact 仍关闭。
 - 因此当前不能声称“用户确认后模型可以读取远程 FASTQ 精确路径”。
 
 ## 分阶段推进
@@ -74,6 +75,23 @@
 6. gateway 是否在发送前发现 secret、tool call 或超限响应。
 
 任何一项失败都不发送 provider 请求。exact grant 不授予写盘、扫描或执行权限；approved root 也不扩大模型 data scope。
+
+## 当前 local `sample_ids` 结构化入口
+
+阶段 B 的第一条业务入口暂时不让普通 LLM 工具自行扩大数据权限，而是使用独立的
+project-scoped API：
+
+1. `POST /api/projects/{project_id}/data-disclosures` 只接受
+   `fields: ["sample_ids"]` 和用途文本，返回不含原值的 disclosure card。
+2. `POST .../{grant_id}/decision` 只接受 JSON 布尔 `approved`；字符串、数字和缺失值
+   都拒绝。
+3. `POST .../{grant_id}/send` 在已批准且仍然绑定当前 project/thread/provider/tool mode
+   与 revisions 时 claim grant，构造 exact request-local context，并强制调用
+   `dispatch_exact`。响应正文作为当前 HTTP 结果返回，不追加到聊天 transcript 或
+   History；发送不确定时 grant 进入 `consumed_ambiguous`，不会自动重试。
+
+这条入口先验证权限和传输边界，后续再把它接入 ChatGraph 的专用 disclosure intent 和
+前端确认卡。普通工具确认卡不会顺带扩大 `data_scope`。
 
 ## 文档维护规则
 

@@ -104,6 +104,12 @@ from .model_provider import (
     context_free_prepared_request,
     normalize_provider_config,
 )
+from .model_data_grants import (
+    DataGrantError,
+    decide_grant,
+    issue_grant_request,
+)
+from .model_exact_service import build_disclosure_card, send_exact_disclosure
 from .project_intake import (
     append_history,
     derive_visible_state,
@@ -3566,6 +3572,113 @@ def create_app(
             pass
         workspace.set_thread_count(project_id, len(list_threads(project_dir)))
         return meta
+
+    @app.post("/api/projects/{project_id}/data-disclosures")
+    async def api_data_disclosure_request(project_id: str, request: Request):
+        """Create a metadata-only local model-data disclosure request.
+
+        The browser receives a confirmation card containing fields, counts,
+        provider identity and revisions. Exact sample values are never part of
+        this response or the durable grant record.
+        """
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        thread_id = str(payload.get("thread_id") or "main").strip() or "main"
+        fields = payload.get("fields")
+        purpose = payload.get("purpose")
+        if not isinstance(fields, list) or fields != ["sample_ids"]:
+            return JSONResponse(
+                {"ok": False, "error_code": "MODEL_DATA_SCOPE_UNSUPPORTED"},
+                status_code=400,
+            )
+        if not isinstance(purpose, str) or not purpose.strip():
+            return JSONResponse(
+                {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"},
+                status_code=400,
+            )
+        try:
+            grant = issue_grant_request(
+                project_dir,
+                project_id=project_id,
+                thread_id=thread_id,
+                fields=("sample_ids",),
+                purpose=purpose,
+                connection_store_dir=connection_file_path().parent,
+            )
+            card = build_disclosure_card(
+                project_dir,
+                grant.grant_id,
+                connection_store_dir=connection_file_path().parent,
+            )
+        except DataGrantError as exc:
+            return JSONResponse(
+                {"ok": False, "error_code": exc.code},
+                status_code=400,
+            )
+        return {"ok": True, "grant_id": grant.grant_id, "card": card}
+
+    @app.post("/api/projects/{project_id}/data-disclosures/{grant_id}/decision")
+    async def api_data_disclosure_decision(project_id: str, grant_id: str, request: Request):
+        """Approve or reject a pending disclosure using fail-closed booleans."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        approved = payload.get("approved") if isinstance(payload, dict) else None
+        if not isinstance(approved, bool):
+            return JSONResponse(
+                {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"},
+                status_code=400,
+            )
+        try:
+            grant = decide_grant(project_dir, grant_id, approved=approved)
+        except DataGrantError as exc:
+            return JSONResponse(
+                {"ok": False, "error_code": exc.code},
+                status_code=409,
+            )
+        return {
+            "ok": True,
+            "grant_id": grant.grant_id,
+            "status": grant.status,
+            "error_code": grant.error_code,
+        }
+
+    @app.post("/api/projects/{project_id}/data-disclosures/{grant_id}/send")
+    async def api_data_disclosure_send(project_id: str, grant_id: str, request: Request):
+        """Consume one approved local grant and return its response transiently."""
+        _guard(request)
+        project_dir = _project_dir_or_404(project_id)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        thread_id = str(payload.get("thread_id") or "main").strip() or "main"
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return JSONResponse(
+                {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"},
+                status_code=400,
+            )
+        result = send_exact_disclosure(
+            project_dir,
+            project_id=project_id,
+            thread_id=thread_id,
+            grant_id=grant_id,
+            prompt=prompt,
+            connection_store_dir=connection_file_path().parent,
+        )
+        return result
 
     @app.post("/api/projects/{project_id}/archive")
     async def api_projects_archive(project_id: str, request: Request):
