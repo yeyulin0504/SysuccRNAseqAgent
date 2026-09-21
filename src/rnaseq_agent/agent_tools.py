@@ -96,6 +96,11 @@ TOOL_MODES = (
 )
 DEFAULT_TOOL_MODE = TOOL_MODE_APPROVED_EXECUTE
 
+# A missing field is different from an explicit JSON ``null``.  Keep the
+# sentinel private so callers must omit the argument rather than smuggling an
+# ambiguous value through ``None``.
+_TOOL_MODE_MISSING = object()
+
 _MODE_RISKS = {
     TOOL_MODE_DISABLED: frozenset(),
     TOOL_MODE_READ_ONLY: frozenset({RISK_READ}),
@@ -104,16 +109,19 @@ _MODE_RISKS = {
 }
 
 
-def normalize_tool_mode(value: Any) -> str:
+def normalize_tool_mode(value: Any = _TOOL_MODE_MISSING) -> str:
     """Return a canonical tool mode, defaulting only when the field is absent.
 
-    Missing settings preserve compatibility with installations created before
-    the kill switch. An explicit unknown value is rejected: silently mapping a
-    typo to the broadest mode would turn a configuration error into privilege
-    escalation.
+    Calling without an argument preserves compatibility with installations
+    created before the kill switch. Explicit ``None`` is a real JSON null and
+    therefore maps to ``disabled``; an explicit unknown value is rejected so
+    silently mapping a typo to the broadest mode cannot turn a configuration
+    error into privilege escalation.
     """
-    if value is None:
+    if value is _TOOL_MODE_MISSING:
         return DEFAULT_TOOL_MODE
+    if value is None:
+        return TOOL_MODE_DISABLED
     if not isinstance(value, str):
         raise ValueError(
             f"tool_mode 必须是字符串且为以下值之一：{', '.join(TOOL_MODES)}。"

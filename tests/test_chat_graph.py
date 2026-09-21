@@ -36,6 +36,7 @@ from rnaseq_agent.agent_tools import (
     confirmation_policy,
     describe_call,
     normalize_write_arguments,
+    normalize_tool_mode,
     parse_message_tool_calls,
     requires_confirmation,
     risk_of,
@@ -46,6 +47,12 @@ from rnaseq_agent.agent_tools import (
 )
 
 langgraph = pytest.importorskip("langgraph")
+
+
+def test_tool_mode_normalization_distinguishes_missing_from_explicit_null() -> None:
+    """Legacy omission keeps compatibility; explicit JSON null fails closed."""
+    assert normalize_tool_mode() == TOOL_MODE_APPROVED_EXECUTE
+    assert normalize_tool_mode(None) == TOOL_MODE_DISABLED
 
 SAMPLE_WRITE_ARGS = {
     "data_source": "remote_path",

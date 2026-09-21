@@ -231,7 +231,16 @@ def _live_llm_tool_mode() -> str:
     from .agent_tools import TOOL_MODE_DISABLED, normalize_tool_mode
 
     try:
-        return normalize_tool_mode(load_llm().get("tool_mode"))
+        settings = load_llm()
+        if not settings:
+            # No user-level LLM block is the legacy rule-fallback case.  Keep
+            # its historical compatibility mode; malformed/explicit-null
+            # stores are represented by load_llm() as an explicit disabled
+            # value and therefore remain fail-closed below.
+            return normalize_tool_mode()
+        if "tool_mode" not in settings:
+            return TOOL_MODE_DISABLED
+        return normalize_tool_mode(settings["tool_mode"])
     except (AttributeError, ValueError):
         return TOOL_MODE_DISABLED
 

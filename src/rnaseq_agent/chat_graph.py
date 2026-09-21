@@ -784,12 +784,20 @@ def build_chat_graph(
 
     def _live_tool_mode() -> str:
         try:
-            raw = (
-                tool_mode_reader()
-                if tool_mode_reader is not None
-                else llm_config.get("llm", llm_config).get("tool_mode")
-            )
-            return normalize_tool_mode(raw)
+            if tool_mode_reader is not None:
+                # A reader returning ``None`` represents an unreadable or
+                # explicitly-null live policy; do not reinterpret it as the
+                # legacy missing-field compatibility case.
+                return normalize_tool_mode(tool_mode_reader())
+            block = llm_config.get("llm", llm_config)
+            if not isinstance(block, dict):
+                return TOOL_MODE_DISABLED
+            if "tool_mode" not in block:
+                # Only a genuinely absent legacy field receives the migration
+                # default.  Explicit JSON null is handled by the helper as
+                # disabled.
+                return normalize_tool_mode()
+            return normalize_tool_mode(block["tool_mode"])
         except Exception:  # noqa: BLE001 - unreadable policy must fail closed
             return TOOL_MODE_DISABLED
 
@@ -1617,7 +1625,9 @@ def build_chat_graph(
         """
         calls = list(state.get("pending_calls") or [])
         project_dir = Path(state.get("project_dir") or "runs/mvp_demo")
-        approved = bool(state.get("confirmed"))
+        # Only the exact boolean produced by the confirmation node may authorize
+        # side effects.  Truthy checkpoint tampering (1, "yes", etc.) fails closed.
+        approved = state.get("confirmed") is True
         messages = list(state.get("messages") or [])
         log = list(state.get("tool_log") or [])
         latest_reply = ""
