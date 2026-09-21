@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import json
 
 import pytest
@@ -151,6 +152,40 @@ def test_claim_compares_live_counts_before_extracting(tmp_path):
     assert caught.value.code == MODEL_DATA_REVISION_CHANGED
     assert called == []
     assert load_grant(project, grant.grant_id).status == "consumed_failed"
+
+
+def test_claim_reads_project_data_under_project_lock(tmp_path, monkeypatch):
+    project = _project(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", now=NOW)
+    decide_grant(project, grant.grant_id, approved=True, now=NOW)
+
+    import rnaseq_agent.model_data_grants as grants_module
+
+    events: list[str] = []
+    real_lock = grants_module.project_state_lock
+
+    @contextmanager
+    def recording_lock(path):
+        path_text = str(path)
+        if path_text.endswith("project.json"):
+            events.append("project-enter")
+        with real_lock(path):
+            yield
+        if path_text.endswith("project.json"):
+            events.append("project-exit")
+
+    monkeypatch.setattr(grants_module, "project_state_lock", recording_lock)
+    prepared = claim_grant_for_send(
+        project,
+        grant.grant_id,
+        live_inputs=ExactClaimInputs("p1", "t1"),
+        prepare=mark_exact_prepare(lambda claim, snapshot: (None, object())),
+        open_stream=mark_exact_open_stream(lambda request: iter(())),
+        now=NOW,
+    )
+
+    assert prepared.claim.exact_values["sample_ids"] == ("SENTINEL_SAMPLE",)
+    assert events == ["project-enter", "project-exit"]
 
 
 @pytest.mark.parametrize("started, expected_status", [(False, "consumed_failed"), (True, "consumed_ambiguous")])

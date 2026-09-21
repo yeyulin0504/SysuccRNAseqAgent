@@ -604,38 +604,42 @@ def _claim_grant_for_send_locked(
             failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_REVISION_CHANGED, "consumed_at": _iso(current)})
             _write(path, _to_payload(failed))
             raise _claim_error(failed, MODEL_DATA_REVISION_CHANGED, current)
-        live_revisions = read_model_data_revisions(project_dir, snapshot.provider)
-        if live_revisions.project_revision != grant.revisions.project_revision:
-            failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_REVISION_CHANGED, "consumed_at": _iso(current)})
-            _write(path, _to_payload(failed))
-            raise _claim_error(failed, MODEL_DATA_REVISION_CHANGED, current)
-        for field in grant.fields:
-            if field == "sample_ids" and live_revisions.sample_revision != grant.revisions.sample_revision:
-                code = MODEL_DATA_REVISION_CHANGED
-                failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
+        # Project writers lock project.json. Hold the same lock across the
+        # revision/count checks and exact extraction so a compliant writer
+        # cannot replace the approved sample data between validation and use.
+        with project_state_lock(project_dir / "project.json"):
+            live_revisions = read_model_data_revisions(project_dir, snapshot.provider)
+            if live_revisions.project_revision != grant.revisions.project_revision:
+                failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_REVISION_CHANGED, "consumed_at": _iso(current)})
                 _write(path, _to_payload(failed))
-                raise _claim_error(failed, code, current)
-            if field == "fastq_filenames" and live_revisions.sample_revision != grant.revisions.sample_revision:
-                code = MODEL_DATA_REVISION_CHANGED
-                failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
+                raise _claim_error(failed, MODEL_DATA_REVISION_CHANGED, current)
+            for field in grant.fields:
+                if field == "sample_ids" and live_revisions.sample_revision != grant.revisions.sample_revision:
+                    code = MODEL_DATA_REVISION_CHANGED
+                    failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
+                    _write(path, _to_payload(failed))
+                    raise _claim_error(failed, code, current)
+                if field == "fastq_filenames" and live_revisions.sample_revision != grant.revisions.sample_revision:
+                    code = MODEL_DATA_REVISION_CHANGED
+                    failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
+                    _write(path, _to_payload(failed))
+                    raise _claim_error(failed, code, current)
+                if field == "report_excerpt" and live_revisions.report_revision != grant.revisions.report_revision:
+                    code = MODEL_DATA_REVISION_CHANGED
+                    failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
+                    _write(path, _to_payload(failed))
+                    raise _claim_error(failed, code, current)
+            live_counts = _project_counts(project_dir, grant.fields)
+            if live_counts != dict(grant.record_counts):
+                failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_REVISION_CHANGED, "consumed_at": _iso(current)})
                 _write(path, _to_payload(failed))
-                raise _claim_error(failed, code, current)
-            if field == "report_excerpt" and live_revisions.report_revision != grant.revisions.report_revision:
-                code = MODEL_DATA_REVISION_CHANGED
-                failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": code, "consumed_at": _iso(current)})
-                _write(path, _to_payload(failed))
-                raise _claim_error(failed, code, current)
-        live_counts = _project_counts(project_dir, grant.fields)
-        if live_counts != dict(grant.record_counts):
-            failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_REVISION_CHANGED, "consumed_at": _iso(current)})
-            _write(path, _to_payload(failed))
-            raise _claim_error(failed, MODEL_DATA_REVISION_CHANGED, current)
-        token = secrets.token_urlsafe(24)
-        claim = ClaimedDataGrant(grant.grant_id, token, GrantBindings(grant.project_id, grant.thread_id, grant.provider_identity, grant.tool_mode, grant.revisions), grant.fields, _extract(project_dir, grant.fields))
-        manifest = dict(grant.manifest)
-        manifest["claim_token_hash"] = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        transmitting = DataDisclosureGrant(**{**grant.__dict__, "status": "transmitting", "claimed_at": _iso(current), "manifest": manifest})
-        _write(path, _to_payload(transmitting))
+                raise _claim_error(failed, MODEL_DATA_REVISION_CHANGED, current)
+            token = secrets.token_urlsafe(24)
+            claim = ClaimedDataGrant(grant.grant_id, token, GrantBindings(grant.project_id, grant.thread_id, grant.provider_identity, grant.tool_mode, grant.revisions), grant.fields, _extract(project_dir, grant.fields))
+            manifest = dict(grant.manifest)
+            manifest["claim_token_hash"] = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            transmitting = DataDisclosureGrant(**{**grant.__dict__, "status": "transmitting", "claimed_at": _iso(current), "manifest": manifest})
+            _write(path, _to_payload(transmitting))
     context = request = None
     events: Iterator[Any] = iter(())
     try:
