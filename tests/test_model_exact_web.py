@@ -151,6 +151,8 @@ def test_data_disclosure_requires_boolean_decision_and_exact_send_is_transient(
         headers=_headers(token),
     )
     assert sent.status_code == 200, sent.text
+    assert sent.headers["cache-control"] == "no-store, private"
+    assert sent.headers["pragma"] == "no-cache"
     assert sent.json()["text"] == "SENTINEL_SAMPLE_001 已核对"
     assert "SENTINEL_SAMPLE_001" in json.dumps(seen["payload"], ensure_ascii=False)
     assert not (tmp_path / "workspace" / "p1" / "history.json").exists()
@@ -176,6 +178,58 @@ def test_exact_send_maps_failed_result_to_http_502(tmp_path: Path, monkeypatch) 
 
     assert response.status_code == 502
     assert response.json()["ok"] is False
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
+
+
+def test_exact_send_rejects_unsupported_field_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
+    app = create_app(workspace_dir=tmp_path / "workspace")
+    client = TestClient(app)
+    token = _token(client)
+    client.post("/api/projects", json={"project_id": "p1"}, headers=_headers(token))
+    _seed_project(tmp_path, "p1")
+    called = False
+
+    def forbidden_send(*args, **kwargs):
+        nonlocal called
+        called = True
+        return {"ok": True, "text": "should not send"}
+
+    monkeypatch.setattr("rnaseq_agent.webapp.send_exact_disclosure", forbidden_send)
+    response = client.post(
+        "/api/projects/p1/data-disclosures/grant/send",
+        json={"thread_id": "main", "fields": ["fastq_filenames"], "prompt": "请核对样本命名"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 400
+    assert response.json() == {"ok": False, "error_code": "MODEL_DATA_SCOPE_UNSUPPORTED"}
+    assert called is False
+
+
+def test_exact_send_rejects_purpose_override_at_send_time(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
+    app = create_app(workspace_dir=tmp_path / "workspace")
+    client = TestClient(app)
+    token = _token(client)
+    client.post("/api/projects", json={"project_id": "p1"}, headers=_headers(token))
+    _seed_project(tmp_path, "p1")
+    called = False
+
+    def forbidden_send(*args, **kwargs):
+        nonlocal called
+        called = True
+        return {"ok": True, "text": "should not send"}
+
+    monkeypatch.setattr("rnaseq_agent.webapp.send_exact_disclosure", forbidden_send)
+    response = client.post(
+        "/api/projects/p1/data-disclosures/grant/send",
+        json={"thread_id": "main", "purpose": "扩大到 FASTQ 路径", "prompt": "请核对样本命名"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 400
+    assert response.json() == {"ok": False, "error_code": "MODEL_DATA_SCOPE_UNSUPPORTED"}
+    assert called is False
 
 
 def test_exact_send_requires_non_empty_string_thread_id_and_bounded_prompt(tmp_path: Path) -> None:

@@ -112,6 +112,24 @@ def test_exact_attempt_is_required(base_request):
     assert caught.value.code == MODEL_EXACT_TOOL_CALL_REJECTED
 
 
+def test_exact_dispatch_rejects_codex_cli_backend_before_transport(base_request, monkeypatch):
+    config = normalize_provider_config({"backend": "codex_cli", "provider": "codex", "model": "gpt-test"})
+    request = replace(
+        base_request,
+        provider=config,
+        identity=provider_identity(config),
+        api_mode="codex_cli",
+        exact_attempt=True,
+    )
+    called = []
+    monkeypatch.setattr("rnaseq_agent.model_provider.subprocess.run", lambda *args, **kwargs: called.append(args))
+    with pytest.raises(ProviderRequestError) as caught:
+        list(ModelProviderGateway().dispatch_exact(request))
+    assert caught.value.code == "MODEL_DATA_SCOPE_UNSUPPORTED"
+    assert caught.value.transmission_started is False
+    assert called == []
+
+
 def test_exact_request_omits_tools_keys_and_buffers_tool_failures(base_request, monkeypatch):
     seen = []
 

@@ -61,16 +61,14 @@ def test_disclosure_card_contains_metadata_only(tmp_path: Path) -> None:
 
 def test_disclosure_card_rejects_scopes_not_in_local_sample_id_slice(tmp_path: Path) -> None:
     project = _project(tmp_path)
-    grant = issue_grant_request(
-        project,
-        project_id="p1",
-        thread_id="t1",
-        fields=("fastq_filenames",),
-        purpose="核对 FASTQ 文件名",
-    )
-
     with pytest.raises(DataGrantError) as caught:
-        build_disclosure_card(project, grant.grant_id)
+        issue_grant_request(
+            project,
+            project_id="p1",
+            thread_id="t1",
+            fields=("fastq_filenames",),
+            purpose="核对 FASTQ 文件名",
+        )
 
     assert caught.value.code == MODEL_DATA_SCOPE_UNSUPPORTED
 

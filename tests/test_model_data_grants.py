@@ -22,6 +22,7 @@ from rnaseq_agent.model_disclosure import (
     MODEL_DATA_GRANT_INVALID,
     MODEL_DATA_GRANT_REJECTED,
     MODEL_DATA_REVISION_CHANGED,
+    MODEL_DATA_SCOPE_UNSUPPORTED,
     MODEL_PROVIDER_REQUEST_FAILED,
     ProviderRequestError,
 )
@@ -211,6 +212,74 @@ def test_remote_source_ref_remains_unsupported(tmp_path):
     with pytest.raises(DataGrantError) as caught:
         issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", source_ref="remote:1", now=NOW)
     assert caught.value.code == "MODEL_DATA_SCOPE_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("field", ["fastq_filenames", "report_excerpt", "remote_paths"])
+def test_issue_rejects_unsupported_fields_before_creating_grant(tmp_path, field):
+    project = _project(tmp_path)
+    with pytest.raises(DataGrantError) as caught:
+        issue_grant_request(
+            project,
+            project_id="p1",
+            thread_id="t1",
+            fields=(field,),
+            purpose="check",
+            now=NOW,
+        )
+    assert caught.value.code == "MODEL_DATA_SCOPE_UNSUPPORTED"
+    grant_dir = project / ".model_data_grants"
+    assert not grant_dir.exists() or not list(grant_dir.glob("*.json"))
+
+
+@pytest.mark.parametrize("project_id", ["p2", ""])
+def test_issue_rejects_missing_or_mismatched_stored_project_id(tmp_path, project_id):
+    project = _project(tmp_path)
+    if project_id == "":
+        payload = json.loads((project / "project.json").read_text(encoding="utf-8"))
+        del payload["project"]["id"]
+        (project / "project.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DataGrantError) as caught:
+        issue_grant_request(
+            project,
+            project_id=project_id or "p1",
+            thread_id="t1",
+            fields=("sample_ids",),
+            purpose="check",
+            now=NOW,
+        )
+    assert caught.value.code == MODEL_DATA_GRANT_INVALID
+
+
+def test_load_rejects_unsupported_field_even_when_record_is_forged(tmp_path):
+    project = _project(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", now=NOW)
+    record = grant_record_path(project, grant.grant_id)
+    payload = json.loads(record.read_text(encoding="utf-8"))
+    payload["fields"] = ["fastq_filenames"]
+    payload["record_counts"] = {"fastq_filenames": 1}
+    record.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DataGrantError) as caught:
+        load_grant(project, grant.grant_id)
+    assert caught.value.code == MODEL_DATA_SCOPE_UNSUPPORTED
+
+
+def test_claim_rejects_mismatched_stored_project_id(tmp_path):
+    project = _project(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", now=NOW)
+    decide_grant(project, grant.grant_id, approved=True, now=NOW)
+    payload = json.loads((project / "project.json").read_text(encoding="utf-8"))
+    payload["project"]["id"] = "p2"
+    (project / "project.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DataGrantError) as caught:
+        claim_grant_for_send(
+            project,
+            grant.grant_id,
+            live_inputs=ExactClaimInputs("p1", "t1"),
+            prepare=mark_exact_prepare(lambda claim, snapshot: (None, object())),
+            open_stream=mark_exact_open_stream(lambda request: iter(())),
+            now=NOW,
+        )
+    assert caught.value.code == MODEL_DATA_GRANT_INVALID
 
 
 @pytest.mark.parametrize("project_id, thread_id", [("", "t1"), ("p1", " ")])

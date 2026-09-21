@@ -40,6 +40,7 @@ from .model_provider import normalize_provider_config, provider_config_revision,
 from .storage import project_state_lock
 
 _FIELDS = {"sample_ids", "fastq_filenames", "remote_paths", "report_excerpt"}
+_ENABLED_FIELDS = frozenset({"sample_ids"})
 _TERMINAL = {"rejected", "consumed_success", "consumed_ambiguous", "consumed_failed"}
 _MARKED_PREPARE_IDS: set[int] = set()
 _MARKED_STREAM_IDS: set[int] = set()
@@ -355,6 +356,23 @@ def _project_counts(project_dir: Path, fields: Sequence[str]) -> dict[str, int]:
     return result
 
 
+def _stored_project_id(project_dir: Path, *, grant_id: str = "") -> str:
+    try:
+        value = json.loads((Path(project_dir) / "project.json").read_text(encoding="utf-8"))
+        project = value.get("project") if isinstance(value, dict) else None
+        stored = project.get("id") if isinstance(project, dict) else None
+    except Exception as exc:
+        raise DataGrantError("invalid project data", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id) from exc
+    if not isinstance(stored, str) or not stored.strip():
+        raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id)
+    return stored
+
+
+def _assert_stored_project_id(project_dir: Path, project_id: str, *, grant_id: str = "") -> None:
+    if _stored_project_id(project_dir, grant_id=grant_id) != project_id:
+        raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id)
+
+
 def _extract(project_dir: Path, fields: Sequence[str]) -> dict[DataField, tuple[str, ...]]:
     value = json.loads((Path(project_dir) / "project.json").read_text(encoding="utf-8"))
     samples = value.get("samples", {}).get("items", []) if isinstance(value, dict) else []
@@ -421,9 +439,13 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
             raise ValueError
         if revisions.report_revision is not None and (not isinstance(revisions.report_revision, str) or not revisions.report_revision.strip()):
             raise ValueError
-        fields = tuple(value["fields"])
-        if not isinstance(value["fields"], (list, tuple)) or not fields or any(not isinstance(field, str) or field not in _FIELDS for field in fields) or len(set(fields)) != len(fields):
+        if not isinstance(value["fields"], (list, tuple)):
             raise ValueError
+        fields = tuple(value["fields"])
+        if not fields or any(not isinstance(field, str) or field not in _FIELDS for field in fields) or len(set(fields)) != len(fields):
+            raise ValueError
+        if any(field not in _ENABLED_FIELDS for field in fields):
+            raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id=grant_id)
         if not isinstance(value["project_id"], str) or not isinstance(value["thread_id"], str):
             raise ValueError
         project_id, thread_id = value["project_id"], value["thread_id"]
@@ -490,13 +512,17 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
             claimed_at=value.get("claimed_at"), consumed_at=value.get("consumed_at"), error_code=value.get("error_code"),
             manifest=dict(manifest),
         )
+    except DataGrantError:
+        raise
     except Exception as exc:
         raise DataGrantError("invalid model data grant", code=MODEL_DATA_GRANT_INVALID, grant_id=grant_id) from exc
 
 
 def load_grant(project_dir: Path, grant_id: str) -> DataDisclosureGrant:
     with project_state_lock(_lock_path(Path(project_dir))):
-        return _from_payload(_read(grant_record_path(project_dir, grant_id), grant_id), grant_id)
+        grant = _from_payload(_read(grant_record_path(project_dir, grant_id), grant_id), grant_id)
+        _assert_stored_project_id(Path(project_dir), grant.project_id, grant_id=grant_id)
+        return grant
 
 
 def issue_grant_request(
@@ -505,22 +531,14 @@ def issue_grant_request(
     runtime_secrets: Sequence[str] = (), now: datetime | None = None,
 ) -> DataDisclosureGrant:
     del scan_store_dir, runtime_secrets
-    if source_ref is not None or not fields or len(set(fields)) != len(fields) or any(field not in _FIELDS for field in fields):
+    if source_ref is not None or not fields or len(set(fields)) != len(fields) or any(field not in _ENABLED_FIELDS for field in fields):
         raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")
     if not isinstance(purpose, str) or not 1 <= len(purpose) <= 240:
         raise DataGrantError("invalid model data purpose", code=MODEL_DATA_GRANT_INVALID, grant_id="")
     if not isinstance(project_id, str) or not isinstance(thread_id, str) or not project_id.strip() or not thread_id.strip():
         raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id="")
-    if "remote_paths" in fields:
-        raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")
     project_dir = Path(project_dir)
-    try:
-        project_payload = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
-        stored_project_id = project_payload.get("project", {}).get("id") if isinstance(project_payload, dict) else None
-    except Exception as exc:
-        raise DataGrantError("invalid project data", code=MODEL_DATA_GRANT_INVALID, grant_id="") from exc
-    if stored_project_id is not None and stored_project_id != project_id:
-        raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id="")
+    _assert_stored_project_id(project_dir, project_id)
     snapshot = _provider_snapshot(connection_store_dir)
     revisions = read_model_data_revisions(project_dir, snapshot.provider)
     counts = _project_counts(project_dir, fields)
@@ -544,6 +562,7 @@ def decide_grant(project_dir: Path, grant_id: str, *, approved: bool, note: str 
     with project_state_lock(_lock_path(project_dir)):
         path = grant_record_path(project_dir, grant_id)
         grant = _from_payload(_read(path, grant_id), grant_id)
+        _assert_stored_project_id(project_dir, grant.project_id, grant_id=grant_id)
         if grant.status == "rejected" and not approved:
             return grant
         if grant.status != "pending":
@@ -576,6 +595,7 @@ def _claim_grant_for_send_locked(
     with project_state_lock(_lock_path(project_dir)):
         path = grant_record_path(project_dir, grant_id)
         grant = _from_payload(_read(path, grant_id), grant_id)
+        _assert_stored_project_id(project_dir, grant.project_id, grant_id=grant_id)
         if grant.status == "transmitting":
             recovered = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_ambiguous", "error_code": MODEL_PROVIDER_REQUEST_FAILED, "consumed_at": _iso(current)})
             _write(path, _to_payload(recovered))

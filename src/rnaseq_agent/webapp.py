@@ -3812,11 +3812,26 @@ def create_app(
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        no_store_headers = {"Cache-Control": "no-store, private", "Pragma": "no-cache"}
+        requested_fields = payload.get("fields")
+        if requested_fields is not None and requested_fields != ["sample_ids"]:
+            return JSONResponse(
+                {"ok": False, "error_code": MODEL_DATA_SCOPE_UNSUPPORTED},
+                status_code=400,
+                headers=no_store_headers,
+            )
+        if "purpose" in payload:
+            return JSONResponse(
+                {"ok": False, "error_code": MODEL_DATA_SCOPE_UNSUPPORTED},
+                status_code=400,
+                headers=no_store_headers,
+            )
         thread_id = payload.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id.strip():
             return JSONResponse(
                 {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
                 status_code=400,
+                headers=no_store_headers,
             )
         thread_id = thread_id.strip()
         try:
@@ -3825,6 +3840,7 @@ def create_app(
             return JSONResponse(
                 {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
                 status_code=400,
+                headers=no_store_headers,
             )
         prompt = payload.get("prompt")
         if (
@@ -3835,6 +3851,7 @@ def create_app(
             return JSONResponse(
                 {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
                 status_code=400,
+                headers=no_store_headers,
             )
         result = send_exact_disclosure(
             project_dir,
@@ -3845,8 +3862,8 @@ def create_app(
             connection_store_dir=connection_file_path().parent,
         )
         if not result.get("ok"):
-            return JSONResponse(result, status_code=_exact_send_error_status(result))
-        return result
+            return JSONResponse(result, status_code=_exact_send_error_status(result), headers=no_store_headers)
+        return JSONResponse(result, headers=no_store_headers)
 
     @app.post("/api/projects/{project_id}/archive")
     async def api_projects_archive(project_id: str, request: Request):

@@ -16,6 +16,7 @@ import requests
 
 from .model_disclosure import (
     MODEL_CONTEXT_SECRET_DETECTED,
+    MODEL_DATA_SCOPE_UNSUPPORTED,
     MODEL_EXACT_TOOL_CALL_REJECTED,
     MODEL_PROVIDER_REQUEST_FAILED,
     PreparedModelRequest,
@@ -333,6 +334,12 @@ class ModelProviderGateway:
         exact_payload.pop("tools", None)
         exact_payload.pop("tool_choice", None)
         exact = replace(request, payload=exact_payload, exact_attempt=True)
+        if exact.provider.backend == "codex_cli" or exact.api_mode == "codex_cli":
+            raise ProviderRequestError(
+                "Codex CLI backend is not permitted for exact disclosure.",
+                code=MODEL_DATA_SCOPE_UNSUPPORTED,
+                transmission_started=False,
+            )
         if exact.api_mode == "chat_completions":
             # Buffer the bounded event stream before exposing anything to the
             # caller.  Exact sends must never reveal a text delta if a later
