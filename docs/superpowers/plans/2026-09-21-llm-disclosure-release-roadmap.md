@@ -21,7 +21,7 @@
 
 仍然明确关闭或未接通的部分：
 
-- exact grant 已接入独立的结构化 Web API 和真实 provider 请求；自然语言 ChatGraph 已接入只支持 `sample_ids` 的独立 disclosure intent/card，并可完成 metadata grant 的批准/拒绝。Graph → claim → dispatch 的 exact response 仍留在下一阶段，前端独立 disclosure card 仍待实现。
+- exact grant 已接入独立的结构化 Web API 和真实 provider 请求；自然语言 ChatGraph 已接入只支持 `sample_ids` 的独立 disclosure intent/card，并在批准后通过 Graph → claim → dispatch 返回一次性 transient exact response。前端独立 disclosure card 仍待实现。
 - 当前只开放 local `sample_ids`；`fastq_filenames`、`report_excerpt`、`remote_paths` 和 remote `source_ref` 仍拒绝。
 - claim、connection snapshot、revision 复核和 exact response collector 已在这条 local API 中形成闭环；approved-root remote exact 仍关闭。
 - 因此当前不能声称“用户确认后模型可以读取远程 FASTQ 精确路径”。
@@ -91,8 +91,9 @@ project-scoped API：
    History；发送不确定时 grant 进入 `consumed_ambiguous`，不会自动重试。
 
 这条入口先验证权限和传输边界；ChatGraph 的专用 disclosure intent 现在复用同一套
-metadata-only grant/card，但不会在批准回合直接把 exact 值写入模型上下文。前端独立
-disclosure card 与 Graph → claim → dispatch 的 request-local exact response 仍单独推进。
+metadata-only grant/card，并在批准后用独立 sender 完成 request-local exact response。
+exact 文本只进入当前 SSE `disclosure_result` 事件，不写入模型上下文、History 或日志。
+前端独立 disclosure card 仍单独推进。
 普通工具确认卡不会顺带扩大 `data_scope`。
 
 ## 文档维护规则
