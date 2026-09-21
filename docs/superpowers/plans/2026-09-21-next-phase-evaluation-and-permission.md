@@ -29,6 +29,7 @@ The current release is stable enough to stop expanding scope:
 - L1 real adapter run: `0 numerical passed / 2 expected_refusal_passed / 0 failed / 0 skipped`.
 - Unit/L0 mutation command exits `0`; its caught mutants demonstrate test sensitivity and do not constitute numerical L1 completion.
 - Remote audit/replay review: `217 passed, 5 skipped, 1 warning`; no new bypass found.
+- Permission threat audit: no confirmed bypass; follow-up items are `normalize_tool_mode(None)` fail-closed semantics and broader sentinel coverage for free-form provider prose. Opaque remote `source_ref` remains summary metadata only; remote exact consumer stays closed.
 
 The existing TCGA and airway cases remain expected refusals. The new metadata-audit contract records their input hashes, unit structure, export scripts, and inclusion rules, while license/redistribution terms, retrieval metadata, source archive hashes, script commits, and explicit batch conclusions remain blocked/null. Their derived inputs must not be described as untouched raw source matrices.
 

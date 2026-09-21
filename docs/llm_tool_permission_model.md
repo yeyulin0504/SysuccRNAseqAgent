@@ -10,7 +10,8 @@ grant 基础设施已经落地并有测试。local `sample_ids` exact grant 已�
 project-scoped Web API 接入真实 provider 发送；自然语言 ChatGraph 现在也能创建独立的
 sample_ids disclosure card，批准后通过独立的 request-local send 链路返回一次性 transient
 结果，前端只显示当前回合的 exact panel，持久化 done 事件只含安全元数据。`fastq_filenames`、`report_excerpt`、`remote_paths` 与
-remote `source_ref` 继续 fail closed。当前可以把“默认摘要不泄露精确信息”和“用户显式
+remote exact consumer 继续 fail closed。远程扫描返回的随机 `src_<32hex>` 只作为去标识
+摘要关联 token，不包含目录或文件信息，也不能单独授权远程精确披露。当前可以把“默认摘要不泄露精确信息”和“用户显式
 批准后 local sample_ids 只在一次 request-local provider 请求中可见”作为已实现契约，
 不能把“确认后模型读取远程 FASTQ 精确路径”当成已上线能力。分阶段验收见
 [LLM 数据披露发布路线图](superpowers/plans/2026-09-21-llm-disclosure-release-roadmap.md)。
@@ -117,7 +118,8 @@ JSON，前端 transient panel 也不会把 exact 文本回灌给下一轮模型�
 当前版本还要求 unsupported disclosure field 在 issue、load、claim 和 send 四个边界
 都直接拒绝；底层 extractor 能枚举某个字段不代表该字段已经成为产品能力。尤其是
 FASTQ 行如果带有 remote scan provenance、`source_ref` 或 `remote_data_dir`，不能被
-当作 local filename scope。provider exact response 的 HTTP/SSE 结果必须使用
+当作 local filename scope。摘要中的 opaque `source_ref` 只用于关联扫描记录，不能被当作
+remote exact scope 或客户端可控的授权参数。provider exact response 的 HTTP/SSE 结果必须使用
 `Cache-Control: no-store, private` 和 `Pragma: no-cache`，避免浏览器或代理缓存一次性
 精确信息。
 
