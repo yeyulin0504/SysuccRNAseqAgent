@@ -100,6 +100,7 @@ def _graph(
     tool_mode_reader=None,
     disclosure_requester=None,
     disclosure_decider=None,
+    disclosure_sender=None,
 ):
     """Build the chat graph with a scripted model and a recording executor.
 
@@ -130,6 +131,7 @@ def _graph(
         tool_mode_reader=tool_mode_reader,
         disclosure_requester=disclosure_requester,
         disclosure_decider=disclosure_decider,
+        disclosure_sender=disclosure_sender,
     )
     return graph, recorded, fake
 
@@ -886,6 +888,52 @@ class TestChatGraphConfirmation:
         assert recorded == []
         assert result["via"] == "rejected"
         _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])
+
+    def test_approved_disclosure_sends_exact_result_only_as_transient_event(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from langgraph.types import Command
+
+        graph, _recorded, fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("d2", "request_data_disclosure", {"fields": ["sample_ids"], "purpose": "解释样本"})]},
+                {"content": "披露结果已在当前面板显示。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            disclosure_requester=lambda *_args: {
+                "grant_id": "grant-2",
+                "card": {
+                    "type": "model_data_disclosure_confirmation",
+                    "grant_id": "grant-2",
+                    "fields": ["sample_ids"],
+                    "record_counts": {"sample_ids": 1},
+                    "purpose_category": "user_requested_exact_context",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                },
+            },
+            disclosure_decider=lambda *_args: {"status": "approved"},
+            disclosure_sender=lambda *_args: {
+                "ok": True,
+                "text": "SENTINEL_SAMPLE_001 的分组是 control",
+                "grant_id_hash": "sha256:grant",
+                "fields": ["sample_ids"],
+            },
+        )
+        config = {"configurable": {"thread_id": "disclosure-exact"}}
+        first = graph.invoke(_initial(tmp_path, "请核对样本分组"), config=config)
+        events: list[dict] = []
+        for mode, chunk in graph.stream(
+            Command(resume=_approval_decision(first, approved=True)),
+            config=config,
+            stream_mode=["custom", "updates"],
+        ):
+            if mode == "custom":
+                events.append(chunk)
+        assert any(item.get("type") == "disclosure_result" and item.get("text") == "SENTINEL_SAMPLE_001 的分组是 control" for item in events)
+        snapshot = graph.get_state(config).values
+        assert "SENTINEL_SAMPLE_001" not in json.dumps(snapshot, ensure_ascii=False)
+        assert "SENTINEL_SAMPLE_001" not in json.dumps(fake.seen_messages, ensure_ascii=False)
 
     def test_switching_to_a_stricter_mode_invalidates_a_waiting_card(
         self, monkeypatch, tmp_path

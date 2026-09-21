@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from rnaseq_agent.model_disclosure import ProviderEvent, ProviderRequestError
+
 fastapi_missing = False
 try:
     from fastapi.testclient import TestClient
@@ -337,6 +339,10 @@ class TestModelWritesConfigViaTool:
             ]
         )
         monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        monkeypatch.setattr(
+            "rnaseq_agent.model_provider.ModelProviderGateway.dispatch_exact",
+            lambda self, request: iter([ProviderEvent("delta", "SENTINEL_SAMPLE_001 的分组是 control", 1)]),
+        )
 
         events = _stream(client, token, "请申请查看样本名", project="disclosure_chat")
         card = _confirm_event(events)
@@ -359,9 +365,100 @@ class TestModelWritesConfigViaTool:
         grant_files = list((tmp_path / "disclosure_chat" / ".model_data_grants").glob("*.json"))
         assert len(grant_files) == 1
         grant_id = load_grant(tmp_path / "disclosure_chat", json.loads(grant_files[0].read_text(encoding="utf-8"))["grant_id"])
-        assert grant_id.status == "approved"
+        assert grant_id.status == "consumed_success"
         assert grant_id.fields == ("sample_ids",)
         assert "S1" not in grant_files[0].read_text(encoding="utf-8")
+
+    def test_approved_disclosure_exact_response_is_transient_only(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        from rnaseq_agent import webapp as webapp_module
+
+        token = _token(client)
+        _create_project(client, token, "disclosure_transient")
+        _seed_project(tmp_path, monkeypatch, "disclosure_transient")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("disclose_t", "request_data_disclosure", {"fields": ["sample_ids"], "purpose": "解释样本"})]},
+                {"content": "已在当前请求显示披露结果。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+        monkeypatch.setattr(
+            webapp_module,
+            "send_exact_disclosure",
+            lambda *args, **kwargs: {
+                "ok": True,
+                "text": "SENTINEL_SAMPLE_001 的分组是 control",
+                "grant_id_hash": "sha256:grant",
+                "fields": ["sample_ids"],
+            },
+        )
+
+        events = _stream(client, token, "请核对样本分组", project="disclosure_transient")
+        card = _confirm_event(events)
+        assert card and card["type"] == "model_data_disclosure_confirmation"
+        events2 = _resume(
+            client,
+            token,
+            project="disclosure_transient",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+        exact_events = [event for event in events2 if event["event"] == "disclosure_result"]
+        assert exact_events and exact_events[0]["data"]["text"] == "SENTINEL_SAMPLE_001 的分组是 control"
+        assert "SENTINEL_SAMPLE_001" not in json.dumps(events2[-1], ensure_ascii=False)
+        assert "SENTINEL_SAMPLE_001" not in json.dumps(fake.seen_messages, ensure_ascii=False)
+        history = tmp_path / "disclosure_transient" / "history.json"
+        if history.exists():
+            assert "SENTINEL_SAMPLE_001" not in history.read_text(encoding="utf-8")
+
+    def test_disclosure_transport_started_is_terminal_ambiguous_without_fallback(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "disclosure_ambiguous")
+        _seed_project(tmp_path, monkeypatch, "disclosure_ambiguous")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {"tool_calls": [_tool_call("disclose_a", "request_data_disclosure", {"fields": ["sample_ids"], "purpose": "解释样本"})]},
+                {"content": "披露请求未能完成。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        def ambiguous_dispatch(self, request):
+            raise ProviderRequestError(
+                "transport interrupted",
+                code="MODEL_PROVIDER_REQUEST_FAILED",
+                transmission_started=True,
+            )
+
+        monkeypatch.setattr(
+            "rnaseq_agent.model_provider.ModelProviderGateway.dispatch_exact",
+            ambiguous_dispatch,
+        )
+        events = _stream(client, token, "请申请查看样本名", project="disclosure_ambiguous")
+        card = _confirm_event(events)
+        assert card and card["type"] == "model_data_disclosure_confirmation"
+        events2 = _resume(
+            client,
+            token,
+            project="disclosure_ambiguous",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+        assert not [event for event in events2 if event["event"] == "disclosure_result"]
+        assert "SENTINEL_SAMPLE_001" not in json.dumps(events2, ensure_ascii=False)
+        assert "SENTINEL_SAMPLE_001" not in json.dumps(fake.seen_messages, ensure_ascii=False)
+        grant_files = list((tmp_path / "disclosure_ambiguous" / ".model_data_grants").glob("*.json"))
+        assert len(grant_files) == 1
+        from rnaseq_agent.model_data_grants import load_grant
+
+        grant = load_grant(tmp_path / "disclosure_ambiguous", json.loads(grant_files[0].read_text(encoding="utf-8"))["grant_id"])
+        assert grant.status == "consumed_ambiguous"
 
     def test_rejected_tool_never_writes(self, client, tmp_path, monkeypatch) -> None:
         token = _token(client)

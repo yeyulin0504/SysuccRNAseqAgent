@@ -98,6 +98,7 @@ from .agent_tools import (
 )
 from .model_disclosure import PreparedModelRequest, ProviderCredentials, ProviderRequestError
 from .model_provider import ModelProviderGateway, normalize_provider_config, provider_identity
+from .model_provider import MAX_RESPONSE_BYTES
 from .model_context import (
     EphemeralToolCallStore,
     ModelContextBuilder,
@@ -144,6 +145,7 @@ ToolExecutor = Callable[[str, dict[str, Any], Path, bool, ToolExecutionContext],
 ToolResultFinalizer = Callable[[ToolExecutionResult, Path | None], ToolExecutionResult]
 DisclosureRequester = Callable[[Path, str, str, dict[str, Any]], dict[str, Any]]
 DisclosureDecider = Callable[[Path, str, bool], dict[str, Any]]
+DisclosureSender = Callable[[Path, str, str, str, str], dict[str, Any]]
 
 _LEGACY_MODEL_KEYS = frozenset({
     "ok", "blocked", "error", "error_code", "message", "reply", "state",
@@ -762,6 +764,7 @@ def build_chat_graph(
     result_finalizer: ToolResultFinalizer | None = None,
     disclosure_requester: DisclosureRequester | None = None,
     disclosure_decider: DisclosureDecider | None = None,
+    disclosure_sender: DisclosureSender | None = None,
 ):
     """Compile the conversation graph.
 
@@ -1521,6 +1524,47 @@ def build_chat_graph(
                     "grant_id_hash": hashlib.sha256(str(context.get("grant_id") or "").encode("utf-8")).hexdigest(),
                     "next_step": "send_exact_disclosure",
                 }
+                if disclosure_sender is not None:
+                    try:
+                        sent = disclosure_sender(
+                            Path(state.get("project_dir") or ""),
+                            str(state.get("project_id") or ""),
+                            str(state.get("thread_id") or ""),
+                            str(context.get("grant_id") or ""),
+                            "请仅根据本次已批准的 local sample_ids 披露授权返回精确样本 ID。",
+                        )
+                        if not isinstance(sent, dict) or sent.get("ok") is not True:
+                            payload = {
+                                "ok": False,
+                                "error_code": str((sent or {}).get("error_code") or "MODEL_PROVIDER_REQUEST_FAILED") if isinstance(sent, dict) else "MODEL_PROVIDER_REQUEST_FAILED",
+                                "transmission_started": bool(sent.get("transmission_started")) if isinstance(sent, dict) else False,
+                            }
+                        else:
+                            exact_text = sent.get("text")
+                            if not isinstance(exact_text, str) or len(exact_text.encode("utf-8")) > MAX_RESPONSE_BYTES:
+                                payload = {"ok": False, "error_code": "MODEL_PROVIDER_REQUEST_FAILED", "transmission_started": True}
+                            else:
+                                result_hash = "sha256:" + hashlib.sha256(exact_text.encode("utf-8")).hexdigest()
+                                payload.update(
+                                    {
+                                        "response_hash": result_hash,
+                                        "response_bytes": len(exact_text.encode("utf-8")),
+                                    }
+                                )
+                                get_stream_writer()(
+                                    {
+                                        "type": "disclosure_result",
+                                        "text": exact_text,
+                                        "response_hash": result_hash,
+                                        "fields": ["sample_ids"],
+                                    }
+                                )
+                    except Exception:
+                        payload = {
+                            "ok": False,
+                            "error_code": "MODEL_PROVIDER_REQUEST_FAILED",
+                            "transmission_started": True,
+                        }
             except Exception as exc:  # noqa: BLE001 - grant decision fails closed
                 payload = {"ok": False, "error_code": str(getattr(exc, "code", None) or "MODEL_DATA_GRANT_INVALID")}
         messages = list(state.get("messages") or [])

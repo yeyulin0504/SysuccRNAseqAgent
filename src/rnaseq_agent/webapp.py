@@ -2206,6 +2206,22 @@ def create_app(
             grant = decide_grant(disclosure_project_dir, grant_id, approved=approved)
             return {"status": grant.status, "error_code": grant.error_code}
 
+        def _send_disclosure(
+            disclosure_project_dir: Path,
+            disclosure_project_id: str,
+            disclosure_thread_id: str,
+            grant_id: str,
+            prompt: str,
+        ) -> dict[str, Any]:
+            return send_exact_disclosure(
+                disclosure_project_dir,
+                project_id=disclosure_project_id,
+                thread_id=disclosure_thread_id,
+                grant_id=grant_id,
+                prompt=prompt,
+                connection_store_dir=connection_file_path().parent,
+            )
+
         config = chat_thread_config(project_id, thread_id)
         with sqlite_checkpointer_for(project_dir) as checkpointer:
             graph = build_chat_graph(
@@ -2225,6 +2241,7 @@ def create_app(
                 tool_mode_reader=_live_llm_tool_mode,
                 disclosure_requester=_request_disclosure,
                 disclosure_decider=_decide_disclosure,
+                disclosure_sender=_send_disclosure,
             )
             if resume is not None:
                 from langgraph.types import Command
@@ -2300,6 +2317,14 @@ def create_app(
                     if isinstance(chunk, dict) and chunk.get("type") == "delta":
                         reply_parts.append(str(chunk.get("text") or ""))
                         yield "delta", {"text": chunk.get("text")}
+                    elif isinstance(chunk, dict) and chunk.get("type") == "disclosure_result":
+                        # Exact text is request-local: forward the transient UI
+                        # event without copying it into graph state or history.
+                        yield "disclosure_result", {
+                            "text": str(chunk.get("text") or ""),
+                            "response_hash": str(chunk.get("response_hash") or ""),
+                            "fields": ["sample_ids"],
+                        }
                     continue
 
                 if "__interrupt__" in chunk:
