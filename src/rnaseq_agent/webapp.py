@@ -3623,7 +3623,20 @@ def create_app(
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
-        thread_id = str(payload.get("thread_id") or "main").strip() or "main"
+        thread_id = payload.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            return JSONResponse(
+                {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
+                status_code=400,
+            )
+        thread_id = thread_id.strip()
+        try:
+            get_thread(project_dir, thread_id)
+        except ThreadError:
+            return JSONResponse(
+                {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
+                status_code=400,
+            )
         fields = payload.get("fields")
         purpose = payload.get("purpose")
         if not isinstance(fields, list) or fields != ["sample_ids"]:

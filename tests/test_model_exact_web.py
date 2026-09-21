@@ -71,6 +71,29 @@ def test_data_disclosure_request_returns_metadata_card_only(tmp_path: Path, monk
     assert "SENTINEL_R1.fastq.gz" not in encoded
 
 
+def test_data_disclosure_request_requires_existing_explicit_thread(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
+    app = create_app(workspace_dir=tmp_path / "workspace")
+    client = TestClient(app)
+    token = _token(client)
+    client.post("/api/projects", json={"project_id": "p1"}, headers=_headers(token))
+    _seed_project(tmp_path, "p1")
+    project_dir = tmp_path / "workspace" / "p1"
+
+    base = {"fields": ["sample_ids"], "purpose": "核对样本命名"}
+    for body in (base, {**base, "thread_id": "unknown"}, {**base, "thread_id": "   "}):
+        response = client.post(
+            "/api/projects/p1/data-disclosures",
+            json=body,
+            headers=_headers(token),
+        )
+        assert response.status_code == 400
+        assert response.json() == {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"}
+
+    grant_dir = project_dir / ".model_data_grants"
+    assert not grant_dir.exists() or not list(grant_dir.glob("*.json"))
+
+
 def test_data_disclosure_requires_boolean_decision_and_exact_send_is_transient(
     tmp_path: Path, monkeypatch
 ) -> None:
