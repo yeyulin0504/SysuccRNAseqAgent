@@ -214,6 +214,52 @@ def _provider_snapshot(store_dir: Path | None) -> ModelDisclosureConnectionSnaps
     return ModelDisclosureConnectionSnapshot(config, identity, provider_config_revision(config), mode)
 
 
+def _connection_revision_payload(payload: Mapping[str, Any], *, browse_policy: Any = None) -> dict[str, Any]:
+    """Return the non-secret connection state used for snapshot revisioning.
+
+    The on-disk connection document contains protected credential ciphertext
+    (and may contain other private extension fields).  Hashing the raw
+    document would make a harmless credential rotation look like a provider
+    configuration change, while also making the revision depend on secret
+    material.  Keep the revision deliberately allowlisted: provider settings,
+    tool mode, server connection metadata, and the browse-policy revision are
+    all authorization-relevant; credential values and unknown extensions are
+    not.
+    """
+    from . import connection_store
+
+    llm = payload.get(connection_store.LLM_BLOCK_KEY)
+    if not isinstance(llm, Mapping):
+        llm = {}
+    server = payload.get("server")
+    if not isinstance(server, Mapping):
+        server = {}
+    api_key_token = llm.get(connection_store._LLM_API_KEY_KEY)
+    password_token = payload.get(connection_store._PASSWORD_KEY)
+    if not password_token:
+        password_token = server.get("password_protected")
+    return {
+        "llm": {
+            key: llm[key]
+            for key in connection_store.LLM_FIELDS
+            if key in llm and llm[key] is not None
+        },
+        "server": {
+            key: server[key]
+            for key in connection_store.SHARED_FIELDS
+            if key in server and server[key] is not None
+        },
+        # Record only credential presence, never protected ciphertext or a
+        # decrypted value.  Rotation keeps the revision stable; adding or
+        # removing a usable credential invalidates a bound snapshot.
+        "credentials": {
+            "api_key_present": isinstance(api_key_token, str) and bool(api_key_token),
+            "password_present": isinstance(password_token, str) and bool(password_token),
+        },
+        "browse_policy_revision": getattr(browse_policy, "revision", None),
+    }
+
+
 @contextmanager
 def locked_model_disclosure_connection(
     *, store_dir: Path | None = None, runtime_secrets: Sequence[str] = ()
@@ -276,10 +322,7 @@ def locked_model_disclosure_connection(
             decrypted_llm, payload, runtime_secrets=runtime_secrets
         )
         browse_policy = connection_store._policy_from_payload(payload) if valid else None
-        revision = canonical_json_sha256({
-            "llm": raw_llm,
-            "server": payload.get("server") if isinstance(payload.get("server"), dict) else {},
-        })
+        revision = canonical_json_sha256(_connection_revision_payload(payload, browse_policy=browse_policy))
         yield ModelDisclosureConnectionSnapshot(
             config,
             identity,

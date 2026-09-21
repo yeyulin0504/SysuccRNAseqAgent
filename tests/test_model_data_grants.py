@@ -298,6 +298,37 @@ def test_locked_connection_snapshot_reads_one_locked_store_and_exposes_revision(
         assert "runtime-secret" in snapshot.credentials.known_secrets
 
 
+def test_connection_revision_is_secret_independent_but_tracks_authorization_settings(tmp_path):
+    connection = _connection(tmp_path)
+
+    def revision():
+        with locked_model_disclosure_connection(store_dir=connection) as snapshot:
+            return snapshot.connection_revision
+
+    initial = revision()
+    payload_path = connection / "connection.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload.setdefault("llm", {})["api_key_protected"] = "dpapi:QUJD"
+    payload["password_protected"] = "dpapi:U1NI"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    credential_added = revision()
+    assert credential_added != initial
+
+    payload["llm"]["api_key_protected"] = "dpapi:ROTATED_CIPHERTEXT"
+    payload["password_protected"] = "dpapi:ROTATED_SSH_CIPHERTEXT"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert revision() == credential_added
+
+    payload["llm"]["tool_mode"] = "disabled"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert revision() != credential_added
+    mode_changed = revision()
+
+    payload["llm"]["model"] = "changed-model"
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert revision() != mode_changed
+
+
 def test_claim_holds_connection_snapshot_through_prepare_and_stream_start(tmp_path, monkeypatch):
     project = _project(tmp_path)
     connection = _connection(tmp_path)

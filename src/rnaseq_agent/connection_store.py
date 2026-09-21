@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -512,7 +513,13 @@ def _unprotect(token: str) -> str:
         buffer = ctypes.create_string_buffer(data, len(data))
         return DATA_BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
 
-    raw = base64.b64decode(token[len("dpapi:"):])
+    try:
+        raw = base64.b64decode(token[len("dpapi:"):], validate=True)
+    except (ValueError, binascii.Error):
+        # A malformed protected value is untrusted persisted input.  Treat it
+        # as unavailable credentials instead of letting a settings read crash
+        # the connection snapshot boundary.
+        return ""
     crypt32 = ctypes.windll.crypt32
     kernel32 = ctypes.windll.kernel32
     input_blob = _blob(raw)
