@@ -57,6 +57,10 @@ def test_paired_design_is_canonical_and_renders_fixed_formula():
     assert deg_gate(config).verdict == PASS
     script = render_diffexp_counts_script(config)
     assert "design = ~ pair_id + condition" in script
+    assert "pair_count = 3" in script
+    assert "model_matrix_rank = 4" in script
+    assert "model_matrix_columns" in script
+    assert "pair_mapping" in script
     assert "design = ~ pair_id + condition" in script
     assert "pair_id" in render_colData(config).splitlines()[0]
 
@@ -106,3 +110,19 @@ def test_paired_design_rejects_unsupported_policy(change, marker):
     config = _paired_config()
     change(config)
     assert any(marker in reason for reason in paired_design_checks(config))
+
+
+def test_paired_design_missing_contrast_is_structured_refusal_not_keyerror():
+    config = _paired_config()
+    config["diffexp"].pop("contrast_condition")
+
+    with pytest.raises(ValueError, match="contrast_condition"):
+        diffexp_design_of(config)
+
+
+def test_paired_design_invalid_reference_is_structured_refusal_not_keyerror():
+    config = _paired_config()
+    config["diffexp"]["reference_condition"] = "missing"
+
+    with pytest.raises(ValueError, match="reference_condition"):
+        diffexp_design_of(config)

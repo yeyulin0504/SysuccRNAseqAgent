@@ -26,6 +26,7 @@ anything itself.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -289,10 +290,16 @@ write.table(res_df, file = paste0(out_prefix, "_results.tsv"),
 n_sig <- sum(res_df$padj < padj_cutoff & abs(res_df$log2FoldChange) >= lfc_cutoff, na.rm = TRUE)
 n_sig_default <- sum(res_df$padj < 0.05 & abs(res_df$log2FoldChange) >= 1, na.rm = TRUE)
 summary_json <- list(
+  template = {_r_quote(template)},
   contrast = {contrast_r},
   formula = {_r_quote(formula)},
   reference_condition = {ref_r},
   treatment_condition = {trt_r},
+  pair_count = {int(design.get("pair_count", 0))},
+  min_count_prefilter = {float(design.get("min_count_prefilter", diffexp.get("min_count_prefilter", 0)))},
+  model_matrix_rank = {int(design.get("model_matrix_rank", 0))},
+  model_matrix_columns = fromJSON({_r_quote(json.dumps(design.get("model_matrix_columns", []))) }),
+  pair_mapping = fromJSON({_r_quote(json.dumps(design.get("pair_mapping", []))) }),
   tested_genes = nrow(res_df),
   padj_cutoff = padj_cutoff,
   log2fc_cutoff = lfc_cutoff,
@@ -356,7 +363,7 @@ def paired_design_checks(config: dict[str, Any]) -> list[str]:
     elif reference not in conditions:
         reasons.append(f"reference_condition={reference!r} is not one of {conditions}.")
     if not contrast:
-        contrast = next((condition for condition in conditions if condition != reference), "")
+        reasons.append("paired_two_group requires an explicit contrast_condition.")
     if contrast not in conditions or contrast == reference:
         reasons.append("contrast_condition must be the condition level distinct from reference_condition.")
 
@@ -395,11 +402,18 @@ def paired_design_checks(config: dict[str, Any]) -> list[str]:
                 f"pair_id={pair_id!r} must contain exactly one reference and one contrast sample (missing mate, duplicate, or extra row)."
             )
             continue
+        reference_rows = by_condition.get(reference, [])
+        contrast_rows = by_condition.get(contrast, [])
+        if len(reference_rows) != 1 or len(contrast_rows) != 1:
+            reasons.append(
+                f"pair_id={pair_id!r} cannot resolve the declared reference/contrast conditions."
+            )
+            continue
         mapping.append(
             {
                 "pair_id": pair_id,
-                "reference_sample_id": str(by_condition[reference][0].get("sample_id", "")).strip(),
-                "contrast_sample_id": str(by_condition[contrast][0].get("sample_id", "")).strip(),
+                "reference_sample_id": str(reference_rows[0].get("sample_id", "")).strip(),
+                "contrast_sample_id": str(contrast_rows[0].get("sample_id", "")).strip(),
             }
         )
     if len(mapping) < PAIRED_MIN_COMPLETE_PAIRS:
@@ -450,6 +464,12 @@ def paired_design_of(config: dict[str, Any]) -> dict[str, Any]:
         "conditions": conditions,
         "pair_count": len(mapping),
         "pair_mapping": mapping,
+        "model_matrix_columns": [
+            "(Intercept)",
+            *[f"pair_id{pair_id}" for pair_id in sorted(by_pair)[1:]],
+            f"condition{contrast}",
+        ],
+        "model_matrix_rank": len(sorted(by_pair)) + 1,
         "min_complete_pairs": PAIRED_MIN_COMPLETE_PAIRS,
         "min_count_prefilter": 0,
         "batches_declared": False,

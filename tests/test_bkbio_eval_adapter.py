@@ -643,6 +643,37 @@ def test_summary_rejects_non_condition_formula_even_if_config_matches() -> None:
         )
 
 
+def test_paired_summary_requires_all_frozen_contract_fields() -> None:
+    config = {
+        "study": {"design": "paired_two_group"},
+        "samples": {
+            "items": [
+                {"sample_id": f"p{i}_{condition}", "condition": condition, "pair_id": f"p{i}"}
+                for i in (1, 2, 3)
+                for condition in ("untrt", "trt")
+            ]
+        },
+        "diffexp": {
+            "formula": "~ pair_id + condition",
+            "reference_condition": "untrt",
+            "contrast_condition": "trt",
+            "padj_cutoff": 0.05,
+            "lfc_cutoff": 1.0,
+            "min_count_prefilter": 0,
+        },
+    }
+    summary = {
+        "formula": "~ pair_id + condition",
+        "reference_condition": "untrt",
+        "treatment_condition": "trt",
+        "contrast": "trt_vs_untrt",
+        "padj_cutoff": 0.05,
+        "log2fc_cutoff": 1.0,
+    }
+    with pytest.raises(AdapterExecutionError, match="template"):
+        _verify_summary(summary, config, reference="untrt", contrast="trt")
+
+
 def _valid_manifest_fixture(
     root: Path,
     *,

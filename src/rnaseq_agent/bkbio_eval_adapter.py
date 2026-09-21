@@ -33,7 +33,7 @@ from .capability import PASS
 from .connection_store import SHARED_FIELDS, load_connection
 from .container import container_config, wrap_command
 from .defaults import DEFAULT_CMS, DEFAULT_CONTAINER, DEFAULT_DIFFEXP, DEFAULT_PIPELINE, DEFAULT_REFERENCE
-from .differential import DEG_MIN_REPLICATES_PER_GROUP, PAIRED_DESIGN_FORMULA
+from .differential import DEG_MIN_REPLICATES_PER_GROUP, PAIRED_DESIGN_FORMULA, diffexp_design_of
 from .remote_transport import create_remote_transport
 from .session import ProjectSession
 from .shell import shell_quote
@@ -1066,8 +1066,24 @@ def _verify_summary(
                 f"expected {expected_value!r}, found {summary.get(field)!r}"
             )
     if paired:
-        if summary.get("template") not in (None, "deseq2_paired_two_group"):
-            raise AdapterExecutionError("DESeq2 summary template does not match paired_two_group")
+        try:
+            design = diffexp_design_of(config)
+        except ValueError as exc:
+            raise AdapterExecutionError(f"paired frozen design is invalid: {exc}") from exc
+        required = {
+            "template": design["template"],
+            "pair_count": design["pair_count"],
+            "min_count_prefilter": design["min_count_prefilter"],
+            "model_matrix_rank": design["model_matrix_rank"],
+            "model_matrix_columns": design["model_matrix_columns"],
+            "pair_mapping": design["pair_mapping"],
+        }
+        for field, expected_value in required.items():
+            if field not in summary or summary[field] != expected_value:
+                raise AdapterExecutionError(
+                    f"DESeq2 paired summary {field} is missing or does not match the frozen analysis contract: "
+                    f"expected {expected_value!r}, found {summary.get(field)!r}"
+                )
 
 
 def _verify_manifests(
