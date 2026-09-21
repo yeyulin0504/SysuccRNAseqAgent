@@ -666,6 +666,17 @@ class TestDisclosureCardInChatPage:
         assert "loadMessages" not in result
         assert "history" not in result.lower()
 
+    def test_disclosure_terminal_outcome_is_metadata_only(self, client) -> None:
+        page = client.get("/chat").text
+        assert "function renderDisclosureOutcome" in page
+        finish = page.split("function finishLiveTurn")[1].split("function sendMessage")[0]
+        assert "renderDisclosureOutcome(settled.disclosure_result)" in finish
+        outcome = page.split("function renderDisclosureOutcome")[1].split("function sendMessage")[0]
+        for marker in ("outcome", "error_code", "response_hash", "byte_length"):
+            assert marker in outcome, marker
+        assert "disclosure.text" not in outcome
+        assert "grant_id" not in outcome
+
 
 class TestResumeEndpointValidation:
     def test_resume_requires_boolean_approved(self, client, token_factory=None) -> None:

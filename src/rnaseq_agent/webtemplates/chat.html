@@ -529,6 +529,7 @@ function finishLiveTurn(settled) {
     stamp.textContent = humanTime(new Date().toISOString());
     body.appendChild(stamp);
   }
+  if (settled && settled.disclosure_result) renderDisclosureOutcome(settled.disclosure_result);
   const details = document.querySelector("details.think[open] #liveSteps");
   if (details) {
     const wrap = details.parentElement;
@@ -765,6 +766,24 @@ function renderDisclosureResult(payload) {
   const panel = document.createElement("div");
   panel.className = "disclosure-result";
   panel.textContent = String(payload && payload.text || "");
+  bubble.appendChild(panel);
+  scrollToBottom();
+}
+
+/* 披露终态只显示可审计元数据，不显示响应正文或 grant 标识。 */
+function renderDisclosureOutcome(payload) {
+  const bubble = document.getElementById("liveReply");
+  if (!bubble || !payload || typeof payload !== "object") return;
+  const panel = document.createElement("div");
+  panel.className = "disclosure-result";
+  const outcome = payload.outcome || payload.status || (payload.ok === true ? "success" : "failed");
+  const bytes = payload.byte_length ?? payload.response_bytes;
+  panel.textContent = [
+    `披露结果：${String(outcome || "")}`,
+    payload.error_code ? `错误：${String(payload.error_code)}` : "",
+    payload.response_hash ? `响应摘要：${String(payload.response_hash)}` : "",
+    bytes !== undefined && bytes !== null ? `字节数：${String(bytes)}` : "",
+  ].filter(Boolean).join("\n");
   bubble.appendChild(panel);
   scrollToBottom();
 }
