@@ -43,6 +43,22 @@ def test_paired_contract_changes_when_canonical_pair_mapping_changes(tmp_path):
     changed["samples"]["items"][1]["pair_id"] = "p9"
     second = build_analysis_contract(changed)
     assert first["contract_id"] != second["contract_id"]
+
+
+def test_counts_contract_freezes_stage_script_inventory(tmp_path):
+    counts_path = tmp_path / "counts.tsv"
+    counts_path.write_text("gene\tc1\tc2\nG1\t1\t2\n", encoding="utf-8")
+    config = {
+        "project": {"id": "counts-inventory", "title": "counts"},
+        "server": {"scheduler": "local", "threads": 1, "memory_gb": 1, "shell": "bash"},
+        "samples": {"source": "counts_upload", "counts_path": str(counts_path), "items": []},
+        "pipeline": {"diffexp": {"enabled": True}, "cms": {"enabled": True}},
+        "diffexp": {"reference_condition": "control", "contrast_condition": "treated", "min_count_prefilter": 0},
+        "cms": {},
+        "execution": {"mode": "free"},
+    }
+    names = {item["name"] for item in build_analysis_contract(config)["body"]["scripts"]}
+    assert {"env_setup.sh", "run_stage_counts.sh", "submit_stage_counts.sh", "diffexp_counts_deseq2.R", "cms_counts_cmscaller.R", "colData.tsv"} <= names
 from rnaseq_agent.run_agent import run_project
 from rnaseq_agent.storage import load_json, save_json
 from rnaseq_agent.validation import validate_local_fastqs

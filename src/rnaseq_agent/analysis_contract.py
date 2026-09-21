@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from .configuration import is_counts_entry_config, normalize_config
-from .pipeline import render_env_setup_script, render_remote_pipeline_script, render_submit_script
+from .pipeline import (
+    render_env_setup_script,
+    render_remote_pipeline_script,
+    render_stage_script,
+    render_submit_script,
+)
 from .storage import load_json, save_json
 from .validation import validate_local_fastqs
 from .workflow_profiles import workflow_profile_errors
@@ -372,11 +377,23 @@ def _script_artifacts(config: dict[str, Any]) -> list[dict[str, Any]]:
     scheduler = config.get("server", {}).get("scheduler", "local")
     submit_name = "submit.sbatch" if scheduler == "slurm" else "submit.pbs" if scheduler == "pbs" else "submit.sh"
     if is_counts_entry_config(config):
-        # counts 直入无 FASTQ 主流程：只冻结环境准备脚本，阶段脚本由
-        # 执行层按 counts 阶段渲染（与契约的 workflow/cms/diffexp 快照一致）。
+        # counts 直入的执行层会在确认后的 counts stage 生成同一组脚本；
+        # 必须在 contract 阶段渲染并冻结它们，避免确认后脚本内容漂移。
+        from .cms import render_cms_counts_script
+        from .differential import render_colData, render_diffexp_counts_script
+
         rendered = {
             "env_setup.sh": render_env_setup_script(config),
+            "run_stage_counts.sh": render_stage_script(config, "counts"),
+            submit_name.replace("submit", "submit_stage_counts", 1): render_submit_script(
+                config, stage="counts"
+            ),
+            "colData.tsv": render_colData(config),
         }
+        if config.get("pipeline", {}).get("diffexp", {}).get("enabled"):
+            rendered["diffexp_counts_deseq2.R"] = render_diffexp_counts_script(config)
+        if config.get("pipeline", {}).get("cms", {}).get("enabled"):
+            rendered["cms_counts_cmscaller.R"] = render_cms_counts_script(config)
     else:
         rendered = {
             "env_setup.sh": render_env_setup_script(config),
