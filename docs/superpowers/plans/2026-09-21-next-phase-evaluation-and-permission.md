@@ -24,13 +24,13 @@
 
 The current release is stable enough to stop expanding scope:
 
-- Main project: `1117 passed, 8 skipped, 1 warning, 6 subtests passed`.
-- External `bkbio-eval`: `152 passed, 1 skipped`.
+- Main project: `1122 passed, 8 skipped, 1 warning, 6 subtests passed` after disclosure hardening commit `7dab67e`.
+- External `bkbio-eval`: `154 passed, 1 skipped` after metadata-audit contract commit `1daf024`.
 - L1 real adapter run: `0 numerical passed / 2 expected_refusal_passed / 0 failed / 0 skipped`.
 - Unit/L0 mutation command exits `0`; its caught mutants demonstrate test sensitivity and do not constitute numerical L1 completion.
 - Remote audit/replay review: `217 passed, 5 skipped, 1 warning`; no new bypass found.
 
-The existing TCGA and airway cases remain expected refusals. Their current metadata does not yet prove a redistributable, fully audited positive L1: license/redistribution terms, retrieval metadata, source hashes, and explicit batch conclusions are incomplete. Their derived inputs must not be described as untouched raw source matrices.
+The existing TCGA and airway cases remain expected refusals. The new metadata-audit contract records their input hashes, unit structure, export scripts, and inclusion rules, while license/redistribution terms, retrieval metadata, source archive hashes, script commits, and explicit batch conclusions remain blocked/null. Their derived inputs must not be described as untouched raw source matrices.
 
 ## Task 1: Freeze the L1 metadata-audit contract
 
@@ -129,4 +129,3 @@ Set-Location C:\Users\Administrator\WorkBuddy\2026-09-15-15-27-02\bkbio-eval
 ```
 
 The L1 release command must use the real adapter and report expected refusals separately from numerical passes. A skipped expected-refusal case is a failed suite gate. No task may claim a positive L1, a new exact scope, or remote exact readiness without fresh evidence for its own acceptance matrix.
-
