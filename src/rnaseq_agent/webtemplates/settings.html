@@ -154,13 +154,13 @@
 
   <h2>下游分析容器</h2>
   <div class="card">
-    <p class="muted" style="margin:0">用于 DESeq2 与 CMScaller。服务器会把 Docker/OCI 镜像转换为 Apptainer SIF。</p>
+    <p class="muted" style="margin:0">用于 DESeq2 与 CMScaller。可选择直接使用 Docker，或使用服务器上的 Apptainer/Singularity。</p>
     <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input id="ctrEnabled" type="checkbox" style="width:auto"> 启用下游容器</label>
     <div class="row">
-      <div><label>服务器容器引擎</label><select id="ctrEngine"><option value="apptainer">Apptainer</option><option value="singularity">Singularity</option></select></div>
+      <div><label>服务器容器引擎</label><select id="ctrEngine"><option value="docker">Docker</option><option value="apptainer">Apptainer</option><option value="singularity">Singularity</option></select></div>
       <div><label>Docker / OCI 镜像</label><input id="ctrUri" placeholder="docker://ghcr.io/...:tag"></div>
     </div>
-    <label>服务器 SIF 路径</label><input id="ctrPath" placeholder="/hwdata/home/user/containers/downstream.sif">
+    <label id="ctrPathLabel">服务器 SIF 路径（Docker 不需要）</label><input id="ctrPath" placeholder="/hwdata/home/user/containers/downstream.sif">
     <label>额外挂载目录 <span class="hint">每行一个绝对路径</span></label><textarea id="ctrBinds" rows="3" placeholder="/hwdata/home/user/projects"></textarea>
     <button onclick="saveContainer()">保存容器配置</button>
     <button id="pullContainer" class="secondary" onclick="pullContainer()">在服务器拉取/构建 SIF</button>
@@ -218,7 +218,13 @@ function load() {
       document.getElementById("ctrPath").value = c.container.image_path || "";
       document.getElementById("ctrBinds").value = (c.container.bind_paths || []).join("\n");
     }
+    updateContainerFields();
   }).finally(loadRemoteRoots);
+}
+function updateContainerFields() {
+  const docker = document.getElementById("ctrEngine").value === "docker";
+  document.getElementById("ctrPath").disabled = docker;
+  document.getElementById("ctrPathLabel").textContent = docker ? "服务器 SIF 路径（Docker 不需要）" : "服务器 SIF 路径";
 }
 async function saveServer() {
   const server = {
@@ -414,3 +420,4 @@ function clearKey() {
 </script>
 </body>
 </html>
+

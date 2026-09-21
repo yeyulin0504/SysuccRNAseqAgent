@@ -30,7 +30,7 @@ def test_validates_downstream_image_settings() -> None:
         {"image_uri": "https://example.invalid/image"},
         {"image_path": "relative/image.sif"},
         {"image_path": "/tmp/image.img"},
-        {"engine": "docker"},
+        {"engine": "docker", "image_uri": ""},
     ],
 )
 def test_rejects_unsafe_image_settings(patch: dict) -> None:
@@ -53,3 +53,18 @@ def test_test_command_uses_cleanenv_binds_and_r_package_probe() -> None:
     assert "--bind /hwdata/home/yeyulin/projects" in command
     assert "loadNamespace" in command and "DESeq2" in command
     assert "CMScaller" in command
+
+
+def test_docker_engine_uses_image_uri_without_sif_path() -> None:
+    settings = {
+        "enabled": True,
+        "engine": "docker",
+        "image_uri": "ghcr.io/sysucc/rnaseq-downstream:2026.09",
+        "image_path": "",
+        "bind_paths": ["/data/project"],
+    }
+    assert validate_image_settings(settings)["engine"] == "docker"
+    assert build_pull_command(settings) == "docker pull ghcr.io/sysucc/rnaseq-downstream:2026.09"
+    command = build_test_command(settings)
+    assert "docker run --rm" in command
+    assert "-v /data/project:/data/project" in command

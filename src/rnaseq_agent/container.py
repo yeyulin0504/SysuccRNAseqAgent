@@ -5,7 +5,7 @@ from typing import Any
 from .shell import shell_quote
 
 
-SUPPORTED_CONTAINER_ENGINES = {"apptainer", "singularity"}
+SUPPORTED_CONTAINER_ENGINES = {"apptainer", "singularity", "docker"}
 
 
 def container_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -34,7 +34,10 @@ def container_errors(config: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if container["engine"] not in SUPPORTED_CONTAINER_ENGINES:
         errors.append(f"Unsupported container engine: {container['engine']}")
-    if not container["image_path"]:
+    if container["engine"] == "docker":
+        if not container["image_uri"]:
+            errors.append("Missing container.image_uri for Docker execution.")
+    elif not container["image_path"]:
         errors.append("Missing container.image_path for Apptainer execution.")
     return errors
 
@@ -43,6 +46,12 @@ def wrap_command(config: dict[str, Any], command: str) -> str:
     container = container_config(config)
     if not container["enabled"]:
         return command
+    if container["engine"] == "docker":
+        bind_args = " ".join(
+            f"-v {shell_quote(path)}:{shell_quote(path)}" for path in container["bind_paths"]
+        )
+        bind_prefix = f"{bind_args} " if bind_args else ""
+        return f"docker run --rm {bind_prefix}{shell_quote(container['image_uri'])} {command}"
     bind_args = " ".join(
         f"--bind {shell_quote(path)}" for path in container["bind_paths"]
     )
