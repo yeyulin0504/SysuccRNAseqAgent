@@ -21,7 +21,7 @@
 
 仍然明确关闭或未接通的部分：
 
-- exact grant 已接入独立的结构化 Web API 和真实 provider 请求；自然语言 ChatGraph 已接入只支持 `sample_ids` 的独立 disclosure intent/card，并在批准后通过 Graph → claim → dispatch 返回一次性 transient exact response。前端独立 disclosure card 仍待实现。
+- exact grant 已接入独立的结构化 Web API 和真实 provider 请求；自然语言 ChatGraph 已接入只支持 `sample_ids` 的独立 disclosure intent/card，并在批准后通过 Graph → claim → dispatch 返回一次性 transient exact response。前端已有独立 disclosure card、transient exact panel 和安全终态元数据投影。
 - 当前只开放 local `sample_ids`；`fastq_filenames`、`report_excerpt`、`remote_paths` 和 remote `source_ref` 仍拒绝。
 - claim、connection snapshot、revision 复核和 exact response collector 已在这条 local API 中形成闭环；approved-root remote exact 仍关闭。
 - 因此当前不能声称“用户确认后模型可以读取远程 FASTQ 精确路径”。
