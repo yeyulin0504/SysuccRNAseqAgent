@@ -720,6 +720,34 @@ def _scan_remote_samples(config: dict[str, Any], remote_dir: str) -> dict[str, A
         _execute_browse_attempt(remote_dir, project_dir, context), project_dir
     )
     return final.local.get("result", final.local)
+
+
+def _safe_disclosure_result(value: Any) -> dict[str, Any] | None:
+    """Project graph disclosure outcome without exact text or grant identity."""
+    if not isinstance(value, dict):
+        return None
+    if value.get("ok") is True:
+        result: dict[str, Any] = {
+            "ok": True,
+            "fields": ["sample_ids"],
+        }
+        status = str(value.get("status") or "")
+        if status:
+            result["status"] = status
+        response_hash = str(value.get("response_hash") or "")
+        if response_hash.startswith("sha256:"):
+            result["response_hash"] = response_hash
+        response_bytes = value.get("response_bytes")
+        if isinstance(response_bytes, int) and not isinstance(response_bytes, bool) and response_bytes >= 0:
+            result["response_bytes"] = min(response_bytes, 1024 * 1024)
+        return result
+    result = {"ok": False}
+    error_code = str(value.get("error_code") or "")
+    if error_code:
+        result["error_code"] = error_code[:128]
+    if isinstance(value.get("transmission_started"), bool):
+        result["transmission_started"] = value["transmission_started"]
+    return result
 def _interrupt_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract the JSON-safe payload(s) of a LangGraph interrupt result.
 
@@ -2377,6 +2405,7 @@ def create_app(
                 return
 
             final_state = graph.get_state(config).values or {}
+            disclosure_result = _safe_disclosure_result(final_state.get("disclosure_result"))
             outcome.update(
                 {
                     "reply": str(final_state.get("reply") or "".join(reply_parts) or ""),
@@ -2388,6 +2417,8 @@ def create_app(
                     "error": str(final_state.get("error") or ""),
                 }
             )
+            if disclosure_result is not None:
+                outcome["disclosure_result"] = disclosure_result
 
     def _drive_chat_graph(
         project_id: str,
@@ -3361,7 +3392,7 @@ def create_app(
                     payload_extra.update(
                         {
                             k: outcome[k]
-                            for k in ("awaiting_confirmation", "confirmation", "tool_log")
+                            for k in ("awaiting_confirmation", "confirmation", "tool_log", "disclosure_result")
                             if k in outcome
                         }
                     )
@@ -3613,7 +3644,7 @@ def create_app(
                 "thread_id": thread_id,
                 **{
                     k: outcome[k]
-                    for k in ("awaiting_confirmation", "confirmation", "tool_log")
+                    for k in ("awaiting_confirmation", "confirmation", "tool_log", "disclosure_result")
                     if k in outcome
                 },
             }

@@ -408,6 +408,13 @@ class TestModelWritesConfigViaTool:
         )
         exact_events = [event for event in events2 if event["event"] == "disclosure_result"]
         assert exact_events and exact_events[0]["data"]["text"] == "SENTINEL_SAMPLE_001 的分组是 control"
+        settled = events2[-1]["data"]
+        assert settled["disclosure_result"]["ok"] is True
+        assert settled["disclosure_result"]["fields"] == ["sample_ids"]
+        assert settled["disclosure_result"]["response_hash"].startswith("sha256:")
+        assert settled["disclosure_result"]["response_bytes"] > 0
+        assert "text" not in settled["disclosure_result"]
+        assert "grant_id" not in settled["disclosure_result"]
         assert "SENTINEL_SAMPLE_001" not in json.dumps(events2[-1], ensure_ascii=False)
         assert "SENTINEL_SAMPLE_001" not in json.dumps(fake.seen_messages, ensure_ascii=False)
         history = tmp_path / "disclosure_transient" / "history.json"
@@ -451,6 +458,12 @@ class TestModelWritesConfigViaTool:
             approved=True,
         )
         assert not [event for event in events2 if event["event"] == "disclosure_result"]
+        settled = events2[-1]["data"]
+        assert settled["disclosure_result"] == {
+            "ok": False,
+            "error_code": "MODEL_PROVIDER_REQUEST_FAILED",
+            "transmission_started": True,
+        }
         assert "SENTINEL_SAMPLE_001" not in json.dumps(events2, ensure_ascii=False)
         assert "SENTINEL_SAMPLE_001" not in json.dumps(fake.seen_messages, ensure_ascii=False)
         grant_files = list((tmp_path / "disclosure_ambiguous" / ".model_data_grants").glob("*.json"))
