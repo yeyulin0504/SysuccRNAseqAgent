@@ -578,24 +578,97 @@ def _approval_description(
     arguments: dict[str, Any],
     current: dict[str, Any],
 ) -> str:
-    """Describe every argument that can change execution semantics."""
-    description = describe_call(name, arguments, current)
-    extra: list[str] = []
-    if name in {"write_project_config", "edit_samples"}:
-        for item in arguments.get("samples") or []:
-            if not isinstance(item, dict):
-                continue
-            sample_id = str(item.get("sample_id") or "（未命名）")
-            if item.get("fastq_1"):
-                extra.append(f"  {sample_id} R1：{item['fastq_1']}")
-            if item.get("fastq_2"):
-                extra.append(f"  {sample_id} R2：{item['fastq_2']}")
-    if name == "set_cms_options" and arguments.get("run_mode"):
-        old = "（默认）"
-        if isinstance(current.get("cms"), dict):
-            old = str(current["cms"].get("run_mode") or old)
-        extra.append(f"  运行模式：{old} → {arguments['run_mode']}")
-    return "\n".join([description, *extra]) if extra else description
+    """Render a durable confirmation summary without exact project data.
+
+    Exact sample IDs, FASTQ names, server paths, and report fragments stay in
+    the request-local argument store.  This text is checkpointed in the
+    interrupt card, so it must describe the change using counts, field names,
+    and bounded enums only.
+    """
+    labels = tool_labels()
+    title = labels.get(name, name)
+
+    if name == "write_project_config":
+        samples = [item for item in arguments.get("samples") or [] if isinstance(item, dict)]
+        configured = sum(
+            1
+            for item in samples
+            if item.get("fastq_1") or item.get("fastq_2")
+        )
+        source = "服务器已有数据" if arguments.get("data_source") == "remote_path" else "本地上传"
+        lines = [
+            f"{title}：",
+            f"  数据来源：{source}",
+            f"  FASTQ 目录：已提供（{configured} 个样本含 FASTQ 信息）" if configured else "  FASTQ 目录：已提供",
+            f"  样本：{len(samples)} 个（仅显示数量，精确样本名按需确认）",
+            f"  链特异性：{arguments.get('strandedness') or 'unknown'}",
+        ]
+        for key, label in (
+            ("gtf", "GTF 注释"),
+            ("genome_fasta", "基因组 FASTA"),
+            ("star_index", "STAR 索引"),
+            ("rsem_prefix", "RSEM 索引前缀"),
+        ):
+            if arguments.get(key):
+                lines.append(f"  {label}：已提供（精确路径按需确认）")
+        return "\n".join(lines)
+
+    if name == "edit_samples":
+        samples = [item for item in arguments.get("samples") or [] if isinstance(item, dict)]
+        removals = [item for item in arguments.get("remove") or [] if item]
+        fields: set[str] = set()
+        for item in samples:
+            fields.update(str(key) for key in item if key != "sample_id")
+        lines = [f"{title}：", f"  修改样本：{len(samples)} 个，删除样本：{len(removals)} 个"]
+        if fields:
+            lines.append("  修改字段：" + "、".join(sorted(fields)))
+        lines.append("  精确样本名与 FASTQ 文件名按需确认。")
+        return "\n".join(lines)
+
+    if name == "edit_connection":
+        changed = [str(key) for key in arguments if key]
+        lines = [f"{title}：", "  修改字段：" + ("、".join(changed) if changed else "（无）")]
+        lines.append("  主机、用户和远端路径的精确值按需确认。")
+        return "\n".join(lines)
+
+    if name == "edit_reference":
+        changed = [str(key) for key in arguments if key]
+        return "\n".join(
+            [f"{title}：", "  修改字段：" + ("、".join(changed) if changed else "（无）"), "  精确参考文件路径按需确认。"]
+        )
+
+    if name == "set_run_resources":
+        changes = [
+            f"{label}：{arguments[key]}"
+            for key, label in (("threads", "线程数"), ("memory_gb", "内存（GB）"))
+            if arguments.get(key) is not None
+        ]
+        return f"{title}：" + ("；".join(changes) if changes else "无实际变化")
+
+    if name == "configure_pipeline":
+        step = str(arguments.get("step") or "未知步骤")
+        return f"{title}：{step} → {'启用' if arguments.get('enabled') else '关闭'}"
+
+    if name == "set_diffexp_reference":
+        return f"{title}：更新对照组（精确分组名按需确认）"
+
+    if name == "set_cms_options":
+        lines = [f"{title}：", f"  CMS 分型：{'启用' if arguments.get('enabled') else '关闭'}"]
+        for key, label in (("n_perm", "置换次数"), ("fdr", "FDR 阈值"), ("run_mode", "运行模式")):
+            if arguments.get(key) is not None:
+                value = arguments[key]
+                if key == "run_mode" and isinstance(current.get("cms"), dict):
+                    old = current["cms"].get("run_mode") or "（默认）"
+                    lines.append(f"  {label}：{old} → {value}")
+                else:
+                    lines.append(f"  {label}：{value}")
+        return "\n".join(lines)
+
+    if name == "run_analysis":
+        stage = arguments.get("stage")
+        return f"{title}：{'只跑 ' + str(stage) + ' 阶段' if stage else '跑完整流水线'}（在服务器上执行）"
+
+    return describe_call(name, {}, {})
 
 
 def _approval_claim_path(project_dir: Path, approval_id: str) -> Path:

@@ -798,7 +798,8 @@ class TestChatGraphConfirmation:
         assert payload["type"] == "tool_confirmation"
         assert payload["calls"][0]["name"] == "write_project_config"
         assert payload["calls"][0]["risk"] == RISK_WRITE
-        assert "S1" in payload["calls"][0]["description"]
+        assert "S1" not in payload["calls"][0]["description"]
+        assert "样本：2 个" in payload["calls"][0]["description"]
 
     def test_switching_to_a_stricter_mode_invalidates_a_waiting_card(
         self, monkeypatch, tmp_path
@@ -932,7 +933,7 @@ class TestChatGraphConfirmation:
         assert recorded == []
         assert result["via"] == "rejected"
 
-    def test_card_hashes_normalized_write_arguments_and_displays_fastq_fields(
+    def test_card_hashes_normalized_write_arguments_without_displaying_fastq_fields(
         self, monkeypatch, tmp_path
     ) -> None:
         from langgraph.types import Command
@@ -962,13 +963,107 @@ class TestChatGraphConfirmation:
         normalized = normalize_write_arguments(args)
 
         assert call["arguments_hash"] == cg._canonical_hash(normalized)
-        assert "S1_1.fastq.gz" in call["description"]
-        assert "S1_2.fastq.gz" in call["description"]
+        assert "S1_1.fastq.gz" not in call["description"]
+        assert "S1_2.fastq.gz" not in call["description"]
+        assert "2 个" in call["description"]
 
         graph.invoke(
             Command(resume=_approval_decision(first, approved=True)), config=config
         )
         assert recorded[0]["arguments"] == normalized
+
+    def test_confirmation_card_does_not_persist_exact_sample_or_path_values(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Durable confirmation cards must carry semantics, never raw data values."""
+        args = {
+            **SAMPLE_WRITE_ARGS,
+            "fastq_dir": "/srv/private/project-42/fastq",
+            "samples": [
+                {
+                    "sample_id": "PATIENT_ABC_001",
+                    "condition": "tumor",
+                    "fastq_1": "patient_abc_001_R1.fastq.gz",
+                    "fastq_2": "patient_abc_001_R2.fastq.gz",
+                }
+            ],
+        }
+        graph, _, _ = _graph(
+            monkeypatch,
+            [{"tool_calls": [_tool_call("private", "write_project_config", args)]}],
+            checkpointer=_memory_checkpointer(),
+            config_reader=lambda _path: {
+                "samples": {
+                    "items": [
+                        {
+                            "sample_id": "PATIENT_OLD_009",
+                            "fastq_1": "old_patient_R1.fastq.gz",
+                        }
+                    ]
+                }
+            },
+        )
+
+        first = graph.invoke(
+            _initial(tmp_path, "写入私有样本配置"),
+            config={"configurable": {"thread_id": "card-no-exact"}},
+        )
+        card = first["__interrupt__"][0].value
+        encoded = json.dumps(card, ensure_ascii=False)
+
+        for exact in (
+            "PATIENT_ABC_001",
+            "PATIENT_OLD_009",
+            "patient_abc_001_R1.fastq.gz",
+            "patient_abc_001_R2.fastq.gz",
+            "old_patient_R1.fastq.gz",
+            "/srv/private/project-42/fastq",
+        ):
+            assert exact not in encoded
+        assert "样本：1 个" in encoded
+        assert "FASTQ 目录" in encoded
+
+    def test_confirmation_card_redacts_connection_and_reference_paths(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        graph, _, _ = _graph(
+            monkeypatch,
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "connection",
+                            "edit_connection",
+                            {
+                                "host": "ssh.private.example",
+                                "remote_workdir": "/srv/private/project-42/work",
+                            },
+                        ),
+                        _tool_call(
+                            "reference",
+                            "edit_reference",
+                            {"star_index": "/srv/private/ref/star/index"},
+                        ),
+                    ]
+                }
+            ],
+            checkpointer=_memory_checkpointer(),
+        )
+
+        first = graph.invoke(
+            _initial(tmp_path, "更新服务器和参考路径"),
+            config={"configurable": {"thread_id": "card-no-path"}},
+        )
+        encoded = json.dumps(first["__interrupt__"][0].value, ensure_ascii=False)
+
+        for exact in (
+            "ssh.private.example",
+            "/srv/private/project-42/work",
+            "/srv/private/ref/star/index",
+        ):
+            assert exact not in encoded
+        assert "修改字段" in encoded
+        assert "精确参考文件路径按需确认" in encoded
 
     def test_card_displays_every_edit_sample_and_cms_execution_field(
         self, monkeypatch, tmp_path
@@ -1017,8 +1112,9 @@ class TestChatGraphConfirmation:
             for item in first["__interrupt__"][0].value["calls"]
         }
 
-        assert "replacement_R1.fastq.gz" in descriptions["edit_samples"]
-        assert "replacement_R2.fastq.gz" in descriptions["edit_samples"]
+        assert "replacement_R1.fastq.gz" not in descriptions["edit_samples"]
+        assert "replacement_R2.fastq.gz" not in descriptions["edit_samples"]
+        assert "修改样本：1 个" in descriptions["edit_samples"]
         assert "counts" in descriptions["set_cms_options"]
         assert "pipeline" in descriptions["set_cms_options"]
 
