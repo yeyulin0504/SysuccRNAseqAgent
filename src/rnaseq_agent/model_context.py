@@ -44,6 +44,7 @@ _SUMMARY_SAFE_ENUMS = {
     "category": {"run_failed", "unknown"},
 }
 _SUMMARY_STAGE_NAMES = {"fastp", "star", "featurecounts", "deseq2", "go", "gsea", "cms", "report", "qc", "align", "quantify"}
+_SOURCE_REF_RE = re.compile(r"^src_[0-9a-f]{32}$")
 
 
 class EphemeralArgumentError(ValueError):
@@ -255,6 +256,15 @@ def _safe_summary_enum(field: str, value: Any) -> str:
     return text if text in _SUMMARY_SAFE_ENUMS.get(field, set()) else "unknown"
 
 
+def _safe_condition_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text.encode("utf-8")) > 128 or any(ch in text for ch in ("/", "\\", "\n", "\r", "\x00")):
+        return "unknown"
+    return text
+
+
 def _sample_rows(project: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     samples = project.get("samples")
     if isinstance(samples, Mapping):
@@ -274,17 +284,20 @@ def build_safe_project_summary(project_dir: Path) -> dict[str, Any]:
     rows = _sample_rows(project)
     conditions: dict[str, int] = {}
     for row in rows:
-        condition = str(row.get("condition") or "").strip()
+        condition = _safe_condition_label(row.get("condition"))
         if condition:
             conditions[condition] = conditions.get(condition, 0) + 1
     status = project.get("status") if isinstance(project.get("status"), Mapping) else {}
     if not status:
         status = session if isinstance(session, Mapping) else {}
     pipeline = project.get("pipeline") if isinstance(project.get("pipeline"), Mapping) else {}
-    stages = [{"name": str(name), "enabled": bool(value.get("enabled"))}
+    stages = [{"name": str(name).strip().lower() if str(name).strip().lower() in _SUMMARY_STAGE_NAMES else "unknown",
+               "enabled": bool(value.get("enabled"))}
               for name, value in pipeline.items() if isinstance(value, Mapping)]
     input_block = intake.get("input") if isinstance(intake.get("input"), Mapping) else {}
-    matrix_class = str(input_block.get("classification") or project.get("matrix_classification") or "unknown")
+    matrix_class = _safe_summary_enum(
+        "classification", input_block.get("classification") or project.get("matrix_classification") or "unknown"
+    )
     raw_counts = matrix_class.lower() in {"raw_counts", "raw integer counts", "counts"}
     reference = project.get("reference") if isinstance(project.get("reference"), Mapping) else {}
     contract_path = _contract_path_inside_project(project_dir, project)
@@ -296,12 +309,12 @@ def build_safe_project_summary(project_dir: Path) -> dict[str, Any]:
     return {
         "policy_version": 1,
         "data_scope": "summary",
-        "project_state": str(session.get("state") or project.get("state") or status.get("state") or "setup"),
-        "route_id": str(route.get("id") or project.get("route_id") or "unknown"),
-        "capability_id": str(route.get("capability_id") or project.get("capability_id") or "bulk_rna"),
-        "input_kind": str(intake.get("input_kind") or input_block.get("kind") or "unknown"),
-        "sequencing": {"layout": str(sequencing.get("layout") or "unknown"),
-                       "strandedness": str(sequencing.get("strandedness") or "unknown")},
+        "project_state": _safe_summary_enum("project_state", session.get("state") or project.get("state") or status.get("state") or "setup"),
+        "route_id": _safe_summary_enum("route_id", route.get("id") or project.get("route_id") or "unknown"),
+        "capability_id": _safe_summary_enum("capability_id", route.get("capability_id") or project.get("capability_id") or "bulk_rna"),
+        "input_kind": _safe_summary_enum("input_kind", intake.get("input_kind") or input_block.get("kind") or "unknown"),
+        "sequencing": {"layout": _safe_summary_enum("layout", sequencing.get("layout") or "unknown"),
+                       "strandedness": _safe_summary_enum("strandedness", sequencing.get("strandedness") or "unknown")},
         "sample_count": len(rows),
         "condition_counts": dict(sorted(conditions.items())),
         "sample_aliases": [f"sample_{index:03d}" for index in range(1, len(rows) + 1)],
@@ -315,7 +328,7 @@ def build_safe_project_summary(project_dir: Path) -> dict[str, Any]:
             "star_index_present": bool(str(reference.get("star_index_dir") or "").strip()),
         },
         "contract": {"present": contract_present, "id_hash": _short_hash(_file_sha256(contract_path) if contract_present else "")},
-        "run": {"present": bool(run_id), "state": str(status.get("state") or "unknown"), "id_hash": _short_hash(run_id) if run_id else ""},
+        "run": {"present": bool(run_id), "state": _safe_summary_enum("state", status.get("state") or "unknown"), "id_hash": _short_hash(run_id) if run_id else ""},
         "errors": errors,
     }
 
@@ -396,11 +409,14 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                 paired += sum(1 for sample in (group.get("samples") or []) if isinstance(sample, Mapping) and sample.get("fastq_2"))
         paired = paired or _safe_int(nested.get("paired_count"))
         directory_count = len(groups) or _safe_int(nested.get("directory_count")) or (1 if full.get("scanned_path") else 0)
+        source_ref = str(full.get("source_ref") or nested.get("source_ref") or "")
+        if not _SOURCE_REF_RE.fullmatch(source_ref):
+            source_ref = ""
         return {"ok": ok, "sample_count": sample_count, "paired_count": paired,
                 "unmatched_count": _safe_int(nested.get("unmatched_count")),
                 "directory_count": directory_count, "truncated": bool(nested.get("truncated")),
                 "authorization": str(nested.get("authorization") or ("inside_approved_root" if full.get("scanned_path") else "")),
-                "source_ref": str(full.get("source_ref") or nested.get("source_ref") or "")}
+                "source_ref": source_ref}
     if name == "refresh_project_status":
         status = full.get("status") if isinstance(full.get("status"), Mapping) else {}
         safe_status = {"state": str(status.get("state") or full.get("run_state") or "unknown")}

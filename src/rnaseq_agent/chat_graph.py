@@ -209,6 +209,28 @@ def _safe_provider_content(value: Any) -> str:
     text = str(value or "")
     if not text:
         return ""
+    # Tool results are already projected through the per-tool allowlist.  When
+    # they are serialized as JSON, inspect only string *values*: scanning the
+    # property names would classify safe keys such as ``sample_count`` and
+    # ``report_hash`` as exact-data leaks and erase the structured result.
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        def _string_values(item: Any) -> Iterator[str]:
+            if isinstance(item, str):
+                yield item
+            elif isinstance(item, dict):
+                for nested in item.values():
+                    yield from _string_values(nested)
+            elif isinstance(item, list):
+                for nested in item:
+                    yield from _string_values(nested)
+
+        if any(_PROVIDER_EXACT_TEXT_RE.search(item) for item in _string_values(parsed)):
+            return "模型回复已生成。"
+        return text[:16_384]
     if _PROVIDER_EXACT_TEXT_RE.search(text):
         return "模型回复已生成。"
     return text[:16_384]
@@ -1418,12 +1440,11 @@ def build_chat_graph(
                     "name": name,
                     "risk": risk_of(name),
                     "arguments_hash": _canonical_hash(arguments),
-                    "argument_projection": (
-                        {"path": "<redacted>"}
-                        if name == "browse_remote_samples"
-                        else {key: value for key, value in arguments.items()
-                              if key not in {"password", "api_key", "secret", "token", "private_key"}}
-                    ),
+                    # Durable logs keep only the versioned safe projection;
+                    # raw arguments may contain sample ids, FASTQ names, or
+                    # remote paths and remain request-local in the ephemeral
+                    # argument store.
+                    "argument_projection": project_tool_arguments_for_model(name, arguments),
                     "ok": ok_value,
                     "projection": log_result,
                 }

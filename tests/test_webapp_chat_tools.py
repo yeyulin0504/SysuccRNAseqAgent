@@ -107,6 +107,15 @@ class FakeLLM:
         yield ("message", {"content": content, "tool_calls": turn.get("tool_calls") or []})
 
 
+def _last_tool_content(fake: FakeLLM) -> str:
+    """Return the latest tool result by protocol role, not list position."""
+    for batch in reversed(fake.seen_messages):
+        for message in reversed(batch):
+            if message.get("role") == "tool":
+                return str(message.get("content") or "")
+    raise AssertionError(fake.seen_messages)
+
+
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
@@ -1413,7 +1422,7 @@ class TestReadAndDerivedArtifactTools:
         assert _confirm_event(events) is None, events
         assert calls["bounded"] >= 1
         assert calls["scanner"] == 1
-        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        tool_result = json.loads(_last_tool_content(fake))
         assert tool_result["ok"] is True
         assert tool_result["directory_count"] == 1
         assert tool_result["sample_count"] == 1
@@ -1596,7 +1605,7 @@ class TestReadAndDerivedArtifactTools:
 
         assert report_path.is_file()
         assert project_id in report_path.read_text(encoding="utf-8")
-        tool_result = json.loads(fake.seen_messages[-1][-1]["content"])
+        tool_result = json.loads(_last_tool_content(fake))
         assert "report_path" not in tool_result
         assert str(report_path) not in json.dumps(tool_result, ensure_ascii=False)
 

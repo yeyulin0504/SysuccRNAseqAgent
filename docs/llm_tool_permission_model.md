@@ -3,6 +3,15 @@
 本文定义工作台对话 Agent 的权限边界。目标是让模型能推进真实分析，同时保证
 模型不能凭一段自然语言直接修改项目、切换服务器或启动计算。
 
+## 当前实现状态（2026-09-21）
+
+summary-only 默认边界、主要 provider gateway、approved-root 扫描和 metadata-only
+grant 基础设施已经落地并有测试。exact grant 还没有接入 ChatGraph/Web 确认卡和真实
+provider 发送路径；`remote_paths` 与 remote `source_ref` 继续 fail closed。当前可以
+把“默认摘要不泄露精确信息”作为已实现契约，不能把“确认后模型读取远程 FASTQ 精确
+路径”当成已上线能力。分阶段验收见
+[LLM 数据披露发布路线图](superpowers/plans/2026-09-21-llm-disclosure-release-roadmap.md)。
+
 ## 核心原则
 
 模型只负责选择已登记的工具并生成结构化参数。代码负责工具白名单、参数校验、

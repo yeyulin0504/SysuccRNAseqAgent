@@ -168,6 +168,11 @@ def test_every_tool_result_uses_explicit_safe_projection() -> None:
                       "truncated": False, "authorization": "inside_approved_root",
                       "source_ref": full["source_ref"]}
 
+    hostile_source = project_tool_result_for_model(
+        "browse_remote_samples", {**full, "source_ref": "/restricted/SENTINEL_73"}
+    )
+    assert hostile_source["source_ref"] == ""
+
 
 def test_read_project_state_rebuilds_nested_summary_without_trusting_values() -> None:
     hostile = {
@@ -189,6 +194,38 @@ def test_read_project_state_rebuilds_nested_summary_without_trusting_values() ->
     assert "REPORT_SENTINEL_SUMMARY" not in encoded
     assert projected["summary"]["sample_aliases"] == ["sample_001", "sample_002"]
     assert "unknown" not in projected["summary"]
+
+
+def test_project_summary_sanitizes_enum_like_fields() -> None:
+    # The helper is exercised through a temporary project so hostile values
+    # cannot be copied into the provider summary as free text.
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "project.json").write_text(json.dumps({
+            "state": "/restricted/PATIENT_73",
+            "route": {"id": "/restricted/route", "capability_id": "PATIENT_73"},
+            "samples": [],
+            "sequencing": {"layout": "/restricted/layout", "strandedness": "PATIENT_73"},
+        }), encoding="utf-8")
+        summary = build_safe_project_summary(root)
+    assert summary["project_state"] == "unknown"
+    assert summary["route_id"] == "unknown"
+    assert summary["capability_id"] == "unknown"
+    assert summary["sequencing"] == {"layout": "unknown", "strandedness": "unknown"}
+
+
+def test_project_summary_sanitizes_condition_and_stage_labels() -> None:
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "project.json").write_text(json.dumps({
+            "samples": {"items": [{"sample_id": "S1", "condition": "/restricted/PATIENT_73"}]},
+            "pipeline": {"/restricted/SENTINEL_STAGE": {"enabled": True}},
+        }), encoding="utf-8")
+        summary = build_safe_project_summary(root)
+    assert summary["condition_counts"] == {"unknown": 1}
+    assert summary["pipeline_stages"] == [{"name": "unknown", "enabled": True}]
 
 
 def test_tool_argument_projector_is_allowlisted_for_every_registered_tool() -> None:

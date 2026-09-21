@@ -286,6 +286,25 @@ def test_provider_messages_use_summary_context_without_exact_project_values(tmp_
     assert any(item.get("role") == "user" and item.get("content") == "请查看项目状态" for item in provider_messages)
 
 
+def test_structured_tool_projection_survives_safe_content_filter() -> None:
+    projected = json.dumps(
+        {
+            "ok": True,
+            "sample_count": 2,
+            "directory_count": 1,
+            "report_hash": "a" * 12,
+        },
+        ensure_ascii=False,
+    )
+    assert json.loads(cg._safe_provider_content(projected)) == json.loads(projected)
+
+    exact = json.dumps(
+        {"ok": True, "sample_count": 1, "sample_id": "PATIENT_SENTINEL_73"},
+        ensure_ascii=False,
+    )
+    assert cg._safe_provider_content(exact) == "模型回复已生成。"
+
+
 class TestConfirmationPolicy:
     """用户 2026-09-16 定的确认边界：配置合并、执行单独。"""
 
@@ -642,6 +661,39 @@ class TestChatGraphToolLoop:
         assert secret_path not in serialized
         assert "SECRET_SAMPLE" not in json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
         assert secret_path not in json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
+
+    def test_tool_log_argument_projection_never_persists_exact_arguments(self, monkeypatch, tmp_path) -> None:
+        from langgraph.types import Command
+
+        exact_path = "/restricted/PATIENT_73/SAMPLE_R1.fastq.gz"
+        write_args = {
+            **SAMPLE_WRITE_ARGS,
+            "fastq_dir": exact_path,
+            "samples": [
+                {
+                    **SAMPLE_WRITE_ARGS["samples"][0],
+                    "sample_id": "PATIENT_73",
+                    "fastq_1": "SAMPLE_R1.fastq.gz",
+                }
+            ],
+        }
+        graph, _recorded, _fake = _graph(
+            monkeypatch,
+            [
+                {"tool_calls": [_tool_call("c1", "write_project_config", write_args)]},
+                {"content": "已完成。"},
+            ],
+            checkpointer=_memory_checkpointer(),
+            tool_mode_reader=lambda: TOOL_MODE_APPROVED_EXECUTE,
+        )
+        config = {"configurable": {"thread_id": "log-projection"}}
+        first = graph.invoke(_initial(tmp_path, "写入样本"), config=config)
+        result = graph.invoke(Command(resume=_approval_decision(first, approved=True)), config=config)
+        serialized = json.dumps(result.get("tool_log") or {}, ensure_ascii=False)
+        assert "PATIENT_73" not in serialized
+        assert exact_path not in serialized
+        projection = (result.get("tool_log") or [])[0]["argument_projection"]
+        assert projection["argument_hash"].startswith("sha256:")
 
     def test_legacy_free_text_fields_use_fixed_categories(self, monkeypatch, tmp_path) -> None:
         secret = "PATIENT_SENTINEL_LEGACY /restricted/SENTINEL_LEGACY/report.md"
