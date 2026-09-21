@@ -776,7 +776,14 @@ function renderDisclosureOutcome(payload) {
   if (!bubble || !payload || typeof payload !== "object") return;
   const panel = document.createElement("div");
   panel.className = "disclosure-result";
-  const outcome = payload.outcome || payload.status || (payload.ok === true ? "success" : "failed");
+  const rawOutcome = String(payload.outcome || payload.status || (payload.ok === true ? "success" : "failed"));
+  const outcome = {
+    consumed_success: "success",
+    consumed_failed: "failed",
+    consumed_ambiguous: "ambiguous",
+    MODEL_DATA_GRANT_REJECTED: "rejected",
+    MODEL_DATA_GRANT_EXPIRED: "expired",
+  }[rawOutcome] || rawOutcome;
   const bytes = payload.byte_length ?? payload.response_bytes;
   panel.textContent = [
     `披露结果：${String(outcome || "")}`,
