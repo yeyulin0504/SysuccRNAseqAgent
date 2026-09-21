@@ -2901,7 +2901,7 @@ def create_app(
                 continue
             existing = by_id.get(sample_id, {})
             merged = dict(existing)
-            for key in ("condition", "fastq_1", "fastq_2"):
+            for key in ("condition", "fastq_1", "fastq_2", "pair_id"):
                 if patch.get(key) not in (None, ""):
                     merged[key] = patch[key]
             merged["sample_id"] = sample_id
@@ -4050,7 +4050,11 @@ def create_app(
             sample_id = str(raw.get("sample_id") or "").strip()
             condition = str(raw.get("condition") or "").strip()
             if sample_id and condition:
-                samples.append({"sample_id": sample_id, "condition": condition})
+                sample = {"sample_id": sample_id, "condition": condition}
+                pair_id = str(raw.get("pair_id") or "").strip()
+                if pair_id:
+                    sample["pair_id"] = pair_id
+                samples.append(sample)
 
         # 建 session 前先做输入级校验：畸形 payload 在此被字段级错误拦截，
         # 而不是放进 helper 内部门禁、以 drafting 假成功返回。
@@ -4672,10 +4676,15 @@ def create_app(
         samples: list[dict[str, Any]] = []
         sample_ids = [str(v) for v in form.getlist("sample_id") if str(v).strip()]
         conditions = [str(v) for v in form.getlist("condition") if str(v).strip()]
+        pair_ids = [str(v) for v in form.getlist("pair_id")]
         for index, sample_id in enumerate(sample_ids):
             condition = conditions[index] if index < len(conditions) else ""
             if sample_id and condition:
-                samples.append({"sample_id": sample_id, "condition": condition})
+                sample = {"sample_id": sample_id, "condition": condition}
+                pair_id = pair_ids[index].strip() if index < len(pair_ids) else ""
+                if pair_id:
+                    sample["pair_id"] = pair_id
+                samples.append(sample)
 
         # counts 直入固定参考路径由表单覆盖（用户可手填服务器路径）。
         reference_overrides: dict[str, str] = {}
@@ -4825,6 +4834,8 @@ def _default_config(project_dir: Path, payload: dict[str, Any]) -> dict[str, Any
             item["fastq_2"] = raw["fastq_2"]
         if raw.get("batch"):
             item["batch"] = raw["batch"]
+        if raw.get("pair_id") not in (None, ""):
+            item["pair_id"] = str(raw["pair_id"]).strip()
         items.append(item)
 
     # 数据来源：local_upload（本地上传）/ remote_path（服务器已有 reads）。

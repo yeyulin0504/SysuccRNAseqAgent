@@ -154,6 +154,29 @@ def test_default_summary_keeps_scientific_counts_but_no_exact_values(tmp_path: P
     assert summary["condition_counts"] == {"tumor": 1}
     assert summary["sample_aliases"] == ["sample_001"]
     assert summary["sequencing"] == {"layout": "paired", "strandedness": "unknown"}
+
+
+def test_default_summary_projects_pairing_status_without_pair_ids(tmp_path: Path) -> None:
+    project = {
+        "study": {"design": "paired_two_group"},
+        "sequencing": {"layout": "paired", "strandedness": "unknown"},
+        "samples": {"items": [
+            {"sample_id": "PATIENT_PAIR_1_A", "condition": "untrt", "pair_id": "PATIENT_PAIR_1"},
+            {"sample_id": "PATIENT_PAIR_1_B", "condition": "trt", "pair_id": "PATIENT_PAIR_1"},
+            {"sample_id": "PATIENT_PAIR_2_A", "condition": "untrt", "pair_id": "PATIENT_PAIR_2"},
+            {"sample_id": "PATIENT_PAIR_2_B", "condition": "trt", "pair_id": "PATIENT_PAIR_2"},
+            {"sample_id": "PATIENT_PAIR_3_A", "condition": "untrt", "pair_id": "PATIENT_PAIR_3"},
+            {"sample_id": "PATIENT_PAIR_3_B", "condition": "trt", "pair_id": "PATIENT_PAIR_3"},
+        ]},
+        "pipeline": {"diffexp": {"enabled": True}},
+        "diffexp": {"reference_condition": "untrt", "contrast_condition": "trt", "min_count_prefilter": 0},
+    }
+    (tmp_path / "project.json").write_text(__import__("json").dumps(project), encoding="utf-8")
+    summary = build_safe_project_summary(tmp_path)
+    assert summary["pairing"] == {"present": True, "pair_count": 3, "gate_status": "pass"}
+    encoded = _serialized(summary)
+    assert "PATIENT_PAIR" not in encoded
+    assert "pair_mapping" not in encoded
     assert all(value not in encoded for value in FORBIDDEN_SENTINELS)
 
 

@@ -10,6 +10,7 @@ from rnaseq_agent.differential import (
     render_colData,
     render_diffexp_counts_script,
 )
+from rnaseq_agent.agent_tools import TOOL_SPECS, validate_call
 
 PAIRED_TEMPLATE = "deseq2_paired_two_group"
 PAIRED_DESIGN_FORMULA = "~ pair_id + condition"
@@ -126,3 +127,16 @@ def test_paired_design_invalid_reference_is_structured_refusal_not_keyerror():
 
     with pytest.raises(ValueError, match="reference_condition"):
         diffexp_design_of(config)
+
+
+def test_llm_sample_schemas_accept_bounded_pair_id_fields():
+    write_schema = TOOL_SPECS["write_project_config"].parameters
+    edit_schema = TOOL_SPECS["edit_samples"].parameters
+    assert "pair_id" in write_schema["properties"]["samples"]["items"]["properties"]
+    assert "pair_id" in edit_schema["properties"]["samples"]["items"]["properties"]
+    args = {
+        "data_source": "local_upload",
+        "fastq_dir": "reads",
+        "samples": [{"sample_id": "s1", "condition": "A", "pair_id": "p1", "fastq_1": "s1_R1.fastq.gz"}],
+    }
+    assert validate_call("write_project_config", args) == []

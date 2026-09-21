@@ -70,6 +70,29 @@ def _sample_rows() -> dict:
 
 
 class TestCountsUploadEndpoint:
+    def test_counts_upload_persists_pair_id_for_structured_samples(self, client) -> None:
+        token = _token(client)
+        h = _headers(token)
+        _create_project(client, token, "cnt_pair")
+        sample_ids = ["t1", "t2", "t3", "n1", "n2", "n3"]
+        fields = {
+            "enabled_diffexp": "1",
+            "reference_condition": "normal",
+            "sample_id": sample_ids,
+            "condition": ["tumor"] * 3 + ["normal"] * 3,
+            "pair_id": ["p1", "p2", "p3", "p1", "p2", "p3"],
+        }
+        resp = client.post(
+            "/api/projects/cnt_pair/counts",
+            data=fields,
+            files={"file": ("counts_matrix.tsv", COUNT_MATRIX.encode(), "text/tab-separated-values")},
+            headers=h,
+        )
+        assert resp.status_code == 200, resp.text
+        project_dir = Path(client.get("/api/state?project=cnt_pair", headers=h).json()["project_dir"])
+        project_json = __import__("json").loads((project_dir / "project.json").read_text(encoding="utf-8"))
+        assert [row["pair_id"] for row in project_json["samples"]["items"]] == ["p1", "p2", "p3", "p1", "p2", "p3"]
+
     def test_creates_counts_session_with_diffexp_only(self, client) -> None:
         token = _token(client)
         h = _headers(token)

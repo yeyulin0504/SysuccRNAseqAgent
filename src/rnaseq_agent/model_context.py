@@ -334,6 +334,16 @@ def build_safe_project_summary(project_dir: Path) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     if status.get("error") or status.get("failed"):
         errors.append({"category": "run_failed", "message": "项目运行失败。"})
+    pair_ids = {str(row.get("pair_id") or "").strip() for row in rows if str(row.get("pair_id") or "").strip()}
+    pairing_present = bool(pair_ids)
+    pairing_gate = "not_applicable"
+    if str(study.get("design") or "").strip() == "paired_two_group":
+        try:
+            from .differential import paired_design_checks
+            pairing_gate = "pass" if not paired_design_checks(project) else "fail"
+        except Exception:  # malformed local metadata remains a safe failed gate
+            pairing_gate = "fail"
+    pairing = {"present": pairing_present, "pair_count": min(len(pair_ids), 256), "gate_status": pairing_gate}
     return {
         "policy_version": 1,
         "data_scope": "summary",
@@ -346,6 +356,7 @@ def build_safe_project_summary(project_dir: Path) -> dict[str, Any]:
         "sample_count": len(rows),
         "condition_counts": dict(sorted(conditions.items())),
         "sample_aliases": [f"sample_{index:03d}" for index in range(1, len(rows) + 1)],
+        "pairing": pairing,
         "replicate_gate": {"passed": bool(rows) and all(count >= 2 for count in conditions.values()),
                            "minimum_per_condition": 2},
         "pipeline_stages": stages,
@@ -384,7 +395,7 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                 "policy_version", "data_scope", "project_state", "route_id",
                 "capability_id", "input_kind", "sample_count", "condition_counts",
                 "sample_aliases", "replicate_gate", "pipeline_stages", "matrix",
-                "references", "contract", "run", "errors", "sequencing",
+                "references", "contract", "run", "errors", "sequencing", "pairing",
             }
             safe_summary: dict[str, Any] = {}
             for key in allowed:
@@ -395,7 +406,7 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                     safe_summary[key] = [f"sample_{index:03d}" for index, _ in enumerate(value[:256], 1)]
                 elif key == "pipeline_stages" and isinstance(value, list):
                     safe_summary[key] = [{"name": (stage if stage in _SUMMARY_STAGE_NAMES else "unknown"), "enabled": bool(item.get("enabled"))} for item in value[:64] if isinstance(item, Mapping) for stage in [str(item.get("name") or "").strip().lower()]]
-                elif key in {"references", "contract", "run", "replicate_gate", "matrix", "sequencing"} and isinstance(value, Mapping):
+                elif key in {"references", "contract", "run", "replicate_gate", "matrix", "sequencing", "pairing"} and isinstance(value, Mapping):
                     nested: dict[str, Any] = {}
                     for nested_key, nested_value in value.items():
                         nested_key = str(nested_key)
@@ -407,6 +418,10 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                             nested[nested_key] = min(_safe_int(nested_value), 256)
                         elif nested_key == "id_hash" and re.fullmatch(r"[0-9a-f]{8,128}", str(nested_value or "").lower()):
                             nested[nested_key] = str(nested_value).lower()[:128]
+                        elif nested_key == "pair_count":
+                            nested[nested_key] = min(_safe_int(nested_value), 256)
+                        elif nested_key == "gate_status":
+                            nested[nested_key] = str(nested_value) if str(nested_value) in {"pass", "fail", "not_applicable"} else "unknown"
                     safe_summary[key] = nested
                 elif key in {"policy_version", "sample_count"}:
                     safe_summary[key] = _safe_int(value)

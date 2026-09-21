@@ -279,6 +279,7 @@ _SAMPLE_SCHEMA: dict[str, Any] = {
         },
         "fastq_1": {"type": "string", "description": "R1 文件名（只写文件名，不要带目录）"},
         "fastq_2": {"type": "string", "description": "R2 文件名（双端测序必填）"},
+        "pair_id": {"type": "string", "description": "配对设计的 bounded pair 标识；仅用于本地结构化样本表"},
     },
     # condition 刻意**不**列入 required：模型可以只给分组名的一部分，
     # 由 normalize_write_arguments 按循环序列补齐（用户明确要的行为）。
@@ -990,6 +991,11 @@ def _validate_edit_samples(arguments: dict[str, Any]) -> list[str]:
             error = relative_filename_error(value, f"samples[{index}].{key}")
             if error:
                 problems.append(f"{error}（{key} 只写文件名，目录请放进 fastq_dir）")
+        pair_id = sample.get("pair_id")
+        if pair_id not in (None, ""):
+            error = identifier_error(pair_id, f"samples[{index}].pair_id")
+            if error:
+                problems.append(error)
 
     if remove is not None:
         if not isinstance(remove, list):
@@ -1056,6 +1062,11 @@ def _validate_write_config(arguments: dict[str, Any]) -> list[str]:
                 problems.append(
                     f"{error}（{key} 只写文件名，目录请放进 fastq_dir）"
                 )
+        pair_id = sample.get("pair_id")
+        if pair_id not in (None, ""):
+            error = identifier_error(pair_id, f"samples[{index}].pair_id")
+            if error:
+                problems.append(error)
 
     seen: set[str] = set()
     for index, sample in enumerate(samples, start=1):
