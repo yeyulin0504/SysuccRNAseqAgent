@@ -252,6 +252,7 @@ class TestExecutorPermissionDefense:
         assert isinstance(result, ToolExecutionResult)
         assert result.security_audit is not None
         assert result.model["error_code"] == "TOOL_MODE_DISABLED"
+        assert not (tmp_path / "p" / ".remote-scans").exists()
 
     def test_direct_executor_call_still_obeys_the_live_kill_switch(
         self, client, tmp_path
