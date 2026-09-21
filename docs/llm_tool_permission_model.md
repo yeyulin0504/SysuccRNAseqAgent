@@ -7,8 +7,9 @@
 
 summary-only 默认边界、主要 provider gateway、approved-root 扫描和 metadata-only
 grant 基础设施已经落地并有测试。local `sample_ids` exact grant 已通过独立的
-project-scoped Web API 接入真实 provider 发送；自然语言 ChatGraph 的 exact intent 和
-前端 disclosure card 仍未接通。`fastq_filenames`、`report_excerpt`、`remote_paths` 与
+project-scoped Web API 接入真实 provider 发送；自然语言 ChatGraph 现在也能创建独立的
+sample_ids disclosure card 并完成批准/拒绝，但批准后的 exact provider send 仍通过下一阶段
+的 request-local send 链路完成。`fastq_filenames`、`report_excerpt`、`remote_paths` 与
 remote `source_ref` 继续 fail closed。当前可以把“默认摘要不泄露精确信息”和“用户显式
 批准后 local sample_ids 只在一次 request-local provider 请求中可见”作为已实现契约，
 不能把“确认后模型读取远程 FASTQ 精确路径”当成已上线能力。分阶段验收见
