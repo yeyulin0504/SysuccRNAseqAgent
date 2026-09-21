@@ -31,6 +31,7 @@ from .model_disclosure import (
     MODEL_DATA_SCOPE_UNSUPPORTED,
     MODEL_PROVIDER_CHANGED,
     ProviderCredentials,
+    ProviderEvent,
     ProviderRequestError,
 )
 from .model_provider import (
@@ -218,8 +219,34 @@ def send_exact_disclosure(
         chunks: list[str] = []
         with prepared.terminal_guard():
             for event in prepared.events:
-                if getattr(event, "kind", None) == "delta":
-                    chunks.append(str(getattr(event, "value", "")))
+                if not isinstance(event, ProviderEvent):
+                    raise ProviderRequestError(
+                        "provider response malformed",
+                        code="MODEL_PROVIDER_REQUEST_FAILED",
+                        transmission_started=True,
+                    )
+                if event.kind == "delta":
+                    if not isinstance(event.value, str):
+                        raise ProviderRequestError(
+                            "provider response malformed",
+                            code="MODEL_PROVIDER_REQUEST_FAILED",
+                            transmission_started=True,
+                        )
+                    chunks.append(event.value)
+                elif event.kind == "message":
+                    continue
+                elif event.kind == "tool_call_fragment":
+                    raise ProviderRequestError(
+                        "provider response contained a tool call",
+                        code="MODEL_EXACT_TOOL_CALL_REJECTED",
+                        transmission_started=True,
+                    )
+                else:
+                    raise ProviderRequestError(
+                        "provider response malformed",
+                        code="MODEL_PROVIDER_REQUEST_FAILED",
+                        transmission_started=True,
+                    )
         text = "".join(chunks)
         return {
             "ok": True,
