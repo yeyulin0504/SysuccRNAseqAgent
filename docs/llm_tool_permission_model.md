@@ -55,7 +55,8 @@ LLM tool_call
 | `approved_execute` | 全部已登记工具 | 只读自动执行；写入与执行仍按原策略确认 |
 
 旧安装的有效配置中真正不存在 `tool_mode` 字段时默认为 `approved_execute`，保持升级
-兼容。显式 JSON `null` 不属于“字段不存在”；它与未知字符串、布尔、数字、数组、
+兼容。这只是迁移例外，不是新安装或重置后的最小权限推荐；新安装应由设置页明确选择
+`read_only` 或 `disabled`。显式 JSON `null` 不属于“字段不存在”；它与未知字符串、布尔、数字、数组、
 对象、损坏 JSON、非对象配置根和非对象 `llm` 块一样均视为配置错误。保存 API 拒绝，
 运行时读取异常则按 `disabled` fail closed。未知工具沿用最高风险
 `execute`，除 `approved_execute` 外全部模式先在权限层拒绝；即使处于
@@ -71,12 +72,19 @@ execute 也会在创建一次性 claim 和调用 executor 前停止。直接调�
 给远程调度器的作业不会因模式切到 `disabled` 而终止；需要取消时必须使用项目或
 调度器的作业控制路径，并核对对应的 `run_id` 和远程 job id。
 
+`request_data_disclosure` 作为模型工具时按工具模式过滤，并属于需要单独确认的
+`write/solo` 动作；`disabled` 或 `read_only` 不会让模型自行发起这张披露卡。用户在
+结构化 UI 中主动打开 project-scoped disclosure API 是另一条明确的人类操作入口，仍然
+必须经过 metadata-only card、严格布尔批准和一次性 exact send；它不会改变 `tool_mode`，
+也不会授予模型其它读写或执行工具权限。
+
 ## 模型数据披露范围
 
 `tool_mode` 只控制模型能发起什么动作，不代表模型可以读取项目中的全部精确信息。
 系统另设独立的 `data_scope` 边界。默认情况下，provider 只接收去标识项目摘要：
 项目状态、路线、输入类型、样本数、分组计数、确定性样本别名、科学门禁结果和流程
-状态。默认上下文不得包含源样本名、患者标识、FASTQ 文件名、远程或本地路径、
+状态。这里的样本别名是服务端生成的稳定序号，不能还原源样本名；分组计数和条件标签
+仍按敏感项目数据处理，只能来自显式 allowlist。默认上下文不得包含源样本名、患者标识、FASTQ 文件名、远程或本地路径、
 host/user/job id、报告正文、命令、stdout/stderr、traceback 或凭据。
 
 需要精确信息时，必须使用独立的数据披露确认，按 `sample_ids`、
@@ -94,7 +102,8 @@ provider 请求最终都由同一 `ModelContextBuilder` 通过显式 allowlist �
 当前 local `sample_ids` 的结构化入口是：先创建 metadata-only grant，再用严格的
 JSON 布尔批准/拒绝，最后调用一次性 send endpoint。send endpoint 返回的正文只属于
 当前 HTTP 请求；它不会追加到对话 History、ChatState、checkpoint、通用日志或 grant
-JSON。普通工具确认卡不能创建这个 grant，也不能借助它扩大写入或执行权限。
+JSON，前端 transient panel 也不会把 exact 文本回灌给下一轮模型。普通工具确认卡不能
+创建这个 grant，也不能借助它扩大写入或执行权限。
 
 当前版本还要求 unsupported disclosure field 在 issue、load、claim 和 send 四个边界
 都直接拒绝；底层 extractor 能枚举某个字段不代表该字段已经成为产品能力。尤其是

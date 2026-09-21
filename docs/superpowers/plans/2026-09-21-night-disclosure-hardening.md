@@ -28,10 +28,10 @@
 
 **Deliverable:** The currently enabled scope is exactly local `sample_ids`. Unsupported fields are rejected before durable pending grants are created, project identity must match the stored project, exact dispatch rejects Codex CLI at the gateway invariant, purpose/approval binding cannot be widened at send time, and transient exact HTTP responses are explicitly non-cacheable.
 
-- [ ] Add failing direct-function and endpoint tests for unsupported fields at issue/load/claim/send, missing or mismatched stored project id, purpose drift, and exact dispatch through a Codex backend.
-- [ ] Add the smallest fail-closed implementation that preserves the existing local `sample_ids` API and terminal semantics.
-- [ ] Add/verify `Cache-Control: no-store, private` and `Pragma: no-cache` on transient exact responses without persisting the body.
-- [ ] Run focused disclosure/grant/provider/web tests, then commit.
+- [x] Add failing direct-function and endpoint tests for unsupported fields at issue/load/claim/send, missing or mismatched stored project id, purpose drift, and exact dispatch through a Codex backend.
+- [x] Add the smallest fail-closed implementation that preserves the existing local `sample_ids` API and terminal semantics.
+- [x] Add/verify `Cache-Control: no-store, private` and `Pragma: no-cache` on transient exact responses without persisting the body.
+- [x] Run focused disclosure/grant/provider/web tests, then commit (`3971399`, `7154287`).
 
 ### Task 2: Approved-root audit and remote-scan replay gates
 
@@ -41,10 +41,10 @@
 
 **Deliverable:** The authoritative security-audit lifecycle, root stale/symlink/nested-root/policy-race failures, and concurrent scan consumption are covered. Any unresolved audit or replay state remains fail-closed and does not fabricate a trusted result.
 
-- [ ] Add failing tests for audit success, explicit audit failure, uncertain audit commit, History failure after audit commit, and removal of security-audit payload before provider/log projection.
-- [ ] Add failing tests for canonical root drift, symlink escape, nested-root longest match, policy change during scan, and no scan record on denied browse.
-- [ ] Add a two-consumer test proving one callback executes, the other receives a stable consumed/reference-used result, and failed callback retry reuses the durable claim.
-- [ ] Implement only defects exposed by these tests, run the focused remote/audit suite, then commit.
+- [x] Add failing tests for audit success, explicit audit failure, uncertain audit commit, History failure after audit commit, and removal of security-audit payload before provider/log projection.
+- [x] Add failing tests for canonical root drift, symlink escape, nested-root longest match, policy change during scan, and no scan record on denied browse.
+- [x] Add a two-consumer test proving one callback executes, the other receives a stable consumed/reference-used result, and failed callback retry reuses the durable claim.
+- [x] Implement only defects exposed by these tests, run the focused remote/audit suite, then commit (`869b15e`, `008f22b`).
 
 ### Task 3: Disclosure concurrency and sentinel containment
 
@@ -54,10 +54,10 @@
 
 **Deliverable:** Concurrent sends, binding changes during send, malformed provider responses, and sentinel secrets are proven not to leak exact data or bypass the single-use grant.
 
-- [ ] Add a concurrent `/send` test proving exactly one provider dispatch and a stable consumed result for the loser.
-- [ ] Add cross-thread/provider/tool-mode/revision races and pre-transport versus post-transport terminal-state assertions.
-- [ ] Send sample, path, password, API-key, private-key, ciphertext, and URL-userinfo sentinels through default, ordinary-tool, exact, and provider-error paths; assert absence from payloads, responses, checkpoints, History, logs, grants, and exceptions.
-- [ ] Verify unsupported `fastq_filenames`, `report_excerpt`, and `remote_paths` remain structurally rejected, then commit any narrow fix and the tests.
+- [x] Add a concurrent `/send` test proving exactly one provider dispatch and a stable consumed result for the loser.
+- [x] Add cross-thread/provider/tool-mode/revision races and pre-transport versus post-transport terminal-state assertions.
+- [x] Send sample, path, password, API-key, private-key, ciphertext, and URL-userinfo sentinels through default, ordinary-tool, exact, and provider-error paths; assert absence from payloads, responses, checkpoints, History, logs, grants, and exceptions (`8331fd0` closes the ordinary-tool projection leak and adds the missing successful/default matrix).
+- [x] Verify unsupported `fastq_filenames`, `report_excerpt`, and `remote_paths` remain structurally rejected, then commit the narrow fix and tests (`d06a66c`).
 
 ### Task 4: Scope documents and release ledger
 
@@ -68,10 +68,10 @@
 
 **Deliverable:** The next permission boundaries are explicit before implementation. `fastq_filenames` distinguishes local rows from remote-scan provenance and has a RED matrix; `report_excerpt` defines source allowlists and redaction requirements; current release status and test evidence are recorded without claiming unsupported scopes are live.
 
-- [ ] Write the local FASTQ filename scope, provenance rules, bounded output, and negative matrix; keep provider enablement off.
-- [ ] Write the report excerpt scope as a separate proposal with section allowlists, redaction, size limits, and explicit rejection of logs/tracebacks/full reports.
-- [ ] Update the roadmap and SDD ledger with current commits, fresh verification counts, and pending Tasks 4/5.
-- [ ] Run documentation checks, `git diff --check`, and the final full gates before committing.
+- [x] Write the local FASTQ filename scope, provenance rules, bounded output, and negative matrix; keep provider enablement off.
+- [x] Write the report excerpt scope as a separate proposal with section allowlists, redaction, size limits, and explicit rejection of logs/tracebacks/full reports.
+- [x] Update the roadmap and SDD ledger with current commits and fresh verification counts; leave later scopes closed.
+- [x] Run documentation checks, `git diff --check`, and the final full gates before committing (`7e96a74`).
 
 ## Release gates
 
