@@ -98,6 +98,8 @@ def _graph(
     clock=None,
     approval_ttl_seconds=900,
     tool_mode_reader=None,
+    disclosure_requester=None,
+    disclosure_decider=None,
 ):
     """Build the chat graph with a scripted model and a recording executor.
 
@@ -126,6 +128,8 @@ def _graph(
         clock=clock,
         approval_ttl_seconds=approval_ttl_seconds,
         tool_mode_reader=tool_mode_reader,
+        disclosure_requester=disclosure_requester,
+        disclosure_decider=disclosure_decider,
     )
     return graph, recorded, fake
 
@@ -562,6 +566,30 @@ class TestDescribeCall:
 
 
 class TestChatGraphToolLoop:
+    def test_data_disclosure_tool_is_metadata_only_and_sample_ids_only(self) -> None:
+        from rnaseq_agent.agent_tools import TOOL_SPECS
+
+        schema = TOOL_SPECS["request_data_disclosure"].parameters
+        assert set(schema["properties"]) == {"fields", "purpose"}
+        assert schema["properties"]["fields"]["items"]["enum"] == ["sample_ids"]
+        assert schema["additionalProperties"] is False
+        assert validate_call(
+            "request_data_disclosure",
+            {"fields": ["sample_ids"], "purpose": "解释当前样本命名"},
+        ) == []
+        assert validate_call(
+            "request_data_disclosure",
+            {"fields": ["fastq_filenames"], "purpose": "解释"},
+        )
+        assert validate_call(
+            "request_data_disclosure",
+            {"fields": ["sample_ids"], "purpose": "x" * 241},
+        )
+        assert validate_call(
+            "request_data_disclosure",
+            {"fields": ["sample_ids"], "purpose": "查看 /restricted/S1"},
+        )
+
     @pytest.mark.parametrize(
         ("mode", "tool_name", "arguments", "executed", "interrupts"),
         [
@@ -800,6 +828,64 @@ class TestChatGraphConfirmation:
         assert payload["calls"][0]["risk"] == RISK_WRITE
         assert "S1" not in payload["calls"][0]["description"]
         assert "样本：2 个" in payload["calls"][0]["description"]
+
+    def test_data_disclosure_uses_a_distinct_metadata_only_card(self, monkeypatch, tmp_path) -> None:
+        graph, recorded, fake = _graph(
+            monkeypatch,
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "d1",
+                            "request_data_disclosure",
+                            {"fields": ["sample_ids"], "purpose": "解释样本"},
+                        )
+                    ]
+                }
+            ],
+            checkpointer=_memory_checkpointer(),
+            config_reader=lambda _path: {
+                "samples": {"items": [{"sample_id": "SECRET_SAMPLE"}]}
+            },
+            disclosure_requester=lambda _path, _project_id, _thread_id, _arguments: {
+                "grant_id": "grant-1",
+                "card": {
+                    "type": "model_data_disclosure_confirmation",
+                    "grant_id": "grant-1",
+                    "fields": ["sample_ids"],
+                    "record_counts": {"sample_ids": 1},
+                    "purpose_category": "user_requested_exact_context",
+                    "provider": {"model": "m"},
+                    "provider_config_revision": "rev",
+                    "tool_mode": TOOL_MODE_APPROVED_EXECUTE,
+                    "revisions": {},
+                    "expires_at": "2099-01-01T00:00:00Z",
+                },
+            },
+            disclosure_decider=lambda _path, _grant_id, _approved: {"status": "rejected"},
+        )
+        first = graph.invoke(
+            _initial(tmp_path, "请按需查看样本名"),
+            config={"configurable": {"thread_id": "disclosure-card"}},
+        )
+        assert recorded == []
+        card = first["__interrupt__"][0].value
+        assert card["type"] == "model_data_disclosure_confirmation"
+        assert card["fields"] == ["sample_ids"]
+        assert card["record_counts"] == {"sample_ids": 1}
+        assert card["purpose_category"] == "user_requested_exact_context"
+        assert "SECRET_SAMPLE" not in json.dumps(card, ensure_ascii=False)
+        assert "解释样本" not in json.dumps(card, ensure_ascii=False)
+
+        from langgraph.types import Command
+
+        result = graph.invoke(
+            Command(resume=_approval_decision(first, approved=False)),
+            config={"configurable": {"thread_id": "disclosure-card"}},
+        )
+        assert recorded == []
+        assert result["via"] == "rejected"
+        _assert_all_declared_tool_calls_are_answered(fake.seen_messages[-1])
 
     def test_switching_to_a_stricter_mode_invalidates_a_waiting_card(
         self, monkeypatch, tmp_path

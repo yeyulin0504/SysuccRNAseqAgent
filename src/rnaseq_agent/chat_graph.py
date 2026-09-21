@@ -142,6 +142,8 @@ class ToolExecutionResult:
 
 ToolExecutor = Callable[[str, dict[str, Any], Path, bool, ToolExecutionContext], ToolExecutionResult]
 ToolResultFinalizer = Callable[[ToolExecutionResult, Path | None], ToolExecutionResult]
+DisclosureRequester = Callable[[Path, str, str, dict[str, Any]], dict[str, Any]]
+DisclosureDecider = Callable[[Path, str, bool], dict[str, Any]]
 
 _LEGACY_MODEL_KEYS = frozenset({
     "ok", "blocked", "error", "error_code", "message", "reply", "state",
@@ -285,6 +287,9 @@ class ChatState(TypedDict, total=False):
     #: survives interrupt replay and is consumed immediately after execution.
     approval_context: dict[str, Any]
     confirmation_card: dict[str, Any]
+    disclosure_context: dict[str, Any]
+    disclosure_card: dict[str, Any]
+    disclosure_result: dict[str, Any]
 
 
 SYSTEM_PROMPT = (
@@ -570,6 +575,11 @@ def _normalize_call_arguments(name: str, arguments: dict[str, Any]) -> dict[str,
         return {"stage": stage} if stage else {}
     if name == "browse_remote_samples":
         return {"path": str(raw.get("path") or "").strip()}
+    if name == "request_data_disclosure":
+        return {
+            "fields": [str(item).strip() for item in (raw.get("fields") or [])],
+            "purpose": str(raw.get("purpose") or "").strip(),
+        }
     return raw
 
 
@@ -587,6 +597,13 @@ def _approval_description(
     """
     labels = tool_labels()
     title = labels.get(name, name)
+
+    if name == "request_data_disclosure":
+        fields = arguments.get("fields") or []
+        return (
+            f"{title}：仅申请本地 sample_ids（{len(fields)} 个字段类别）；"
+            "精确值不会写入确认卡或项目记录。"
+        )
 
     if name == "write_project_config":
         samples = [item for item in arguments.get("samples") or [] if isinstance(item, dict)]
@@ -743,6 +760,8 @@ def build_chat_graph(
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS,
     tool_mode_reader: ToolModeReader | None = None,
     result_finalizer: ToolResultFinalizer | None = None,
+    disclosure_requester: DisclosureRequester | None = None,
+    disclosure_decider: DisclosureDecider | None = None,
 ):
     """Compile the conversation graph.
 
@@ -829,6 +848,34 @@ def build_chat_graph(
 
     ephemeral_store = _EPHEMERAL_TOOL_CALL_STORE
 
+    def _disclosure_request(state: ChatState, call: Mapping[str, Any]) -> dict[str, Any]:
+        if disclosure_requester is None:
+            raise ValueError("MODEL_DATA_DISCLOSURE_UNAVAILABLE")
+        arguments = _call_arguments(state, call)
+        result = disclosure_requester(
+            Path(state.get("project_dir") or ""),
+            str(state.get("project_id") or ""),
+            str(state.get("thread_id") or ""),
+            arguments,
+        )
+        if not isinstance(result, dict):
+            raise ValueError("MODEL_DATA_DISCLOSURE_INVALID")
+        card = result.get("card")
+        grant_id = str(result.get("grant_id") or "")
+        if not grant_id or not isinstance(card, dict) or card.get("type") != "model_data_disclosure_confirmation":
+            raise ValueError("MODEL_DATA_DISCLOSURE_INVALID")
+        if card.get("fields") != ["sample_ids"]:
+            raise ValueError("MODEL_DATA_SCOPE_UNSUPPORTED")
+        safe_card = {
+            key: card[key]
+            for key in (
+                "type", "grant_id", "fields", "record_counts", "purpose_category",
+                "provider", "provider_config_revision", "tool_mode", "revisions", "expires_at",
+            )
+            if key in card
+        }
+        return {"grant_id": grant_id, "card": safe_card}
+
     def _raw_call(call: ToolCall, call_ref: str | None = None) -> dict[str, Any]:
         """Re-shape a parsed call back into the provider's ``tool_calls`` form."""
         try:
@@ -882,6 +929,8 @@ def build_chat_graph(
                 "deferred_calls": [],
                 "approval_context": {},
                 "confirmation_card": {},
+                "disclosure_context": {},
+                "disclosure_card": {},
                 "reply": (
                     "我在这一轮里来回调用工具太多次了，先停在这里。\n"
                     f"当前进度：{state.get('reply') or '还没有可回报的结果'}。\n"
@@ -981,6 +1030,8 @@ def build_chat_graph(
             "deferred_calls": pending_calls,
             "approval_context": {},
             "confirmation_card": {},
+            "disclosure_context": {},
+            "disclosure_card": {},
             "confirmed": False,
             "rejected": False,
             "iterations": iterations + 1,
@@ -1113,6 +1164,63 @@ def build_chat_graph(
                 "confirmation_card": {},
             }
 
+        # Data disclosure is a separate control path. It creates a
+        # metadata-only grant/card and must never be folded into the ordinary
+        # tool confirmation card or executor.
+        if len(valid) == 1 and str(valid[0].get("name") or "") == "request_data_disclosure":
+            try:
+                disclosure = _disclosure_request(state, valid[0])
+            except Exception as exc:  # noqa: BLE001 - malformed/unavailable disclosure fails closed
+                message = _tool_error_message(
+                    str(valid[0].get("call_id") or ""),
+                    {"ok": False, "error_code": str(exc) or "MODEL_DATA_DISCLOSURE_INVALID"},
+                )
+                return {
+                    "messages": list(state.get("messages") or []) + [message],
+                    "pending_calls": [],
+                    "deferred_calls": rest,
+                    "confirmed": False,
+                    "rejected": False,
+                    "approval_context": {},
+                    "confirmation_card": {},
+                    "disclosure_context": {},
+                    "disclosure_card": {},
+                }
+            card = dict(disclosure["card"])
+            issued_at = now()
+            expires_at = issued_at + timedelta(seconds=ttl_seconds)
+            approval_id = "discl_" + secrets.token_urlsafe(24)
+            card.update(
+                {
+                    "approval_id": approval_id,
+                    "project_id": str(state.get("project_id") or ""),
+                    "thread_id": str(state.get("thread_id") or ""),
+                    "call_id": str(valid[0].get("call_id") or ""),
+                    "expires_at": card.get("expires_at") or _utc_iso(expires_at),
+                }
+            )
+            disclosure_context = {
+                "approval_id": approval_id,
+                "grant_id": disclosure["grant_id"],
+                "project_id": str(state.get("project_id") or ""),
+                "thread_id": str(state.get("thread_id") or ""),
+                "call_id": str(valid[0].get("call_id") or ""),
+                "tool_mode": mode,
+                "issued_at": _utc_iso(issued_at),
+                "expires_at": card["expires_at"],
+            }
+            return {
+                "messages": list(state.get("messages") or []),
+                "pending_calls": valid,
+                "deferred_calls": rest,
+                "confirmed": False,
+                "rejected": False,
+                "approval_context": {},
+                "confirmation_card": {},
+                "disclosure_context": disclosure_context,
+                "disclosure_card": card,
+            }
+
         # 只读工具直接放行；写盘/执行必须人工确认（唯一真源在 agent_tools）。
         policy = confirmation_policy(str(valid[0].get("name") or ""))
         if policy == POLICY_NEVER:
@@ -1189,6 +1297,8 @@ def build_chat_graph(
             "deferred_calls": rest,
             "approval_context": approval_context,
             "confirmation_card": card,
+            "disclosure_context": {},
+            "disclosure_card": {},
             "confirmed": False,
             "rejected": False,
         }
@@ -1361,7 +1471,84 @@ def build_chat_graph(
             return _reject_approval(state, error=problem, note=note)
         return {"confirmed": True, "rejected": False}
 
+    def node_disclosure_confirmation(state: ChatState) -> ChatState:
+        """Approve/reject a metadata-only disclosure grant."""
+        card = state.get("disclosure_card") or {}
+        decision = interrupt(card)
+        context = state.get("disclosure_context") or {}
+        supplied_id = str(decision.get("approval_id") or "") if isinstance(decision, dict) else ""
+        expected_id = str(context.get("approval_id") or "") if isinstance(context, dict) else ""
+        call_id = str(context.get("call_id") or "") if isinstance(context, dict) else ""
+        if not supplied_id or supplied_id != expected_id:
+            payload = {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"}
+        elif str(context.get("project_id") or "") != str(state.get("project_id") or "") or str(context.get("thread_id") or "") != str(state.get("thread_id") or ""):
+            payload = {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"}
+        elif str(context.get("tool_mode") or "") != _live_tool_mode():
+            payload = {"ok": False, "error_code": "LLM_TOOL_MODE_CHANGED"}
+        else:
+            current_time = now()
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc)
+            expires_at = _parse_utc(context.get("expires_at"))
+            if expires_at is None or expires_at <= current_time.astimezone(timezone.utc):
+                payload = {"ok": False, "error_code": "MODEL_DATA_GRANT_EXPIRED"}
+            else:
+                payload = None
+        if payload is None and not (isinstance(decision, dict) and decision.get("approved") is True):
+            if disclosure_decider is not None:
+                try:
+                    disclosure_decider(
+                        Path(state.get("project_dir") or ""),
+                        str(context.get("grant_id") or ""),
+                        False,
+                    )
+                except Exception:
+                    pass
+            payload = {"ok": False, "error_code": "MODEL_DATA_GRANT_REJECTED"}
+        elif payload is None and disclosure_decider is None:
+            payload = {"ok": False, "error_code": "MODEL_DATA_DISCLOSURE_UNAVAILABLE"}
+        elif payload is None:
+            try:
+                outcome = disclosure_decider(
+                    Path(state.get("project_dir") or ""),
+                    str(context.get("grant_id") or ""),
+                    True,
+                )
+                payload = {
+                    "ok": True,
+                    "status": str(outcome.get("status") or "approved") if isinstance(outcome, dict) else "approved",
+                    "fields": ["sample_ids"],
+                    "grant_id_hash": hashlib.sha256(str(context.get("grant_id") or "").encode("utf-8")).hexdigest(),
+                    "next_step": "send_exact_disclosure",
+                }
+            except Exception as exc:  # noqa: BLE001 - grant decision fails closed
+                payload = {"ok": False, "error_code": str(getattr(exc, "code", None) or "MODEL_DATA_GRANT_INVALID")}
+        messages = list(state.get("messages") or [])
+        if call_id:
+            messages.append(_tool_error_message(call_id, payload) if not payload.get("ok") else {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": json.dumps(payload, ensure_ascii=False),
+                "model_projection_version": 1,
+            })
+        return {
+            "messages": messages,
+            "pending_calls": [],
+            "deferred_calls": list(state.get("deferred_calls") or []),
+            "confirmed": False,
+            "rejected": not bool(payload.get("ok")),
+            "via": "rejected" if not payload.get("ok") else "tool",
+            "reply": "精确样本信息披露申请已批准。" if payload.get("ok") else "精确样本信息披露申请未批准。",
+            "disclosure_result": payload,
+            "disclosure_context": {},
+            "disclosure_card": {},
+            "approval_context": {},
+            "confirmation_card": {},
+        }
+
     def route_after_guardrail(state: ChatState) -> str:
+        if state.get("disclosure_context") and state.get("disclosure_card"):
+            return "disclosure_confirmation"
         if state.get("approval_context"):
             return "confirmation"
         if state.get("pending_calls"):
@@ -1569,6 +1756,7 @@ def build_chat_graph(
     builder.add_node("agent", node_agent)
     builder.add_node("guardrail", node_guardrail)
     builder.add_node("confirmation", node_confirmation)
+    builder.add_node("disclosure_confirmation", node_disclosure_confirmation)
     builder.add_node("execute", node_execute)
     builder.add_edge(START, "agent")
     builder.add_conditional_edges(
@@ -1579,6 +1767,7 @@ def build_chat_graph(
         route_after_guardrail,
         {
             "confirmation": "confirmation",
+            "disclosure_confirmation": "disclosure_confirmation",
             "execute": "execute",
             "guardrail": "guardrail",
             "agent": "agent",
@@ -1587,6 +1776,7 @@ def build_chat_graph(
     builder.add_conditional_edges(
         "confirmation", route_after_confirmation, {"execute": "execute", "agent": "agent"}
     )
+    builder.add_edge("disclosure_confirmation", "agent")
     builder.add_conditional_edges(
         "execute", route_after_execute, {"guardrail": "guardrail", "agent": "agent"}
     )

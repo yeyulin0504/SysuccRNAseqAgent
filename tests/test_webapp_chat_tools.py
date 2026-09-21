@@ -315,6 +315,54 @@ class TestModelWritesConfigViaTool:
         done2 = events2[-1]["data"]
         assert done2["state"] == "drafting", done2
 
+    def test_disclosure_intent_creates_distinct_card_and_metadata_grant(
+        self, client, tmp_path, monkeypatch
+    ) -> None:
+        token = _token(client)
+        _create_project(client, token, "disclosure_chat")
+        _seed_project(tmp_path, monkeypatch, "disclosure_chat")
+        _configure_llm(client, token)
+        fake = FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        _tool_call(
+                            "disclose_1",
+                            "request_data_disclosure",
+                            {"fields": ["sample_ids"], "purpose": "解释样本分组"},
+                        )
+                    ]
+                },
+                {"content": "披露申请已登记。"},
+            ]
+        )
+        monkeypatch.setattr(cg, "_stream_chat_completion", fake)
+
+        events = _stream(client, token, "请申请查看样本名", project="disclosure_chat")
+        card = _confirm_event(events)
+        assert card is not None, events
+        assert card["type"] == "model_data_disclosure_confirmation"
+        assert card["fields"] == ["sample_ids"]
+        assert "解释样本分组" not in json.dumps(card, ensure_ascii=False)
+        assert "S1" not in json.dumps(card, ensure_ascii=False)
+
+        events2 = _resume(
+            client,
+            token,
+            project="disclosure_chat",
+            approval_id=card["approval_id"],
+            approved=True,
+        )
+        assert events2[-1]["data"]["via"] in {"llm", "tool"}
+        from rnaseq_agent.model_data_grants import grant_record_path, load_grant
+
+        grant_files = list((tmp_path / "disclosure_chat" / ".model_data_grants").glob("*.json"))
+        assert len(grant_files) == 1
+        grant_id = load_grant(tmp_path / "disclosure_chat", json.loads(grant_files[0].read_text(encoding="utf-8"))["grant_id"])
+        assert grant_id.status == "approved"
+        assert grant_id.fields == ("sample_ids",)
+        assert "S1" not in grant_files[0].read_text(encoding="utf-8")
+
     def test_rejected_tool_never_writes(self, client, tmp_path, monkeypatch) -> None:
         token = _token(client)
         _create_project(client, token, "tool_b")

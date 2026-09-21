@@ -2169,6 +2169,43 @@ def create_app(
         from .agent_graph import sqlite_checkpointer_for
         from .chat_graph import build_chat_graph, chat_thread_config
 
+        def _request_disclosure(
+            disclosure_project_dir: Path,
+            disclosure_project_id: str,
+            disclosure_thread_id: str,
+            arguments: dict[str, Any],
+        ) -> dict[str, Any]:
+            fields = arguments.get("fields") if isinstance(arguments, dict) else None
+            purpose = arguments.get("purpose") if isinstance(arguments, dict) else None
+            if fields != ["sample_ids"] or not isinstance(purpose, str):
+                raise DataGrantError(
+                    "unsupported model data scope",
+                    code=MODEL_DATA_SCOPE_UNSUPPORTED,
+                    grant_id="",
+                )
+            grant = issue_grant_request(
+                disclosure_project_dir,
+                project_id=disclosure_project_id,
+                thread_id=disclosure_thread_id,
+                fields=("sample_ids",),
+                purpose=purpose,
+                connection_store_dir=connection_file_path().parent,
+            )
+            card = build_disclosure_card(
+                disclosure_project_dir,
+                grant.grant_id,
+                connection_store_dir=connection_file_path().parent,
+            )
+            return {"grant_id": grant.grant_id, "card": card}
+
+        def _decide_disclosure(
+            disclosure_project_dir: Path,
+            grant_id: str,
+            approved: bool,
+        ) -> dict[str, Any]:
+            grant = decide_grant(disclosure_project_dir, grant_id, approved=approved)
+            return {"status": grant.status, "error_code": grant.error_code}
+
         config = chat_thread_config(project_id, thread_id)
         with sqlite_checkpointer_for(project_dir) as checkpointer:
             graph = build_chat_graph(
@@ -2186,6 +2223,8 @@ def create_app(
                 # graph boundary. A card parked in a durable checkpoint cannot
                 # retain broader authority after the user tightens the mode.
                 tool_mode_reader=_live_llm_tool_mode,
+                disclosure_requester=_request_disclosure,
+                disclosure_decider=_decide_disclosure,
             )
             if resume is not None:
                 from langgraph.types import Command
@@ -2194,14 +2233,21 @@ def create_app(
                 # issuing Command(resume).  A consumed/old/cross-thread card has
                 # no authority even if it still exists in a browser tab.
                 snapshot = graph.get_state(config)
-                approval_context = (snapshot.values or {}).get("approval_context") or {}
+                snapshot_values = snapshot.values or {}
+                approval_context = snapshot_values.get("approval_context") or {}
+                disclosure_context = snapshot_values.get("disclosure_context") or {}
                 expected_id = (
                     str(approval_context.get("approval_id") or "")
                     if isinstance(approval_context, dict)
                     else ""
                 )
+                if not expected_id and isinstance(disclosure_context, dict):
+                    expected_id = str(disclosure_context.get("approval_id") or "")
                 supplied_id = str(resume.get("approval_id") or "")
-                waiting_confirmation = "confirmation" in tuple(snapshot.next or ())
+                waiting_confirmation = any(
+                    node in tuple(snapshot.next or ())
+                    for node in ("confirmation", "disclosure_confirmation")
+                )
                 if (
                     not waiting_confirmation
                     or not expected_id

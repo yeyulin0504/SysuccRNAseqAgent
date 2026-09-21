@@ -290,6 +290,34 @@ _SAMPLE_PATCH_SCHEMA: dict[str, Any] = {
 
 
 TOOL_SPECS: dict[str, ToolSpec] = {
+    "request_data_disclosure": ToolSpec(
+        name="request_data_disclosure",
+        label="申请精确样本信息披露",
+        description=(
+            "申请一次性向模型披露本地样本 ID。只允许 fields=[sample_ids]，"
+            "需要用户单独确认；不能申请 FASTQ 文件名、远程路径、报告正文，"
+            "也不能在参数中填写任何精确值。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["sample_ids"]},
+                    "minItems": 1,
+                    "maxItems": 1,
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": "简短用途类别说明，不要填写样本名、路径或文件名",
+                },
+            },
+            "required": ["fields", "purpose"],
+            "additionalProperties": False,
+        },
+        risk=RISK_WRITE,
+        policy=POLICY_SOLO,
+    ),
     "read_project_state": ToolSpec(
         name="read_project_state",
         label="读取项目状态",
@@ -761,6 +789,16 @@ def validate_call(name: str, arguments: dict[str, Any]) -> list[str]:
         error = _absolute_posix_path_error(arguments.get("path"), "path")
         if error:
             problems.append(error)
+
+    if name == "request_data_disclosure":
+        fields = arguments.get("fields")
+        purpose = arguments.get("purpose")
+        if fields != ["sample_ids"]:
+            problems.append("request_data_disclosure 只允许 fields=[sample_ids]。")
+        if not isinstance(purpose, str) or not 1 <= len(purpose.strip()) <= 240:
+            problems.append("purpose 必须是 1 到 240 个字符的简短说明。")
+        elif any(ch in purpose for ch in ("/", "\\", "\n", "\r", "\x00")) or ".fastq" in purpose.lower() or ".fq" in purpose.lower():
+            problems.append("purpose 不得包含路径、文件名或 FASTQ 信息。")
 
     if name == "write_project_config":
         problems.extend(_validate_write_config(arguments))
