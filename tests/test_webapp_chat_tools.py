@@ -625,6 +625,48 @@ class TestConfirmCardInChatPage:
         assert "resp.body.getReader()" not in dispatch, dispatch
 
 
+class TestDisclosureCardInChatPage:
+    """模型数据披露确认卡必须与普通工具确认卡分开渲染。"""
+
+    def test_page_has_a_distinct_disclosure_card_renderer(self, client) -> None:
+        page = client.get("/chat").text
+        assert "function renderDisclosureCard" in page
+        assert "disclosure-card" in page
+        handler = page.split("function handleEvent")[1].split("function showStreamError")[0]
+        assert 'data.type === "model_data_disclosure_confirmation"' in handler
+        assert "renderDisclosureCard(data)" in handler
+
+    def test_disclosure_card_renders_metadata_only(self, client) -> None:
+        page = client.get("/chat").text
+        card = page.split("function renderDisclosureCard")[1].split("function resolveConfirm")[0]
+        for marker in (
+            "fields",
+            "record_counts",
+            "provider",
+            "provider_config_revision",
+            "revisions",
+            "expires_at",
+            "purpose_category",
+        ):
+            assert marker in card, marker
+        assert "payload.values" not in card
+        assert "payload.path" not in card
+        assert "payload.source_ref" not in card
+        assert "grant_id" not in card
+        assert "textContent" in card or "escapeHtml" in card
+
+    def test_disclosure_result_is_transient_and_escaped(self, client) -> None:
+        page = client.get("/chat").text
+        assert "function renderDisclosureResult" in page
+        handler = page.split("function handleEvent")[1].split("function showStreamError")[0]
+        assert 'name === "disclosure_result"' in handler
+        assert "renderDisclosureResult(data)" in handler
+        result = page.split("function renderDisclosureResult")[1].split("function showStreamError")[0]
+        assert "textContent" in result
+        assert "loadMessages" not in result
+        assert "history" not in result.lower()
+
+
 class TestResumeEndpointValidation:
     def test_resume_requires_boolean_approved(self, client, token_factory=None) -> None:
         token = _token(client)

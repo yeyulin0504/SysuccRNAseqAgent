@@ -124,6 +124,20 @@
   .confirm-card .acts button.reject { background: transparent; border: 1px solid var(--err);
                                       color: var(--err); }
   .confirm-card .settled { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .disclosure-card { border: 1px solid rgba(9,105,218,.45); border-radius: 10px;
+                     background: rgba(9,105,218,.06); padding: 12px 14px; margin-top: 8px; }
+  .disclosure-card .head { font-size: 13px; font-weight: 600; color: var(--accent); margin-bottom: 8px; }
+  .disclosure-card .meta { display: grid; grid-template-columns: minmax(110px, auto) 1fr;
+                            gap: 5px 12px; border-top: 1px dashed rgba(9,105,218,.25);
+                            padding-top: 8px; font-size: 12px; }
+  .disclosure-card .meta .key { color: var(--muted); }
+  .disclosure-card .meta .value { color: var(--text); word-break: break-word; }
+  .disclosure-card .acts { display: flex; gap: 8px; margin-top: 10px; }
+  .disclosure-card .acts button { padding: 7px 16px; font-size: 13px; }
+  .disclosure-card .acts button.approve { background: var(--ok); color: #fff; }
+  .disclosure-card .acts button.reject { background: transparent; border: 1px solid var(--err); color: var(--err); }
+  .disclosure-result { margin-top: 10px; border-left: 3px solid var(--accent); padding: 8px 10px;
+                       background: var(--accent-weak); white-space: pre-wrap; word-break: break-word; }
   .step { font-size: 12px; color: var(--muted); padding: 2px 0; }
   .gate { font-size: 12px; color: var(--warn); padding: 2px 0; }
   .muted { color: var(--muted); font-size: 12px; }
@@ -602,7 +616,11 @@ function handleEvent(block, onDone) {
 
   if (name === "step") upsertStep(data);
   else if (name === "delta") appendDelta(data.text || "");
-  else if (name === "confirm") renderConfirmCard(data);
+  else if (name === "confirm") {
+    if (data.type === "model_data_disclosure_confirmation") renderDisclosureCard(data);
+    else renderConfirmCard(data);
+  }
+  else if (name === "disclosure_result") renderDisclosureResult(data);
   else if (name === "error") showStreamError(data.message || "出错了");
   else if (name === "done") onDone({ event: name, data });
 }
@@ -656,7 +674,7 @@ function renderConfirmCard(payload) {
 
 /* 提交决定：卡片原地变成「已批准 / 已拒绝」，随后走同一套 SSE 处理。 */
 async function resolveConfirm(approved, approvalId) {
-  const card = document.getElementById("liveConfirm");
+  const card = document.getElementById("liveConfirm") || document.getElementById("liveDisclosure");
   if (!card || streaming) return;
   const noteEl = document.getElementById("liveConfirmNote");
   const note = noteEl ? noteEl.value.trim() : "";
@@ -673,6 +691,82 @@ async function resolveConfirm(approved, approvalId) {
   const live = document.getElementById("liveReply");
   if (live) live.removeAttribute("id");
   await dispatchResume(approved, note, approvalId);
+}
+
+/* 模型数据披露卡只展示授权元数据。精确值、grant id、路径和原始参数均不进入 DOM。 */
+function renderDisclosureCard(payload) {
+  const previous = document.getElementById("liveDisclosure");
+  if (previous) {
+    previous.removeAttribute("id");
+    const oldActs = previous.querySelector(".acts");
+    if (oldActs) oldActs.remove();
+    const replaced = document.createElement("div");
+    replaced.className = "settled";
+    replaced.textContent = "已被新的披露确认卡替换。";
+    previous.appendChild(replaced);
+  }
+  const bubble = document.getElementById("liveReply");
+  if (!bubble) return;
+  bubble.textContent = "";
+  const card = document.createElement("div");
+  card.className = "disclosure-card";
+  card.id = "liveDisclosure";
+
+  const head = document.createElement("div");
+  head.className = "head";
+  head.textContent = "模型数据披露确认";
+  card.appendChild(head);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const provider = payload && payload.provider && typeof payload.provider === "object" ? payload.provider : {};
+  const revisions = payload && payload.revisions && typeof payload.revisions === "object" ? payload.revisions : {};
+  const fields = Array.isArray(payload && payload.fields) ? payload.fields.join(", ") : "";
+  const counts = payload && payload.record_counts && typeof payload.record_counts === "object"
+    ? Object.entries(payload.record_counts).map(([key, value]) => `${key}: ${value}`).join(", ") : "";
+  const providerSummary = [provider.provider, provider.origin, provider.model].filter(Boolean).join(" / ");
+  const revisionSummary = [payload && payload.provider_config_revision, revisions.project_revision,
+    revisions.sample_revision, revisions.policy_version ? `policy ${revisions.policy_version}` : ""]
+    .filter(Boolean).join(" · ");
+  [["字段", fields], ["数量", counts], ["提供方", providerSummary], ["版本", revisionSummary],
+   ["用途", payload && payload.purpose_category], ["有效期", payload && payload.expires_at]].forEach(([key, value]) => {
+    const keyEl = document.createElement("span");
+    keyEl.className = "key";
+    keyEl.textContent = String(key);
+    const valueEl = document.createElement("span");
+    valueEl.className = "value";
+    valueEl.textContent = String(value || "");
+    meta.appendChild(keyEl);
+    meta.appendChild(valueEl);
+  });
+  card.appendChild(meta);
+
+  const acts = document.createElement("div");
+  acts.className = "acts";
+  const approve = document.createElement("button");
+  approve.className = "approve";
+  approve.textContent = "批准披露";
+  approve.onclick = () => resolveConfirm(true, String(payload && payload.approval_id || ""));
+  const reject = document.createElement("button");
+  reject.className = "reject";
+  reject.textContent = "拒绝";
+  reject.onclick = () => resolveConfirm(false, String(payload && payload.approval_id || ""));
+  acts.appendChild(approve);
+  acts.appendChild(reject);
+  card.appendChild(acts);
+  bubble.appendChild(card);
+  scrollToBottom();
+}
+
+/* 精确响应只在当前 live turn 显示；重新加载消息时不会出现在 transcript/History。 */
+function renderDisclosureResult(payload) {
+  const bubble = document.getElementById("liveReply");
+  if (!bubble) return;
+  const panel = document.createElement("div");
+  panel.className = "disclosure-result";
+  panel.textContent = String(payload && payload.text || "");
+  bubble.appendChild(panel);
+  scrollToBottom();
 }
 
 /* 与 /api/chat/resume 打交道：与 dispatch 共用 SSE 解析与收尾逻辑。 */
