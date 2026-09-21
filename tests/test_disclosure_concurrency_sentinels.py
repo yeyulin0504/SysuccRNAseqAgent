@@ -144,6 +144,50 @@ def test_concurrent_exact_sends_dispatch_once_and_loser_is_consumed(tmp_path: Pa
     assert SAMPLE not in _grant_text(project, grant.grant_id)
 
 
+def test_successful_exact_projection_excludes_unapproved_secret_sentinels(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _project(tmp_path)
+    connection = _connection(tmp_path)
+    payload = json.loads((project / "project.json").read_text(encoding="utf-8"))
+    payload["server"] = {
+        "password": PASSWORD,
+        "api_key": API_KEY,
+        "private_key": PRIVATE_KEY,
+        "ciphertext": CIPHERTEXT,
+        "url": f"https://alice:{URL_USERINFO}@llm.example/v1",
+    }
+    payload["report"] = " ".join([PASSWORD, API_KEY, PRIVATE_KEY, CIPHERTEXT, URL_USERINFO])
+    (project / "project.json").write_text(json.dumps(payload), encoding="utf-8")
+    grant = _approved(project, connection)
+    seen_payloads = []
+
+    def safe_dispatch(self, request):
+        seen_payloads.append(dict(request.payload))
+        return iter([ProviderEvent("delta", "safe response", 1)])
+
+    monkeypatch.setattr(
+        "rnaseq_agent.model_provider.ModelProviderGateway.dispatch_exact",
+        safe_dispatch,
+    )
+    result = send_exact_disclosure(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        grant_id=grant.grant_id,
+        prompt="请核对样本命名",
+        connection_store_dir=connection,
+    )
+
+    assert result["ok"] is True
+    encoded_request = json.dumps(seen_payloads, ensure_ascii=False)
+    durable = _grant_text(project, grant.grant_id)
+    for sentinel in [PASSWORD, API_KEY, PRIVATE_KEY, CIPHERTEXT, URL_USERINFO]:
+        assert sentinel not in encoded_request
+        assert sentinel not in json.dumps(result, ensure_ascii=False)
+        assert sentinel not in durable
+
+
 @pytest.mark.parametrize(
     "case, mutate, project_id, thread_id, expected_code",
     [

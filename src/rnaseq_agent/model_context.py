@@ -396,7 +396,7 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                     ]
             result["summary"] = safe_summary
         else:
-            result.update({"state": str(full.get("state") or "unknown"), "has_session": bool(full.get("has_session"))})
+            result.update({"state": _safe_summary_enum("state", full.get("state") or "unknown"), "has_session": bool(full.get("has_session"))})
         return result
     if name == "browse_remote_samples":
         nested = full.get("result") if isinstance(full.get("result"), Mapping) else full
@@ -420,24 +420,25 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                 "source_ref": source_ref}
     if name == "refresh_project_status":
         status = full.get("status") if isinstance(full.get("status"), Mapping) else {}
-        safe_status = {"state": str(status.get("state") or full.get("run_state") or "unknown")}
+        safe_status = {"state": _safe_summary_enum("state", status.get("state") or full.get("run_state") or "unknown")}
         message = str(status.get("message") or "")
         if message.startswith("Remote state: "):
             safe_status["message"] = "Remote state: " + safe_status["state"]
-        result = {"ok": ok, "state": str(full.get("state") or "unknown"),
-                "run_state": str(full.get("run_state") or status.get("state") or "unknown"),
-                "stage": str(status.get("stage") or ""), "artifact_present": bool(status.get("artifact_present")),
+        stage = str(status.get("stage") or "").strip().lower()
+        result = {"ok": ok, "state": _safe_summary_enum("state", full.get("state") or "unknown"),
+                "run_state": _safe_summary_enum("state", full.get("run_state") or status.get("state") or "unknown"),
+                "stage": stage if stage in _SUMMARY_STAGE_NAMES else "unknown", "artifact_present": bool(status.get("artifact_present")),
                 "status": safe_status}
         return result
     if name == "get_project_report":
-        return {"ok": ok, "state": str(full.get("state") or "unknown"), "generated": ok,
+        return {"ok": ok, "state": _safe_summary_enum("state", full.get("state") or "unknown"), "generated": ok,
                 "present": bool(full.get("report") or full.get("report_path")),
                 "validated": bool(full.get("validated")),
                 "report_hash": _short_hash(full.get("report") or full.get("report_path") or "")}
     result: dict[str, Any] = {"ok": ok}
     for key in ("state", "run_state", "gate_ok", "confirmation_required"):
         if key in full and isinstance(full.get(key), (str, bool)):
-            result[key] = full[key]
+            result[key] = _safe_summary_enum("state", full[key]) if key in {"state", "run_state"} else full[key]
     for key in ("sample_count", "directory_count", "unmatched_count", "record_count"):
         if key in full:
             result[key] = _safe_int(full.get(key))

@@ -125,6 +125,8 @@ FORBIDDEN_SENTINELS = (
     "PATIENT_SENTINEL_73", "TUMOR_SENTINEL_R1.fastq.gz",
     "/restricted/SENTINEL_73/fastq", "HOST_SENTINEL_73",
     "USER_SENTINEL_73", "JOB_SENTINEL_73", "API_KEY_SENTINEL_73",
+    "PASSWORD_SENTINEL_73", "PRIVATE_KEY_SENTINEL_73",
+    "CIPHERTEXT_SENTINEL_73", "URL_PASSWORD_SENTINEL_73",
 )
 
 
@@ -136,7 +138,14 @@ def test_default_summary_keeps_scientific_counts_but_no_exact_values(tmp_path: P
     project_dir = tmp_path / "project-73"
     _seed_revision_project(project_dir)
     project = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
-    project["server"] = {"host": "HOST_SENTINEL_73", "user": "USER_SENTINEL_73", "remote_workdir": "/restricted/SENTINEL_73/fastq"}
+    project["server"] = {
+        "host": "HOST_SENTINEL_73", "user": "USER_SENTINEL_73",
+        "password": "PASSWORD_SENTINEL_73",
+        "private_key": "PRIVATE_KEY_SENTINEL_73",
+        "ciphertext": "CIPHERTEXT_SENTINEL_73",
+        "api_base": "https://alice:URL_PASSWORD_SENTINEL_73@llm.example/v1",
+        "remote_workdir": "/restricted/SENTINEL_73/fastq",
+    }
     project["status"]["job_id"] = "JOB_SENTINEL_73"
     _write_json(project_dir / "project.json", project)
     summary = build_safe_project_summary(project_dir)
@@ -146,6 +155,33 @@ def test_default_summary_keeps_scientific_counts_but_no_exact_values(tmp_path: P
     assert summary["sample_aliases"] == ["sample_001"]
     assert summary["sequencing"] == {"layout": "paired", "strandedness": "unknown"}
     assert all(value not in encoded for value in FORBIDDEN_SENTINELS)
+
+
+def test_ordinary_tool_projection_excludes_secret_sentinels_from_all_channels() -> None:
+    full = {
+        "ok": True,
+        "state": "PASSWORD_SENTINEL_73",
+        "run_state": "PRIVATE_KEY_SENTINEL_73",
+        "status": {
+            "state": "CIPHERTEXT_SENTINEL_73",
+            "stage": "URL_PASSWORD_SENTINEL_73",
+            "message": "https://alice:URL_PASSWORD_SENTINEL_73@llm.example/v1",
+        },
+        "reply": "PASSWORD_SENTINEL_73",
+        "path": "/restricted/SENTINEL_73/fastq",
+        "host": "HOST_SENTINEL_73",
+        "user": "USER_SENTINEL_73",
+        "secret": "API_KEY_SENTINEL_73",
+        "private_key": "PRIVATE_KEY_SENTINEL_73",
+        "ciphertext": "CIPHERTEXT_SENTINEL_73",
+    }
+    for name in TOOL_SPECS:
+        projected = project_tool_result_for_model(name, full)
+        logged = project_tool_result_for_log(name, full)
+        encoded = _serialized(projected)
+        logged_encoded = _serialized(logged)
+        assert all(value not in encoded for value in FORBIDDEN_SENTINELS)
+        assert all(value not in logged_encoded for value in FORBIDDEN_SENTINELS)
 
 
 def test_every_tool_result_uses_explicit_safe_projection() -> None:
