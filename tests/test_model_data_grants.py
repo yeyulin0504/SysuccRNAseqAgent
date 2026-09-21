@@ -298,12 +298,14 @@ def test_locked_connection_snapshot_reads_one_locked_store_and_exposes_revision(
         assert "runtime-secret" in snapshot.credentials.known_secrets
 
 
-def test_claim_holds_connection_snapshot_through_prepare_and_stream_start(tmp_path):
+def test_claim_holds_connection_snapshot_through_prepare_and_stream_start(tmp_path, monkeypatch):
     project = _project(tmp_path)
     connection = _connection(tmp_path)
     grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", connection_store_dir=connection, now=NOW)
     decide_grant(project, grant.grant_id, approved=True, now=NOW)
     seen = []
+    import rnaseq_agent.model_data_grants as grants_module
+    monkeypatch.setattr(grants_module, "_provider_snapshot", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("claim must use locked snapshot")))
 
     @mark_exact_prepare
     def prepare(claim, snapshot):
