@@ -991,11 +991,12 @@ class TestConnectionEditIsAlwaysSolo:
         # 连接配置永远是 solo：不许和别的配置合并。
         assert card["policy"] == "solo", card
         description = card["calls"][0]["description"]
-        assert "old.example" in description, description
-        assert "new.example" in description, description
-        assert "→" in description, description
-        # 线程数的旧值也要写出来。
-        assert "8" in description and "32" in description, description
+        # Durable cards carry only the changed field categories. Exact host
+        # values stay request-local and require a separate disclosure flow.
+        assert "old.example" not in description, description
+        assert "new.example" not in description, description
+        assert "修改字段" in description and "host" in description and "threads" in description
+        assert "精确值按需确认" in description, description
 
     def test_connection_card_uses_the_effective_global_old_value(
         self, client, tmp_path, monkeypatch
@@ -1034,9 +1035,10 @@ class TestConnectionEditIsAlwaysSolo:
         card = _confirm_event(events)
         assert card is not None, events
         description = card["calls"][0]["description"]
-        assert "global.example" in description, description
+        assert "global.example" not in description, description
         assert "old.example" not in description, description
-        assert "64" in description and "32" in description, description
+        assert "修改字段" in description and "host" in description and "threads" in description
+        assert "精确值按需确认" in description, description
 
     def test_connection_edit_is_not_merged_with_other_writes(self, client, tmp_path, monkeypatch) -> None:
         """一轮里同时改连接和别的配置：连接必须独占一张卡。"""
@@ -1143,9 +1145,13 @@ class TestEditSamplesOnExistingSession:
         events = _stream(client, token, "把 S1 分到 treat", project="edit_a")
         card = _confirm_event(events)
         assert card is not None, events
-        # 卡片上要看得见这一条是从哪个组改到哪个组。
-        assert "control" in card["calls"][0]["description"], card
-        assert "treat" in card["calls"][0]["description"], card
+        # Durable cards show the count and changed field; exact sample and
+        # condition values stay request-local.
+        description = card["calls"][0]["description"]
+        assert "control" not in description, card
+        assert "treat" not in description, card
+        assert "修改样本：1 个" in description, card
+        assert "修改字段：condition" in description, card
 
         _resume(
             client,
@@ -1211,8 +1217,12 @@ class TestEditReference:
         events = _stream(client, token, "GTF 换成 /ref/gencode.v99.gtf", project="ref_a")
         card = _confirm_event(events)
         assert card is not None, events
-        # 模型用的短参数名 gtf，卡片上要显示成 config 里那一位的旧值 → 新值。
-        assert "/ref/gencode.v99.gtf" in card["calls"][0]["description"], card
+        # The durable card carries the reference field category, while the
+        # exact path remains request-local.
+        description = card["calls"][0]["description"]
+        assert "/ref/gencode.v99.gtf" not in description, card
+        assert "修改字段：gtf" in description, card
+        assert "精确参考文件路径按需确认" in description, card
 
         _resume(
             client,
@@ -1271,7 +1281,10 @@ class TestDiffexpAndCmsTools:
         card = _confirm_event(events)
         assert card is not None, events
         assert card["policy"] == "batch", card
-        assert "control" in card["calls"][0]["description"], card
+        description = card["calls"][0]["description"]
+        assert "control" not in description, card
+        assert "更新对照组" in description, card
+        assert "精确分组名按需确认" in description, card
 
         _resume(
             client,
