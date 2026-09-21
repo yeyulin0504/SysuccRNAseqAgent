@@ -201,13 +201,12 @@ def test_every_tool_result_uses_explicit_safe_projection() -> None:
     browse = project_tool_result_for_model("browse_remote_samples", full)
     assert browse == {"ok": True, "sample_count": 1, "paired_count": 0,
                       "unmatched_count": 0, "directory_count": 1,
-                      "truncated": False, "authorization": "inside_approved_root",
-                      "source_ref": full["source_ref"]}
+                      "truncated": False, "authorization": "inside_approved_root"}
 
     hostile_source = project_tool_result_for_model(
         "browse_remote_samples", {**full, "source_ref": "/restricted/SENTINEL_73"}
     )
-    assert hostile_source["source_ref"] == ""
+    assert "source_ref" not in hostile_source
 
 
 def test_read_project_state_rebuilds_nested_summary_without_trusting_values() -> None:

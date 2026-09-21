@@ -280,6 +280,7 @@ def test_provider_summary_is_deidentified():
     text = repr(summary)
     for secret in ("secret.fastq", "/data/root", "root-id", "unique-sample-basename", "example.test", "alice"):
         assert secret not in text
+    assert "source_ref" not in summary
 
 
 def test_execution_budget_reuses_deadline_and_subtracts_raw_bytes():

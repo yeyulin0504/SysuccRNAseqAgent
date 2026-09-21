@@ -275,12 +275,11 @@ def resolve_remote_directory(
     return canonical
 
 
-def provider_browse_summary(result: BrowseResult, source_ref: str | None) -> dict[str, object]:
+def provider_browse_summary(result: BrowseResult, _source_ref: str | None) -> dict[str, object]:
     return {
         "ok": result.ok,
         "blocked": result.blocked,
         "error_code": result.error_code,
-        "source_ref": source_ref if result.ok else None,
         "directory_count": len(result.groups),
         "sample_count": result.sample_count,
         "unmatched_count": result.unmatched_count,

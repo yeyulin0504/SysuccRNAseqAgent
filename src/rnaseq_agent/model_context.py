@@ -49,7 +49,6 @@ _SAFE_CONDITION_LABELS = frozenset({
     "baseline", "case", "control", "disease", "healthy", "ko", "knockout",
     "normal", "treated", "treatment", "tumor", "untreated", "vehicle", "wildtype", "wt",
 })
-_SOURCE_REF_RE = re.compile(r"^src_[0-9a-f]{32}$")
 
 
 class EphemeralArgumentError(ValueError):
@@ -438,14 +437,10 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
                 paired += sum(1 for sample in (group.get("samples") or []) if isinstance(sample, Mapping) and sample.get("fastq_2"))
         paired = paired or _safe_int(nested.get("paired_count"))
         directory_count = len(groups) or _safe_int(nested.get("directory_count")) or (1 if full.get("scanned_path") else 0)
-        source_ref = str(full.get("source_ref") or nested.get("source_ref") or "")
-        if not _SOURCE_REF_RE.fullmatch(source_ref):
-            source_ref = ""
         return {"ok": ok, "sample_count": sample_count, "paired_count": paired,
                 "unmatched_count": _safe_int(nested.get("unmatched_count")),
                 "directory_count": directory_count, "truncated": bool(nested.get("truncated")),
-                "authorization": str(nested.get("authorization") or ("inside_approved_root" if full.get("scanned_path") else "")),
-                "source_ref": source_ref}
+                "authorization": str(nested.get("authorization") or ("inside_approved_root" if full.get("scanned_path") else ""))}
     if name == "refresh_project_status":
         status = full.get("status") if isinstance(full.get("status"), Mapping) else {}
         safe_status = {"state": _safe_summary_enum("state", status.get("state") or full.get("run_state") or "unknown")}
