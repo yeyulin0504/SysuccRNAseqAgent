@@ -18,6 +18,7 @@
 - remote scan 的结构化 UI 可以显示本地精确信息，provider 默认只收到数量、配对统计和不透明 `source_ref`。
 - metadata-only grant store 已具备 TTL、project/thread/provider/tool-mode/revision 绑定、单次 claim 和 terminal 状态。
 - local `sample_ids` 已有独立的结构化 Web API：创建元数据卡、布尔批准/拒绝、一次性 exact provider send；返回正文只存在当前请求，不写入 History、ChatState 或 grant JSON。
+- 当前发布门禁继续把 `sample_ids` 以外的字段在 issue/load/claim/send 边界 fail closed；底层字段枚举能力不表示对应 scope 已上线。
 
 仍然明确关闭或未接通的部分：
 
@@ -58,6 +59,13 @@
 ### 阶段 C：local FASTQ/report scopes
 
 在阶段 B 稳定后分别开放 `fastq_filenames` 和 `report_excerpt`，每个字段类别单独授权，不能从 sample grant 自动扩大。报告只允许 bounded excerpt，不能发送完整 report、stdout、stderr 或 traceback。
+
+阶段 C 必须先经过独立 scope 文档和 RED 矩阵：
+
+- [Local FASTQ filename scope](../specs/2026-09-21-local-fastq-filenames-scope.md) 只讨论项目本地、非 remote-origin 的 basename；带 `source_ref`、`remote_data_dir` 或远程扫描 provenance 的行仍然拒绝。
+- [Report excerpt scope](../specs/2026-09-21-report-excerpt-scope.md) 要求报告章节 allowlist、敏感值清除和日志/traceback/full-report 拒绝，不能用“截取前 4000 字”代替安全定义。
+
+这两个 spec 目前都是 proposal，不能被实现状态或 UI 文案解释为已授权。
 
 ### 阶段 D：approved-root remote exact
 
@@ -101,3 +109,4 @@ exact 文本只进入当前 SSE `disclosure_result` 事件，不写入模型上�
 - `docs/llm_tool_permission_model.md` 描述长期权限契约；本路线图记录当前实现状态和阶段门槛。
 - 每完成一个阶段，更新本路线图的基线、测试命令和明确关闭项，再更新 `.superpowers/sdd/2026-09-21-night-run-hardening/progress.md`。
 - 任何把 `remote_paths`、任意文件、凭据、完整报告或 shell 输出加入 exact scope 的改动，都必须另写 spec，不能通过扩大现有 schema 实现。
+- `fastq_filenames` 与 `report_excerpt` 也必须分别满足 issue/load/claim/send、并发、重放、secret scanner 和持久化隔离测试后才能启用；remote exact 仍需 approved-root/source-ref consumer 的独立复审。

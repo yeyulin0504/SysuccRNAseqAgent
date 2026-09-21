@@ -96,6 +96,13 @@ JSON 布尔批准/拒绝，最后调用一次性 send endpoint。send endpoint �
 当前 HTTP 请求；它不会追加到对话 History、ChatState、checkpoint、通用日志或 grant
 JSON。普通工具确认卡不能创建这个 grant，也不能借助它扩大写入或执行权限。
 
+当前版本还要求 unsupported disclosure field 在 issue、load、claim 和 send 四个边界
+都直接拒绝；底层 extractor 能枚举某个字段不代表该字段已经成为产品能力。尤其是
+FASTQ 行如果带有 remote scan provenance、`source_ref` 或 `remote_data_dir`，不能被
+当作 local filename scope。provider exact response 的 HTTP/SSE 结果必须使用
+`Cache-Control: no-store, private` 和 `Pragma: no-cache`，避免浏览器或代理缓存一次性
+精确信息。
+
 ## 三个相互独立的权限轴
 
 远程数据根、工具模式和模型数据披露回答的是三个不同问题，不能由模型调用一个
