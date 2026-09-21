@@ -771,9 +771,16 @@ def _ensure_runtime_available(config: Mapping[str, Any]) -> dict[str, str]:
     try:
         transport = create_remote_transport(config_dict)
         if release_mode:
-            image = shell_quote(container["image_path"])
+            if container["engine"] == "docker":
+                image = shell_quote(container["image_uri"])
+                digest_command = (
+                    f"docker image inspect --format '{{{{index .RepoDigests 0}}}}' {image}"
+                )
+            else:
+                image = shell_quote(container["image_path"])
+                digest_command = f"sha256sum {image}"
             digest_result = transport.execute(
-                "; ".join(["set -e", *init_commands, f"sha256sum {image}"])
+                "; ".join(["set -e", *init_commands, digest_command])
             )
             actual_digest = digest_result.stdout.strip().split(maxsplit=1)[0].lower()
             if (
@@ -797,11 +804,13 @@ def _ensure_runtime_available(config: Mapping[str, Any]) -> dict[str, str]:
         )
         if container["enabled"]:
             engine = shell_quote(container["engine"])
-            image = shell_quote(container["image_path"])
-            probe = (
-                f"command -v {engine} >/dev/null 2>&1 && [ -r {image} ] && "
-                f"{wrap_command(config_dict, 'Rscript')} -e {shell_quote(r_expression)}"
-            )
+            if container["engine"] == "docker":
+                image = shell_quote(container["image_uri"])
+                availability = f"command -v docker >/dev/null 2>&1 && docker image inspect {image} >/dev/null 2>&1"
+            else:
+                image = shell_quote(container["image_path"])
+                availability = f"command -v {engine} >/dev/null 2>&1 && [ -r {image} ]"
+            probe = f"{availability} && {wrap_command(config_dict, 'Rscript')} -e {shell_quote(r_expression)}"
         else:
             probe = (
                 "command -v Rscript >/dev/null 2>&1 && "
