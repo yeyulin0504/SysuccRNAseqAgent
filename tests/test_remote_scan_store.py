@@ -1,4 +1,6 @@
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import pytest
 
@@ -114,6 +116,38 @@ def test_consume_remote_scan_reuses_durable_claim_after_callback_failure(tmp_pat
         apply=fail_once,
     )
     assert claims[0] == claims[1]
+
+
+def test_concurrent_consumers_have_one_callback_and_stable_used_result(tmp_path):
+    ref, policy, context, group = _stored_case(tmp_path)
+    entered = Event()
+    release = Event()
+    calls = []
+
+    def apply(selected, claim):
+        calls.append((selected.group_id, claim))
+        entered.set()
+        assert release.wait(timeout=5)
+
+    kwargs = dict(
+        project_dir=tmp_path,
+        scan_id=ref.scan_id,
+        result_revision=ref.result_revision,
+        group_id=group.group_id,
+        expected_policy=policy,
+        expected_context=context,
+        apply=apply,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(consume_remote_scan, **kwargs)
+        assert entered.wait(timeout=5)
+        second = pool.submit(consume_remote_scan, **kwargs)
+        release.set()
+        assert first.result(timeout=5) == group
+        with pytest.raises(ValueError, match="REMOTE_SCAN_REFERENCE_USED"):
+            second.result(timeout=5)
+
+    assert len(calls) == 1
 
 
 def test_consume_remote_scan_fails_closed_for_revoked_or_changed_root(tmp_path):

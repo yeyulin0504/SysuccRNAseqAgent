@@ -754,6 +754,27 @@ def browse_remote_fastqs(
 
     try:
         payload = scanner(canonical_target, selected[1], runner, transport)
+        # The remote scanner executes outside the local policy lock.  Re-read
+        # the authorization snapshot after it returns so a root revocation or
+        # policy revision that happens during the scan cannot be published as
+        # a trusted result.
+        try:
+            final_policy = policy_reader()
+        except Exception:
+            final_policy = None
+        if not _same_authorization_snapshot(final_policy, initial, selected[0]):
+            return _result(
+                context=context,
+                event_id=event_id,
+                started_at=started_at,
+                identity=identity,
+                requested_path=target,
+                canonical_target=canonical_target,
+                root_id=selected[0].root_id,
+                revision=initial.revision,
+                error_code=REMOTE_POLICY_CHANGED,
+                message="Remote browse policy changed; retry the request.",
+            )
         payload = _rebind_group_ids(payload, initial.revision, selected[0].root_id, event_id)
         _validate_scan_payload(payload)
     except CommandTimeoutError:

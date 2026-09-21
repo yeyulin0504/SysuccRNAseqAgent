@@ -20,6 +20,7 @@ from rnaseq_agent.remote_browse import (
     scan_result_from_canonical_files,
     scan_remote_fastqs,
     REMOTE_PATH_ESCAPE,
+    REMOTE_POLICY_CHANGED,
     REMOTE_SCAN_INVALID_OUTPUT,
     ScanPathEscape,
     ScanPython3Required,
@@ -156,6 +157,73 @@ def test_exact_root_authorizes_injected_scanner():
     assert calls == [("/data/root", "/data/root")]
 
 
+def test_stale_approved_root_fails_closed_before_target_scan():
+    root = _root()
+    policy = _policy(root)
+
+    class Transport:
+        def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes):
+            return _command_result("/data/moved\n")
+
+    scanner = Spy()
+    result = browse_remote_fastqs(
+        "/data/root", CONTEXT, lambda: policy, lambda _: Transport(), scanner
+    )
+    assert result.error_code == "REMOTE_ROOT_STALE"
+    assert scanner.calls == 0
+
+
+def test_symlinked_target_escape_is_rejected_without_partial_scan():
+    root = _root()
+    policy = _policy(root)
+
+    class Transport:
+        def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes):
+            if "realpath -e" in command:
+                if "-- /data/root)" in command:
+                    return _command_result("/data/root\n")
+                return _command_result("/data/outside\n")
+            raise AssertionError(command)
+
+    scanner = Spy()
+    result = browse_remote_fastqs(
+        "/data/root/run", CONTEXT, lambda: policy, lambda _: Transport(), scanner
+    )
+    assert result.error_code == "REMOTE_PATH_ESCAPE"
+    assert scanner.calls == 0
+
+
+def test_nested_approved_root_uses_longest_canonical_match():
+    outer = _root("/data", root_id="outer")
+    inner = _root("/data/root", root_id="inner")
+    policy = _policy(outer, inner)
+
+    class Transport:
+        def execute_bounded(self, command, *, absolute_deadline, max_capture_bytes):
+            if "-- /data/root/run)" in command:
+                return _command_result("/data/root/run\n")
+            if "-- /data/root)" in command:
+                return _command_result("/data/root\n")
+            if "-- /data)" in command:
+                return _command_result("/data\n")
+            raise AssertionError(command)
+
+    payload = BrowseScanPayload(
+        groups=(BrowseDirectoryGroup("g1", "/data/root/run", (BrowseSampleRow("s", "a_R1.fastq", None),), ()),),
+        sample_count=1,
+        unmatched_count=0,
+        truncated=False,
+    )
+    seen = []
+    result = browse_remote_fastqs(
+        "/data/root/run", CONTEXT, lambda: policy, lambda _: Transport(),
+        lambda target, canonical_root, *_: (seen.append((target, canonical_root)) or payload),
+    )
+    assert result.ok is True
+    assert result.authorization["root_id"] == "inner"
+    assert seen == [("/data/root/run", "/data/root")]
+
+
 def test_policy_recheck_prevents_scan():
     root = _root()
     policy = _policy(root)
@@ -166,6 +234,33 @@ def test_policy_recheck_prevents_scan():
     result = browse_remote_fastqs("/data/root", CONTEXT, lambda: next(policies), lambda _: transport, scanner)
     assert result.error_code == "REMOTE_POLICY_CHANGED"
     assert scanner.calls == 0
+
+
+def test_policy_change_during_scan_rejects_result_after_scanner_returns():
+    root = _root()
+    policy = _policy(root)
+    changed = BrowsePolicy(IDENTITY, (), "sha256:changed", True)
+    current = {"value": policy}
+    transport = ScriptedTransport({"/data/root": _command_result("/data/root\n")})
+    payload = BrowseScanPayload(
+        groups=(BrowseDirectoryGroup("g1", "/data/root", (BrowseSampleRow("s", "a_R1.fastq", None),), ()),),
+        sample_count=1,
+        unmatched_count=0,
+        truncated=False,
+    )
+
+    def scanner(*args):
+        current["value"] = changed
+        return payload
+
+    result = browse_remote_fastqs(
+        "/data/root", CONTEXT, lambda: current["value"], lambda _: transport, scanner
+    )
+
+    assert result.ok is False
+    assert result.error_code == REMOTE_POLICY_CHANGED
+    assert result.groups == ()
+    assert result.sample_count == 0
 
 
 def test_provider_summary_is_deidentified():
