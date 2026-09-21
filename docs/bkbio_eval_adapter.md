@@ -80,18 +80,19 @@ Rscript 前再次计算并核对镜像文件 hash，缩小探针通过后镜像�
 
 首版只支持原始整数 counts 直入，并沿用主项目当前冻结的 DESeq2 门禁：
 
-- `design` 必须等价于 `~ condition`；
-- `paired` 必须为 `false`；
-- 必须恰好有 reference/contrast 两组，且每组至少 3 个生物学重复；
+- 独立两组路线的 `design` 必须等价于 `~ condition`；
+- 配对路线必须显式声明具名 `paired_two_group`，并固定生成 `~ pair_id + condition`；
+- 配对路线要求至少 3 个完整 pair，每个 pair 恰好一条 reference 和一条 contrast，且
+  `min_count_prefilter` 必须为 `0`；不接受任意 R 公式或静默降级为独立两组；
+- 两条路线都必须恰好有 reference/contrast 两组；独立路线每组至少 3 个生物学重复；
 - `counts.tsv` 样本列必须与 `coldata.tsv` 的 `sample` 精确一致；
 - 当前真实 counts stage 未暴露 `min_count_prefilter`，因此该值必须为数值 `0` 或省略。
 
-paired 或多因素设计会在创建项目和远程执行之前写出严格的 `NOT_EVALUABLE` 结果并以
-退出码 `0` 返回。该结果只包含 `schema`、`analyzer`、`status`、`reason_code` 和可选
-`message`，不会伪造 project、contract、run 或 artifacts。输入文件缺失、JSON 损坏等
-畸形输入仍以非零退出码失败。因此当前 `L0_smoke_synthetic` 是首轮可执行
-目标；现有 TCGA（`~ patient + condition`）和 airway（`~ cell + condition`）L1 用例
-要等主项目真实 DESeq2 流程支持相应设计后才能接入。
+不具名的 paired 或其它多因素设计会在创建项目和远程执行之前写出严格的
+`NOT_EVALUABLE` 结果并以退出码 `0` 返回。该结果只包含 `schema`、`analyzer`、`status`、
+`reason_code` 和可选 `message`，不会伪造 project、contract、run 或 artifacts。输入文件
+缺失、JSON 损坏等畸形输入仍以非零退出码失败。Airway 的 `~ cell + condition` 只能通过
+具名 `paired_two_group` 路线接入；TCGA 等其它多因素设计仍保持拒绝。
 
 非零数值 `min_count_prefilter` 同样属于能力不支持，使用稳定
 `reason_code: unsupported_design` 结构化拒绝并返回 `0`。字符串、数组、对象、布尔值或
