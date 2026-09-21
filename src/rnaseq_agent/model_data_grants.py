@@ -34,6 +34,8 @@ from .model_disclosure import (
     MODEL_CONTEXT_SECRET_DETECTED,
     MODEL_PROVIDER_REQUEST_FAILED,
     GRANT_TTL_SECONDS,
+    DISCLOSURE_PURPOSE_CATEGORIES,
+    normalize_disclosure_purpose,
 )
 from .model_context import canonical_json_sha256, read_model_data_revisions
 from .model_provider import normalize_provider_config, provider_config_revision, provider_identity
@@ -404,6 +406,7 @@ def _to_payload(grant: DataDisclosureGrant) -> dict[str, Any]:
         "grant_id": grant.grant_id, "project_id": grant.project_id, "thread_id": grant.thread_id,
         "provider_identity": grant.provider_identity, "tool_mode": grant.tool_mode,
         "fields": list(grant.fields), "purpose_hash": grant.purpose_hash,
+        "purpose_category": grant.purpose_category,
         "issued_at": grant.issued_at, "expires_at": grant.expires_at,
         "policy_version": grant.policy_version, "revisions": {
             "project_revision": revisions.project_revision, "sample_revision": revisions.sample_revision,
@@ -458,6 +461,11 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
             raise ValueError
         issued_at, expires_at = value["issued_at"], value["expires_at"]
         issued, expires = _parse(issued_at), _parse(expires_at)
+        if "purpose_category" not in value:
+            raise ValueError
+        purpose_category = str(value.get("purpose_category") or "")
+        if purpose_category not in DISCLOSURE_PURPOSE_CATEGORIES:
+            raise ValueError
         if expires <= issued or not str(value["provider_identity"]).strip() or not str(value["tool_mode"]).strip() or not str(value["purpose_hash"]).strip():
             raise ValueError
         if not isinstance(value["record_counts"], dict):
@@ -510,7 +518,7 @@ def _from_payload(value: Mapping[str, Any], grant_id: str) -> DataDisclosureGran
             record_counts=counts, status=status,
             remote_scan_ref_hash=value.get("remote_scan_ref_hash"), decided_at=value.get("decided_at"),
             claimed_at=value.get("claimed_at"), consumed_at=value.get("consumed_at"), error_code=value.get("error_code"),
-            manifest=dict(manifest),
+            manifest=dict(manifest), purpose_category=purpose_category,
         )
     except DataGrantError:
         raise
@@ -533,7 +541,9 @@ def issue_grant_request(
     del scan_store_dir, runtime_secrets
     if source_ref is not None or not fields or len(set(fields)) != len(fields) or any(field not in _ENABLED_FIELDS for field in fields):
         raise DataGrantError("unsupported model data scope", code=MODEL_DATA_SCOPE_UNSUPPORTED, grant_id="")
-    if not isinstance(purpose, str) or not 1 <= len(purpose) <= 240:
+    try:
+        purpose_category = normalize_disclosure_purpose(purpose)
+    except ValueError:
         raise DataGrantError("invalid model data purpose", code=MODEL_DATA_GRANT_INVALID, grant_id="")
     if not isinstance(project_id, str) or not isinstance(thread_id, str) or not project_id.strip() or not thread_id.strip():
         raise DataGrantError("invalid model data binding", code=MODEL_DATA_GRANT_INVALID, grant_id="")
@@ -547,9 +557,10 @@ def issue_grant_request(
     grant = DataDisclosureGrant(
         grant_id=grant_id, project_id=project_id, thread_id=thread_id,
         provider_identity=snapshot.provider_identity.digest, tool_mode=snapshot.tool_mode,
-        fields=tuple(fields), purpose_hash=canonical_json_sha256({"purpose": purpose}),
+        fields=tuple(fields), purpose_hash=canonical_json_sha256({"purpose_category": purpose_category}),
         issued_at=_iso(issued), expires_at=_iso(issued + timedelta(seconds=GRANT_TTL_SECONDS)),
         policy_version=revisions.policy_version, revisions=revisions, record_counts=counts, status="pending",
+        purpose_category=purpose_category,
     )
     with project_state_lock(_lock_path(project_dir)):
         _write(grant_record_path(project_dir, grant_id), _to_payload(grant))

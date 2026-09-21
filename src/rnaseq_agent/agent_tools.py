@@ -797,8 +797,13 @@ def validate_call(name: str, arguments: dict[str, Any]) -> list[str]:
             problems.append("request_data_disclosure 只允许 fields=[sample_ids]。")
         if not isinstance(purpose, str) or not 1 <= len(purpose.strip()) <= 240:
             problems.append("purpose 必须是 1 到 240 个字符的简短说明。")
-        elif any(ch in purpose for ch in ("/", "\\", "\n", "\r", "\x00")) or ".fastq" in purpose.lower() or ".fq" in purpose.lower():
-            problems.append("purpose 不得包含路径、文件名或 FASTQ 信息。")
+        else:
+            from .model_disclosure import normalize_disclosure_purpose
+
+            try:
+                normalize_disclosure_purpose(purpose)
+            except ValueError:
+                problems.append("purpose 必须是受限的安全用途类别。")
 
     if name == "write_project_config":
         problems.extend(_validate_write_config(arguments))

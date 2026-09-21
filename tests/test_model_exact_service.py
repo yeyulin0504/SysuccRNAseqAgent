@@ -54,6 +54,7 @@ def test_disclosure_card_contains_metadata_only(tmp_path: Path) -> None:
     assert card["type"] == "model_data_disclosure_confirmation"
     assert card["fields"] == ["sample_ids"]
     assert card["record_counts"] == {"sample_ids": 1}
+    assert card["purpose_category"] == "sample_identity_check"
     assert "SENTINEL_SAMPLE_001" not in json.dumps(card, ensure_ascii=False)
     assert "SENTINEL_R1.fastq.gz" not in json.dumps(card, ensure_ascii=False)
     assert "purpose" not in card

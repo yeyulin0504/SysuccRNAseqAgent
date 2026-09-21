@@ -726,11 +726,16 @@ function renderDisclosureCard(payload) {
   const counts = payload && payload.record_counts && typeof payload.record_counts === "object"
     ? Object.entries(payload.record_counts).map(([key, value]) => `${key}: ${value}`).join(", ") : "";
   const providerSummary = [provider.provider, provider.origin, provider.model].filter(Boolean).join(" / ");
+  const purposeLabels = {
+    sample_identity_check: "核对样本标识",
+    sample_group_check: "核对样本分组",
+  };
+  const purposeCategory = purposeLabels[String(payload && payload.purpose_category || "")] || "受限用途";
   const revisionSummary = [payload && payload.provider_config_revision, revisions.project_revision,
     revisions.sample_revision, revisions.policy_version ? `policy ${revisions.policy_version}` : ""]
     .filter(Boolean).join(" · ");
-  [["字段", fields], ["数量", counts], ["提供方", providerSummary], ["版本", revisionSummary],
-   ["用途", payload && payload.purpose_category], ["有效期", payload && payload.expires_at]].forEach(([key, value]) => {
+   [["字段", fields], ["数量", counts], ["提供方", providerSummary], ["版本", revisionSummary],
+   ["用途", purposeCategory], ["有效期", payload && payload.expires_at]].forEach(([key, value]) => {
     const keyEl = document.createElement("span");
     keyEl.className = "key";
     keyEl.textContent = String(key);
@@ -741,6 +746,10 @@ function renderDisclosureCard(payload) {
     meta.appendChild(valueEl);
   });
   card.appendChild(meta);
+  const notice = document.createElement("div");
+  notice.className = "muted";
+  notice.textContent = "一次性授权：仅本次 provider 请求；不会启用工具调用；不会写入对话历史。失败或不确定时不会自动重试，需要重新发起。";
+  card.appendChild(notice);
 
   const acts = document.createElement("div");
   acts.className = "acts";

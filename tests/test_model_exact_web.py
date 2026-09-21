@@ -71,6 +71,34 @@ def test_data_disclosure_request_returns_metadata_card_only(tmp_path: Path, monk
     assert "SENTINEL_R1.fastq.gz" not in encoded
 
 
+def test_structured_disclosure_remains_an_explicit_human_entry_when_tool_mode_is_disabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
+    from rnaseq_agent.connection_store import save_llm
+
+    save_llm({
+        "enabled": True,
+        "api_base": "https://llm.example/v1",
+        "model": "test-model",
+        "api_key": "sk-test",
+        "tool_mode": "disabled",
+    })
+    app = create_app(workspace_dir=tmp_path / "workspace")
+    client = TestClient(app)
+    token = _token(client)
+    client.post("/api/projects", json={"project_id": "p1"}, headers=_headers(token))
+    _seed_project(tmp_path, "p1")
+
+    pending = client.post(
+        "/api/projects/p1/data-disclosures",
+        json={"thread_id": "main", "fields": ["sample_ids"], "purpose": "核对样本命名"},
+        headers=_headers(token),
+    )
+    assert pending.status_code == 200
+    assert pending.json()["card"]["tool_mode"] == "disabled"
+
+
 def test_data_disclosure_request_requires_existing_explicit_thread(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("RNASEQ_AGENT_HOME", str(tmp_path / "agent_home"))
     app = create_app(workspace_dir=tmp_path / "workspace")

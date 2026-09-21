@@ -663,6 +663,13 @@ class TestDisclosureCardInChatPage:
             "purpose_category",
         ):
             assert marker in card, marker
+        for marker in (
+            "仅本次 provider 请求",
+            "不会写入对话历史",
+            "不会启用工具调用",
+            "失败或不确定时不会自动重试",
+        ):
+            assert marker in card, marker
         assert "payload.values" not in card
         assert "payload.path" not in card
         assert "payload.source_ref" not in card

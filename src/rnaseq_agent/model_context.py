@@ -45,6 +45,10 @@ _SUMMARY_SAFE_ENUMS = {
     "category": {"run_failed", "unknown"},
 }
 _SUMMARY_STAGE_NAMES = {"fastp", "star", "featurecounts", "deseq2", "go", "gsea", "cms", "report", "qc", "align", "quantify"}
+_SAFE_CONDITION_LABELS = frozenset({
+    "baseline", "case", "control", "disease", "healthy", "ko", "knockout",
+    "normal", "treated", "treatment", "tumor", "untreated", "vehicle", "wildtype", "wt",
+})
 _SOURCE_REF_RE = re.compile(r"^src_[0-9a-f]{32}$")
 
 
@@ -263,7 +267,25 @@ def _safe_condition_label(value: Any) -> str:
         return ""
     if len(text.encode("utf-8")) > 128 or any(ch in text for ch in ("/", "\\", "\n", "\r", "\x00")):
         return "unknown"
-    return text
+    normalized = text.casefold()
+    return normalized if normalized in _SAFE_CONDITION_LABELS else ""
+
+
+def _safe_condition_counts(value: Mapping[Any, Any]) -> dict[str, int]:
+    """Project condition counts without copying arbitrary condition labels."""
+    result: dict[str, int] = {}
+    opaque: dict[str, str] = {}
+    for raw_key, raw_count in list(value.items())[:64]:
+        count = _safe_int(raw_count)
+        if count < 0:
+            continue
+        raw_text = str(raw_key or "").strip()
+        label = _safe_condition_label(raw_text)
+        if not label and raw_text:
+            label = opaque.setdefault(raw_text, f"group_{len(opaque) + 1:03d}")
+        if label:
+            result[label] = result.get(label, 0) + count
+    return result
 
 
 def _sample_rows(project: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -284,8 +306,14 @@ def build_safe_project_summary(project_dir: Path) -> dict[str, Any]:
     sequencing = project.get("sequencing") if isinstance(project.get("sequencing"), Mapping) else {}
     rows = _sample_rows(project)
     conditions: dict[str, int] = {}
+    opaque_conditions: dict[str, str] = {}
     for row in rows:
         condition = _safe_condition_label(row.get("condition"))
+        if not condition and str(row.get("condition") or "").strip():
+            raw_condition = str(row.get("condition") or "").strip()
+            condition = opaque_conditions.setdefault(
+                raw_condition, f"group_{len(opaque_conditions) + 1:03d}"
+            )
         if condition:
             conditions[condition] = conditions.get(condition, 0) + 1
     status = project.get("status") if isinstance(project.get("status"), Mapping) else {}
@@ -363,7 +391,7 @@ def project_tool_result_for_model(name: str, full_result: Mapping[str, Any]) -> 
             for key in allowed:
                 value = summary.get(key)
                 if key == "condition_counts" and isinstance(value, Mapping):
-                    safe_summary[key] = {str(k): _safe_int(v) for k, v in list(value.items())[:64] if str(k) and not any(token in str(k).lower() for token in ("path", "file", "sample", "patient"))}
+                    safe_summary[key] = _safe_condition_counts(value)
                 elif key == "sample_aliases" and isinstance(value, list):
                     safe_summary[key] = [f"sample_{index:03d}" for index, _ in enumerate(value[:256], 1)]
                 elif key == "pipeline_stages" and isinstance(value, list):

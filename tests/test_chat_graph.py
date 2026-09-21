@@ -596,6 +596,13 @@ class TestChatGraphToolLoop:
         ("mode", "tool_name", "arguments", "executed", "interrupts"),
         [
             (TOOL_MODE_DISABLED, "read_project_state", {}, False, False),
+            (
+                TOOL_MODE_DISABLED,
+                "request_data_disclosure",
+                {"fields": ["sample_ids"], "purpose": "解释样本"},
+                False,
+                False,
+            ),
             (TOOL_MODE_READ_ONLY, "read_project_state", {}, True, False),
             (TOOL_MODE_READ_ONLY, "set_run_resources", {"threads": 16}, False, False),
             (TOOL_MODE_APPROVED_WRITE, "set_run_resources", {"threads": 16}, False, True),

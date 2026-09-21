@@ -217,7 +217,7 @@ def test_read_project_state_rebuilds_nested_summary_without_trusting_values() ->
             "project_state": "ready",
             "sample_count": 3,
             "sample_aliases": ["PATIENT_SENTINEL_SUMMARY", "/restricted/SENTINEL_SUMMARY"],
-            "condition_counts": {"tumor": 2, "sample_id": 99},
+            "condition_counts": {"tumor": 2, "case-2024-09-17": 1, "sample_id": 99},
             "references": {"gtf_present": True, "path": "/restricted/SENTINEL_SUMMARY"},
             "errors": [{"category": "run_failed", "message": "REPORT_SENTINEL_SUMMARY"}],
             "unknown": {"secret": "PATIENT_SENTINEL_SUMMARY"},
@@ -229,6 +229,8 @@ def test_read_project_state_rebuilds_nested_summary_without_trusting_values() ->
     assert "/restricted/SENTINEL_SUMMARY" not in encoded
     assert "REPORT_SENTINEL_SUMMARY" not in encoded
     assert projected["summary"]["sample_aliases"] == ["sample_001", "sample_002"]
+    assert "case-2024-09-17" not in encoded
+    assert all(key.startswith("group_") or key == "tumor" for key in projected["summary"]["condition_counts"])
     assert "unknown" not in projected["summary"]
 
 
@@ -262,6 +264,27 @@ def test_project_summary_sanitizes_condition_and_stage_labels() -> None:
         summary = build_safe_project_summary(root)
     assert summary["condition_counts"] == {"unknown": 1}
     assert summary["pipeline_stages"] == [{"name": "unknown", "enabled": True}]
+
+
+def test_project_summary_anonymizes_free_form_condition_labels() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "project.json").write_text(json.dumps({
+            "samples": {"items": [
+                {"sample_id": "S1", "condition": "PATIENT_001_TUMOR"},
+                {"sample_id": "S2", "condition": "case-2024-09-17"},
+                {"sample_id": "S3", "condition": "tumor"},
+            ]},
+        }), encoding="utf-8")
+        summary = build_safe_project_summary(root)
+
+    encoded = _serialized(summary)
+    assert "PATIENT_001_TUMOR" not in encoded
+    assert "case-2024-09-17" not in encoded
+    assert summary["condition_counts"]["tumor"] == 1
+    assert all(key.startswith("group_") for key in summary["condition_counts"] if key != "tumor")
 
 
 def test_tool_argument_projector_is_allowlisted_for_every_registered_tool() -> None:

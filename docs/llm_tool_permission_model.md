@@ -75,7 +75,8 @@ execute 也会在创建一次性 claim 和调用 executor 前停止。直接调�
 `request_data_disclosure` 作为模型工具时按工具模式过滤，并属于需要单独确认的
 `write/solo` 动作；`disabled` 或 `read_only` 不会让模型自行发起这张披露卡。用户在
 结构化 UI 中主动打开 project-scoped disclosure API 是另一条明确的人类操作入口，仍然
-必须经过 metadata-only card、严格布尔批准和一次性 exact send；它不会改变 `tool_mode`，
+必须经过 metadata-only card、严格布尔批准和一次性 exact send；该人类入口即使当前
+`tool_mode=disabled` 也不会被模型权限开关阻断，它不会改变 `tool_mode`，
 也不会授予模型其它读写或执行工具权限。
 
 ## 模型数据披露范围
@@ -84,7 +85,8 @@ execute 也会在创建一次性 claim 和调用 executor 前停止。直接调�
 系统另设独立的 `data_scope` 边界。默认情况下，provider 只接收去标识项目摘要：
 项目状态、路线、输入类型、样本数、分组计数、确定性样本别名、科学门禁结果和流程
 状态。这里的样本别名是服务端生成的稳定序号，不能还原源样本名；分组计数和条件标签
-仍按敏感项目数据处理，只能来自显式 allowlist。默认上下文不得包含源样本名、患者标识、FASTQ 文件名、远程或本地路径、
+仍按敏感项目数据处理，只能来自显式 allowlist，未列入安全类别的条件会改写成不透明的
+`group_N` 标签。默认上下文不得包含源样本名、患者标识、FASTQ 文件名、远程或本地路径、
 host/user/job id、报告正文、命令、stdout/stderr、traceback 或凭据。
 
 需要精确信息时，必须使用独立的数据披露确认，按 `sample_ids`、
@@ -104,6 +106,13 @@ JSON 布尔批准/拒绝，最后调用一次性 send endpoint。send endpoint �
 当前 HTTP 请求；它不会追加到对话 History、ChatState、checkpoint、通用日志或 grant
 JSON，前端 transient panel 也不会把 exact 文本回灌给下一轮模型。普通工具确认卡不能
 创建这个 grant，也不能借助它扩大写入或执行权限。
+
+披露用途不是任意自由文本。当前只接受受限安全类别（`sample_identity_check`、
+`sample_group_check`，兼容少量等价短语）；确认卡展示类别而不展示原始用途文本。一次
+披露只允许本次 provider 请求，禁用 provider tools/tool choice，不写入历史；发送失败或
+结果不确定时授权已消费且不会自动重试，用户必须重新发起授权。
+旧 grant 记录若缺少 `purpose_category` 不自动补默认类别，直接按无效记录拒绝并要求重新
+发起确认卡，避免把历史自由文本授权重新解释为新的用途。
 
 当前版本还要求 unsupported disclosure field 在 issue、load、claim 和 send 四个边界
 都直接拒绝；底层 extractor 能枚举某个字段不代表该字段已经成为产品能力。尤其是

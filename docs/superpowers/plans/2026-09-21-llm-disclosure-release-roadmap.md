@@ -91,7 +91,7 @@ approved-root remote exact。任何阶段都不能通过普通工具确认卡间
 
 ## 权限判定顺序
 
-每次 exact provider send 都按以下顺序检查：
+每次**模型发起的** exact provider send 都按以下顺序检查：
 
 1. `tool_mode` 是否允许这类模型动作；
 2. data grant 是否绑定当前 project、thread、provider identity、tool mode 和数据 revisions；
@@ -101,6 +101,8 @@ approved-root remote exact。任何阶段都不能通过普通工具确认卡间
 6. gateway 是否在发送前发现 secret、tool call 或超限响应。
 
 任何一项失败都不发送 provider 请求。exact grant 不授予写盘、扫描或执行权限；approved root 也不扩大模型 data scope。
+结构化 UI 的人类入口仍须经过同一 metadata-only grant、严格布尔批准、绑定复核和 single-use
+claim；它可以在 `tool_mode=disabled` 时由用户主动继续，但这不等于模型获得了披露工具权限。
 
 ## 当前 local `sample_ids` 结构化入口
 
@@ -114,7 +116,9 @@ project-scoped API：
 3. `POST .../{grant_id}/send` 在已批准且仍然绑定当前 project/thread/provider/tool mode
    与 revisions 时 claim grant，构造 exact request-local context，并强制调用
    `dispatch_exact`。响应正文作为当前 HTTP 结果返回，不追加到聊天 transcript 或
-   History；发送不确定时 grant 进入 `consumed_ambiguous`，不会自动重试。
+   History；发送不确定时 grant 进入 `consumed_ambiguous`，不会自动重试。用途必须是
+   `sample_identity_check` 或 `sample_group_check` 这类受限安全类别，卡片展示类别而非
+   原始自由文本；缺少用途类别的旧 grant 直接 fail closed，要求重新发起确认卡。
 
 这条入口先验证权限和传输边界；ChatGraph 的专用 disclosure intent 现在复用同一套
 metadata-only grant/card，并在批准后用独立 sender 完成 request-local exact response。

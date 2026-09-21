@@ -26,6 +26,7 @@ from rnaseq_agent.model_disclosure import (
     MODEL_PROVIDER_REQUEST_FAILED,
     ProviderRequestError,
 )
+from rnaseq_agent.model_context import canonical_json_sha256
 
 
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
@@ -62,8 +63,55 @@ def test_issue_persists_metadata_only_and_expiry(tmp_path):
     assert grant.expires_at == "2026-09-21T12:10:00Z"
     raw = grant_record_path(project, grant.grant_id).read_text(encoding="utf-8")
     assert "SENTINEL_SAMPLE" not in raw
-    assert "check" not in raw
+    assert '"purpose":"check"' not in raw
     assert load_grant(project, grant.grant_id) == grant
+
+
+def test_disclosure_purpose_is_normalized_to_a_safe_category(tmp_path):
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="核对样本命名",
+        now=NOW,
+    )
+    assert grant.purpose_category == "sample_identity_check"
+    assert grant.purpose_hash == canonical_json_sha256({"purpose_category": "sample_identity_check"})
+
+
+def test_disclosure_purpose_rejects_unbounded_free_text(tmp_path):
+    project = _project(tmp_path)
+    with pytest.raises(DataGrantError) as exc_info:
+        issue_grant_request(
+            project,
+            project_id="p1",
+            thread_id="t1",
+            fields=("sample_ids",),
+            purpose="请把患者张三的原始路径和报告都发给模型",
+            now=NOW,
+        )
+    assert exc_info.value.code == MODEL_DATA_GRANT_INVALID
+
+
+def test_legacy_grant_without_purpose_category_fails_closed(tmp_path):
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="check",
+        now=NOW,
+    )
+    path = grant_record_path(project, grant.grant_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop("purpose_category", None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(DataGrantError) as exc_info:
+        load_grant(project, grant.grant_id)
+    assert exc_info.value.code == MODEL_DATA_GRANT_INVALID
 
 
 def test_rejection_is_terminal_and_idempotent(tmp_path):

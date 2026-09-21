@@ -107,7 +107,7 @@ def _metadata_card(grant: Any, snapshot: Any, *, purpose: str | None = None) -> 
         "grant_id": grant.grant_id,
         "fields": list(grant.fields),
         "record_counts": dict(grant.record_counts),
-        "purpose_category": "user_requested_exact_context",
+        "purpose_category": grant.purpose_category,
         "provider": {
             "provider": identity.provider,
             "origin": identity.origin,

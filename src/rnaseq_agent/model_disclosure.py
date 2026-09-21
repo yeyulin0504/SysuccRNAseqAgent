@@ -11,6 +11,7 @@ POLICY_VERSION = 1
 GRANT_TTL_SECONDS = 600
 
 DataField = Literal["sample_ids", "fastq_filenames", "remote_paths", "report_excerpt"]
+DisclosurePurposeCategory = Literal["sample_identity_check", "sample_group_check"]
 GrantStatus = Literal[
     "pending", "approved", "rejected", "transmitting",
     "consumed_success", "consumed_ambiguous", "consumed_failed",
@@ -30,6 +31,30 @@ MODEL_CONTEXT_SECRET_DETECTED = "MODEL_CONTEXT_SECRET_DETECTED"
 MODEL_DATA_SCOPE_UNSUPPORTED = "MODEL_DATA_SCOPE_UNSUPPORTED"
 MODEL_PROVIDER_REQUEST_FAILED = "MODEL_PROVIDER_REQUEST_FAILED"
 MODEL_EXACT_TOOL_CALL_REJECTED = "MODEL_EXACT_TOOL_CALL_REJECTED"
+
+DISCLOSURE_PURPOSE_CATEGORIES = frozenset(
+    {"sample_identity_check", "sample_group_check"}
+)
+_DISCLOSURE_PURPOSE_ALIASES = {
+    "check": "sample_identity_check",
+    "sample_identity_check": "sample_identity_check",
+    "核对样本命名": "sample_identity_check",
+    "解释样本": "sample_identity_check",
+    "解释当前样本命名": "sample_identity_check",
+    "sample_group_check": "sample_group_check",
+    "核对样本分组": "sample_group_check",
+    "解释样本分组": "sample_group_check",
+}
+
+
+def normalize_disclosure_purpose(value: Any) -> DisclosurePurposeCategory:
+    """Return one safe purpose category; reject free-form disclosure intent."""
+    if not isinstance(value, str):
+        raise ValueError("invalid model data purpose")
+    normalized = _DISCLOSURE_PURPOSE_ALIASES.get(value.strip().casefold())
+    if normalized not in DISCLOSURE_PURPOSE_CATEGORIES:
+        raise ValueError("invalid model data purpose")
+    return normalized  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -90,6 +115,7 @@ class DataDisclosureGrant:
     consumed_at: str | None = None
     error_code: str | None = None
     manifest: Mapping[str, Any] = field(default_factory=dict)
+    purpose_category: DisclosurePurposeCategory = "sample_identity_check"
 
 
 @dataclass(frozen=True, repr=False)
