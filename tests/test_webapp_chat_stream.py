@@ -128,6 +128,17 @@ class TestStreamFraming:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
 
+    def test_stream_exact_capability_is_explicitly_non_cacheable(self, client) -> None:
+        token = _token(client)
+        resp = client.post(
+            "/api/chat/stream",
+            json={"message": "你好"},
+            headers=_headers(token),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store, private"
+        assert resp.headers["pragma"] == "no-cache"
+
     def test_stream_requires_token(self, client) -> None:
         resp = client.post("/api/chat/stream", json={"message": "hi"})
         assert resp.status_code == 403

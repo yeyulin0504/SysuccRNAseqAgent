@@ -3271,6 +3271,7 @@ def create_app(
             return StreamingResponse(
                 iter([sse("error", {"message": "请输入想做的事。"})]),
                 media_type="text/event-stream",
+                headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"},
             )
 
         explicit_project = str(
@@ -3531,7 +3532,11 @@ def create_app(
 
             yield sse("done", result)
 
-        return StreamingResponse(run(), media_type="text/event-stream")
+        return StreamingResponse(
+            run(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"},
+        )
 
     @app.post("/api/chat/resume")
     async def api_chat_resume(request: Request):
@@ -3668,7 +3673,11 @@ def create_app(
 
             yield sse("done", result)
 
-        return StreamingResponse(run(), media_type="text/event-stream")
+        return StreamingResponse(
+            run(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"},
+        )
 
     # -- workspace API (multi-project registry) --------------------------
 
