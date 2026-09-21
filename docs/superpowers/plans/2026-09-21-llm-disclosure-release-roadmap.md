@@ -27,8 +27,9 @@
 - `3971399`、`7154287`：local `sample_ids` 的 project binding、issue/load/claim/send fail-closed、Codex exact gateway 拒绝和 transient response 的 `no-store/private` 缓存头。
 - `869b15e`、`008f22b`：approved-root canonical/symlink/nested-root 边界、审计生命周期、策略竞态、scan replay/concurrency 和 denied browse 持久化隔离。
 - `d06a66c`：并发 send 单次 dispatch、竞争者 consumed、绑定竞态、malformed provider event、unsupported scope 和 sample/path/secret sentinel containment。
+- `8331fd0`：修复 ordinary-tool 状态投影把任意 `state/run_state/stage` 原样回灌模型的泄露，并补齐 default/ordinary-tool/successful-exact 的秘密 sentinel 回归。
 
-新鲜验证证据：主项目 `1115 passed, 8 skipped, 1 warning, 6 subtests passed`；外部
+新鲜验证证据：主项目 `1117 passed, 8 skipped, 1 warning, 6 subtests passed`；外部
 `bkbio-eval` `152 passed, 1 skipped`；预期拒绝 `32 passed`；`compileall` 和
 `git diff --check` 通过；unit/L0 mutation 命令退出码为 0。mutation harness 中的
 已知系统错误跳过和 L1 预期拒绝语义仍单独记录，不能当作真实 L1 数值能力已经完成。
