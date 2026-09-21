@@ -98,8 +98,22 @@ from .remote_scan_store import (
 from .security_audit import AuditCommitUncertainError, _record_browse_audit, browse_history_projection
 from .chat_graph import ToolExecutionContext, ToolExecutionResult
 from .model_context import ModelContextBuilder
-from .model_disclosure import ProviderCredentials, ProviderRequestError
+from .model_disclosure import (
+    MODEL_CONTEXT_SECRET_DETECTED,
+    MODEL_DATA_GRANT_CONSUMED,
+    MODEL_DATA_GRANT_EXPIRED,
+    MODEL_DATA_GRANT_INVALID,
+    MODEL_DATA_GRANT_REJECTED,
+    MODEL_DATA_REVISION_CHANGED,
+    MODEL_DATA_SCOPE_UNSUPPORTED,
+    MODEL_EXACT_TOOL_CALL_REJECTED,
+    MODEL_PROVIDER_CHANGED,
+    MODEL_PROVIDER_REQUEST_FAILED,
+    ProviderCredentials,
+    ProviderRequestError,
+)
 from .model_provider import (
+    MAX_RESPONSE_BYTES,
     ModelProviderGateway,
     context_free_prepared_request,
     normalize_provider_config,
@@ -400,6 +414,26 @@ def _finalize_tool_execution_result(result: ToolExecutionResult, project_dir: Pa
         except Exception:
             pass
     return ToolExecutionResult(result.local, result.model, result.log_projection, None)
+
+
+def _exact_send_error_status(payload: dict[str, Any]) -> int:
+    """Map exact disclosure failures to non-success HTTP responses."""
+    code = str(payload.get("error_code") or MODEL_DATA_GRANT_INVALID)
+    if code in {
+        MODEL_DATA_GRANT_CONSUMED,
+        MODEL_DATA_GRANT_EXPIRED,
+        MODEL_DATA_GRANT_REJECTED,
+        MODEL_DATA_REVISION_CHANGED,
+        MODEL_PROVIDER_CHANGED,
+    }:
+        return 409
+    if code in {MODEL_PROVIDER_REQUEST_FAILED, MODEL_EXACT_TOOL_CALL_REJECTED}:
+        return 502
+    if code == MODEL_CONTEXT_SECRET_DETECTED:
+        return 400
+    if code in {MODEL_DATA_GRANT_INVALID, MODEL_DATA_SCOPE_UNSUPPORTED}:
+        return 400
+    return 400
 
 
 def _resolve_settings_remote_path(requested_path: str) -> tuple[Any, str]:
@@ -3663,11 +3697,28 @@ def create_app(
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
-        thread_id = str(payload.get("thread_id") or "main").strip() or "main"
-        prompt = payload.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
+        thread_id = payload.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id.strip():
             return JSONResponse(
-                {"ok": False, "error_code": "MODEL_DATA_GRANT_INVALID"},
+                {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
+                status_code=400,
+            )
+        thread_id = thread_id.strip()
+        try:
+            get_thread(project_dir, thread_id)
+        except ThreadError:
+            return JSONResponse(
+                {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
+                status_code=400,
+            )
+        prompt = payload.get("prompt")
+        if (
+            not isinstance(prompt, str)
+            or not prompt.strip()
+            or len(prompt.encode("utf-8")) > MAX_RESPONSE_BYTES
+        ):
+            return JSONResponse(
+                {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID},
                 status_code=400,
             )
         result = send_exact_disclosure(
@@ -3678,6 +3729,8 @@ def create_app(
             prompt=prompt,
             connection_store_dir=connection_file_path().parent,
         )
+        if not result.get("ok"):
+            return JSONResponse(result, status_code=_exact_send_error_status(result))
         return result
 
     @app.post("/api/projects/{project_id}/archive")

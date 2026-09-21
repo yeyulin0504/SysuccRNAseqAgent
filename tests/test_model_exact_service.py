@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from rnaseq_agent.model_data_grants import DataGrantError, decide_grant, issue_grant_request
-from rnaseq_agent.model_disclosure import MODEL_DATA_SCOPE_UNSUPPORTED, ProviderEvent
+from rnaseq_agent.model_disclosure import (
+    MODEL_DATA_GRANT_INVALID,
+    MODEL_DATA_SCOPE_UNSUPPORTED,
+    MODEL_PROVIDER_REQUEST_FAILED,
+    ProviderEvent,
+)
 from rnaseq_agent.model_exact_service import build_disclosure_card, send_exact_disclosure
 
 
@@ -50,6 +55,22 @@ def test_disclosure_card_contains_metadata_only(tmp_path: Path) -> None:
     assert "SENTINEL_SAMPLE_001" not in json.dumps(card, ensure_ascii=False)
     assert "SENTINEL_R1.fastq.gz" not in json.dumps(card, ensure_ascii=False)
     assert "purpose" not in card
+
+
+def test_disclosure_card_rejects_scopes_not_in_local_sample_id_slice(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("fastq_filenames",),
+        purpose="核对 FASTQ 文件名",
+    )
+
+    with pytest.raises(DataGrantError) as caught:
+        build_disclosure_card(project, grant.grant_id)
+
+    assert caught.value.code == MODEL_DATA_SCOPE_UNSUPPORTED
 
 
 def test_send_exact_disclosure_keeps_exact_values_request_local(tmp_path: Path, monkeypatch) -> None:
@@ -155,6 +176,121 @@ def test_send_exact_disclosure_rejects_prompt_that_contains_unapproved_path_data
     assert result["ok"] is False
     assert result["error_code"] == "MODEL_DATA_SCOPE_UNSUPPORTED"
     assert called is False
+
+
+def test_send_exact_disclosure_rejects_unc_path_in_prompt(tmp_path: Path, monkeypatch) -> None:
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="核对样本命名",
+    )
+    decide_grant(project, grant.grant_id, approved=True)
+    called = False
+
+    def forbidden_dispatch(self, request):
+        nonlocal called
+        called = True
+        return iter(())
+
+    monkeypatch.setattr(
+        "rnaseq_agent.model_provider.ModelProviderGateway.dispatch_exact",
+        forbidden_dispatch,
+    )
+    result = send_exact_disclosure(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        grant_id=grant.grant_id,
+        prompt=r"请读取 \\server\share\S1_R1.fastq.gz 并核对样本名",
+    )
+
+    assert result == {"ok": False, "error_code": MODEL_DATA_SCOPE_UNSUPPORTED}
+    assert called is False
+
+
+def test_send_exact_disclosure_rejects_empty_or_non_string_thread_id(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    for thread_id in ("", "   ", None, 123):
+        grant = issue_grant_request(
+            project,
+            project_id="p1",
+            thread_id="t1",
+            fields=("sample_ids",),
+            purpose="核对样本命名",
+        )
+        decide_grant(project, grant.grant_id, approved=True)
+        result = send_exact_disclosure(
+            project,
+            project_id="p1",
+            thread_id=thread_id,
+            grant_id=grant.grant_id,
+            prompt="请核对样本命名",
+        )
+        assert result == {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID}
+
+
+def test_send_exact_disclosure_rejects_prompt_over_one_mib(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="核对样本命名",
+    )
+    decide_grant(project, grant.grant_id, approved=True)
+
+    result = send_exact_disclosure(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        grant_id=grant.grant_id,
+        prompt="x" * (1024 * 1024 + 1),
+    )
+
+    assert result == {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID}
+
+
+def test_send_exact_disclosure_rejects_codex_cli_backend(tmp_path: Path) -> None:
+    from rnaseq_agent.connection_store import save_llm
+
+    project = _project(tmp_path)
+    connection_dir = tmp_path / "connection"
+    save_llm(
+        {
+            "enabled": True,
+            "backend": "codex_cli",
+            "provider": "codex",
+            "api_mode": "codex_cli",
+            "model": "gpt-test",
+            "tool_mode": "disabled",
+        },
+        store_dir=connection_dir,
+    )
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="核对样本命名",
+        connection_store_dir=connection_dir,
+    )
+    decide_grant(project, grant.grant_id, approved=True)
+
+    result = send_exact_disclosure(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        grant_id=grant.grant_id,
+        prompt="请核对样本命名",
+        connection_store_dir=connection_dir,
+    )
+
+    assert result["ok"] is False
+    assert result["error_code"] == MODEL_DATA_SCOPE_UNSUPPORTED
 
 
 def test_send_exact_disclosure_never_accepts_remote_source_ref(tmp_path: Path) -> None:

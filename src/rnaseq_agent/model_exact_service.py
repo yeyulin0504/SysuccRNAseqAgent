@@ -28,11 +28,13 @@ from .model_data_grants import (
 )
 from .model_disclosure import (
     MODEL_DATA_GRANT_INVALID,
+    MODEL_DATA_SCOPE_UNSUPPORTED,
     MODEL_PROVIDER_CHANGED,
     ProviderCredentials,
     ProviderRequestError,
 )
 from .model_provider import (
+    MAX_RESPONSE_BYTES,
     ModelProviderGateway,
     context_free_prepared_request,
 )
@@ -52,7 +54,7 @@ _EXACT_SERVICE_CONTEXT: ContextVar[_ExactServiceContext | None] = ContextVar(
     "model_exact_service_context", default=None
 )
 _UNAPPROVED_EXACT_PROMPT_RE = re.compile(
-    r"(?:[A-Za-z]:[\\/]|/)[^\s,，。；;]+|\b[^\s,，。；;]+\.(?:fastq|fq)(?:\.gz)?\b",
+    r"(?:[A-Za-z]:[\\/]|/)[^\s,，。；;]+|\\\\[^\s\\/]+[\\/][^\s,，。；;]+|\b[^\s,，。；;]+\.(?:fastq|fq)(?:\.gz)?\b",
     re.IGNORECASE,
 )
 
@@ -62,6 +64,12 @@ def _prepare_exact_request(claim: Any, snapshot: Any) -> tuple[Any, Any]:
     parameters = _EXACT_SERVICE_CONTEXT.get()
     if parameters is None:
         raise ValueError(MODEL_DATA_GRANT_INVALID)
+    if getattr(snapshot.provider, "backend", None) == "codex_cli" or getattr(snapshot.provider, "api_mode", None) == "codex_cli":
+        raise DataGrantError(
+            "codex cli backend is not permitted for exact disclosure",
+            code=MODEL_DATA_SCOPE_UNSUPPORTED,
+            grant_id=claim.grant_id,
+        )
     context = ModelContextBuilder.build(
         project_dir=parameters.project_dir,
         project_id=parameters.project_id,
@@ -130,6 +138,12 @@ def build_disclosure_card(
 ) -> dict[str, Any]:
     """Build the safe UI card for a pending/approved local disclosure grant."""
     grant = load_grant(Path(project_dir), grant_id)
+    if tuple(grant.fields) != ("sample_ids",) or grant.remote_scan_ref_hash is not None:
+        raise DataGrantError(
+            "unsupported model data scope",
+            code=MODEL_DATA_SCOPE_UNSUPPORTED,
+            grant_id=grant.grant_id,
+        )
     with locked_model_disclosure_connection(store_dir=connection_store_dir) as snapshot:
         if snapshot.provider_identity.digest != grant.provider_identity:
             raise DataGrantError(
@@ -165,7 +179,9 @@ def send_exact_disclosure(
     The caller must deliberately keep the returned text transient.  This
     function never appends it to ChatState, History, a transcript, or a log.
     """
-    if not isinstance(prompt, str) or not prompt.strip():
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID}
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode("utf-8")) > MAX_RESPONSE_BYTES:
         return {"ok": False, "error_code": MODEL_DATA_GRANT_INVALID}
     if _UNAPPROVED_EXACT_PROMPT_RE.search(prompt):
         return {"ok": False, "error_code": "MODEL_DATA_SCOPE_UNSUPPORTED"}
