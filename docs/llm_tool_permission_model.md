@@ -141,9 +141,12 @@ Settings 是创建、扩大和撤销 approved root 的唯一入口。项目 JSON
 
 远程浏览统一返回四个通道：`local` 仅供当前请求和结构化 UI 使用，`model` 是 provider
 安全摘要，`log_projection` 是唯一允许进入通用工具日志的内容，`security_audit` 只交给
-独立审计 owner 完成一次权威提交。审计提交失败时 exact scan reference 必须撤销或保留
-为可 reconciliation 的 uncertain 状态；History 只是去标识显示投影，不能替代审计记录，
-也不能在审计已提交后把一次成功误改成失败。
+独立审计 owner 完成一次权威提交。provider-facing 的远程浏览摘要只包含去标识的数量、
+配对统计和有限状态字段，不包含 `source_ref`、目录、文件名、样本名或任何远程精确值。
+opaque `source_ref` 只保留在本地结构化结果、scan store 和安全审计关联元数据中，不能由
+模型或浏览器作为参数提交，也不能单独授权 remote exact。审计提交失败时 exact scan
+reference 必须撤销或保留为可 reconciliation 的 uncertain 状态；History 只是去标识显示
+投影，不能替代审计记录，也不能在审计已提交后把一次成功误改成失败。
 
 Workbench 的 remote scan apply 只接受服务器构造的
 `BrowseContext(project_id, None, "workbench")`。浏览器提交的 `scan_id`、

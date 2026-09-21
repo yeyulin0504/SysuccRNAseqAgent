@@ -24,12 +24,12 @@
 
 The current release is stable enough to stop expanding scope:
 
-- Main project: `1122 passed, 8 skipped, 1 warning, 6 subtests passed` after disclosure hardening commit `7dab67e`.
+- Main project: `1123 passed, 8 skipped, 1 warning, 6 subtests passed` after the current hardening line, including `ce3f333`.
 - External `bkbio-eval`: `154 passed, 1 skipped` after metadata-audit contract commit `1daf024`.
 - L1 real adapter run: `0 numerical passed / 2 expected_refusal_passed / 0 failed / 0 skipped`.
 - Unit/L0 mutation command exits `0`; its caught mutants demonstrate test sensitivity and do not constitute numerical L1 completion.
 - Remote audit/replay review: `217 passed, 5 skipped, 1 warning`; no new bypass found.
-- Permission threat audit: no confirmed bypass; follow-up items are `normalize_tool_mode(None)` fail-closed semantics and broader sentinel coverage for free-form provider prose. Opaque remote `source_ref` remains summary metadata only; remote exact consumer stays closed.
+- Permission threat audit: no confirmed bypass; `normalize_tool_mode(None)` remains a separately gated M1 follow-up, alongside broader sentinel coverage for free-form provider prose. Provider-facing remote browse summaries contain counts/paired statistics only and no `source_ref`; opaque `source_ref` remains local structured/audit metadata and cannot authorize remote exact. The remote exact consumer stays closed.
 
 The existing TCGA and airway cases remain expected refusals. The new metadata-audit contract records their input hashes, unit structure, export scripts, and inclusion rules, while license/redistribution terms, retrieval metadata, source archive hashes, script commits, and explicit batch conclusions remain blocked/null. Their derived inputs must not be described as untouched raw source matrices.
 
