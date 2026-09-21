@@ -13,6 +13,7 @@ from rnaseq_agent.model_data_grants import (
     grant_record_path,
     issue_grant_request,
     load_grant,
+    locked_model_disclosure_connection,
 )
 from rnaseq_agent.model_disclosure import (
     MODEL_DATA_GRANT_CONSUMED,
@@ -279,3 +280,44 @@ def test_callback_marker_attribute_spoof_is_rejected(tmp_path):
     with pytest.raises(DataGrantError) as caught:
         claim_grant_for_send(project, grant.grant_id, live_inputs=ExactClaimInputs("p1", "t1"), prepare=prepare, open_stream=open_stream, now=NOW)
     assert caught.value.code == MODEL_DATA_GRANT_INVALID
+
+
+def test_locked_connection_snapshot_reads_one_locked_store_and_exposes_revision(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    import rnaseq_agent.connection_store as connection_store
+
+    def forbidden_unlocked_reader(*args, **kwargs):
+        raise AssertionError("unlocked load_llm must not be used by locked snapshot")
+
+    monkeypatch.setattr(connection_store, "load_llm", forbidden_unlocked_reader)
+    with locked_model_disclosure_connection(store_dir=connection, runtime_secrets=("runtime-secret",)) as snapshot:
+        assert snapshot.provider.model == "test"
+        assert snapshot.tool_mode == "read_only"
+        assert snapshot.connection_revision.startswith("sha256:")
+        assert snapshot.credentials is not None
+        assert "runtime-secret" in snapshot.credentials.known_secrets
+
+
+def test_claim_holds_connection_snapshot_through_prepare_and_stream_start(tmp_path):
+    project = _project(tmp_path)
+    connection = _connection(tmp_path)
+    grant = issue_grant_request(project, project_id="p1", thread_id="t1", fields=("sample_ids",), purpose="check", connection_store_dir=connection, now=NOW)
+    decide_grant(project, grant.grant_id, approved=True, now=NOW)
+    seen = []
+
+    @mark_exact_prepare
+    def prepare(claim, snapshot):
+        seen.append((snapshot.provider.model, snapshot.connection_revision))
+        from rnaseq_agent.connection_store import save_llm
+        save_llm({"model": "changed"}, store_dir=connection)
+        return None, object()
+
+    prepared = claim_grant_for_send(
+        project, grant.grant_id,
+        live_inputs=ExactClaimInputs("p1", "t1", connection_store_dir=connection),
+        prepare=prepare,
+        open_stream=mark_exact_open_stream(lambda request: iter(())),
+        now=NOW,
+    )
+    assert seen and seen[0][0] == "test"
+    assert prepared.connection_snapshot.provider.model == "test"

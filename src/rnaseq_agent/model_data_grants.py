@@ -214,6 +214,83 @@ def _provider_snapshot(store_dir: Path | None) -> ModelDisclosureConnectionSnaps
     return ModelDisclosureConnectionSnapshot(config, identity, provider_config_revision(config), mode)
 
 
+@contextmanager
+def locked_model_disclosure_connection(
+    *, store_dir: Path | None = None, runtime_secrets: Sequence[str] = ()
+) -> Iterator[ModelDisclosureConnectionSnapshot]:
+    """Yield one provider/tool/credential snapshot from one locked store read.
+
+    The connection lock is deliberately acquired by this boundary.  Callers
+    that need to bind a grant must enter this context before the project/grant
+    lock (the fixed order is connection -> project).  No unlocked ``load_llm``
+    reader is used, so provider identity, mode, credentials and revision all
+    describe the same bytes.
+    """
+    from . import connection_store
+    from .agent_tools import TOOL_MODE_APPROVED_EXECUTE, TOOL_MODE_DISABLED, normalize_tool_mode
+    from .storage import project_state_lock
+
+    directory = connection_store._resolve_store_dir(store_dir)
+    path = directory / connection_store.CONNECTION_FILE_NAME
+    with project_state_lock(path):
+        payload, _exists, valid = connection_store._read_payload_state(directory, secure=True)
+        if not valid:
+            payload = {}
+        raw_llm = payload.get(connection_store.LLM_BLOCK_KEY)
+        if not isinstance(raw_llm, dict):
+            raw_llm = {}
+        decrypted_llm = {
+            key: raw_llm[key]
+            for key in connection_store.LLM_FIELDS
+            if raw_llm.get(key) is not None
+        }
+        token = raw_llm.get(connection_store._LLM_API_KEY_KEY)
+        if isinstance(token, str) and token:
+            secret = connection_store._unprotect(token)
+            if secret:
+                decrypted_llm["api_key"] = secret
+        raw = {
+            "backend": decrypted_llm.get("backend", "openai_compatible"),
+            "provider": decrypted_llm.get("provider", "openai"),
+            "api_base": decrypted_llm.get("api_base", "https://localhost/v1"),
+            "model": decrypted_llm.get("model", "unknown"),
+            "api_mode": decrypted_llm.get("api_mode", "chat_completions"),
+        }
+        try:
+            config = normalize_provider_config(raw)
+        except ValueError:
+            config = normalize_provider_config({"provider": "openai", "api_base": "https://localhost/v1", "model": "unknown"})
+        identity = provider_identity(config)
+        mode_value = decrypted_llm.get(
+            "tool_mode",
+            TOOL_MODE_APPROVED_EXECUTE if connection_store.LLM_BLOCK_KEY in payload else TOOL_MODE_DISABLED,
+        )
+        if mode_value is None:
+            mode = TOOL_MODE_DISABLED
+        else:
+            try:
+                mode = normalize_tool_mode(mode_value)
+            except ValueError:
+                mode = TOOL_MODE_DISABLED
+        credentials = connection_store.provider_credentials_from_connection(
+            decrypted_llm, payload, runtime_secrets=runtime_secrets
+        )
+        browse_policy = connection_store._policy_from_payload(payload) if valid else None
+        revision = canonical_json_sha256({
+            "llm": raw_llm,
+            "server": payload.get("server") if isinstance(payload.get("server"), dict) else {},
+        })
+        yield ModelDisclosureConnectionSnapshot(
+            config,
+            identity,
+            provider_config_revision(config),
+            mode,
+            credentials=credentials,
+            connection_revision=revision,
+            browse_policy=browse_policy,
+        )
+
+
 def _project_counts(project_dir: Path, fields: Sequence[str]) -> dict[str, int]:
     try:
         value = json.loads((Path(project_dir) / "project.json").read_text(encoding="utf-8"))
@@ -443,10 +520,11 @@ def _claim_error(grant: DataDisclosureGrant, code: str, now: datetime) -> DataGr
     return DataGrantError("model data grant invalid", code=code, grant_id=grant.grant_id)
 
 
-def claim_grant_for_send(
+def _claim_grant_for_send_locked(
     project_dir: Path, grant_id: str, *, live_inputs: ExactClaimInputs | None = None,
     prepare: Callable[..., Any] | None = None, open_stream: Callable[..., Iterator[Any]] | None = None,
     now: datetime | None = None,
+    _connection_snapshot: ModelDisclosureConnectionSnapshot | None = None,
 ) -> PreparedExactClaim:
     project_dir = Path(project_dir)
     current = _now(now)
@@ -470,7 +548,7 @@ def claim_grant_for_send(
             failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_DATA_GRANT_INVALID, "consumed_at": _iso(current)})
             _write(path, _to_payload(failed))
             raise _claim_error(failed, MODEL_DATA_GRANT_INVALID, current)
-        snapshot = _provider_snapshot(inputs.connection_store_dir)
+        snapshot = _connection_snapshot or _provider_snapshot(inputs.connection_store_dir)
         if snapshot.provider_identity.digest != grant.provider_identity:
             failed = DataDisclosureGrant(**{**grant.__dict__, "status": "consumed_failed", "error_code": MODEL_PROVIDER_CHANGED, "consumed_at": _iso(current)})
             _write(path, _to_payload(failed))
@@ -542,6 +620,31 @@ def claim_grant_for_send(
             finish_grant_claim(project_dir, claim, outcome="consumed_success", manifest=manifest, now=_now(None))
 
     return PreparedExactClaim(claim, snapshot, context, request, events, bool(getattr(events, "transmission_started", False)), terminal_guard)
+
+
+def claim_grant_for_send(
+    project_dir: Path, grant_id: str, *, live_inputs: ExactClaimInputs | None = None,
+    prepare: Callable[..., Any] | None = None, open_stream: Callable[..., Iterator[Any]] | None = None,
+    now: datetime | None = None,
+) -> PreparedExactClaim:
+    """Claim an exact grant while holding one live connection snapshot.
+
+    The connection-store lock is acquired before the project/grant lock, and
+    remains held through request preparation and transport creation.  This
+    prevents provider or tool-mode drift between validation and transmission.
+    """
+    store_dir = live_inputs.connection_store_dir if live_inputs is not None else None
+    runtime_secrets = live_inputs.runtime_secrets if live_inputs is not None else ()
+    with locked_model_disclosure_connection(store_dir=store_dir, runtime_secrets=runtime_secrets) as snapshot:
+        return _claim_grant_for_send_locked(
+            project_dir,
+            grant_id,
+            live_inputs=live_inputs,
+            prepare=prepare,
+            open_stream=open_stream,
+            now=now,
+            _connection_snapshot=snapshot,
+        )
 
 
 def finish_grant_claim(
