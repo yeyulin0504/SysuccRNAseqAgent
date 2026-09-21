@@ -1,0 +1,42 @@
+{
+  "schema": "sysucc-rnaseq/airway-promotion-gate@1",
+  "audited_at": "2026-09-21",
+  "case_id": "L1_airway_deseq2",
+  "current_status": "blocked_expected_refusal",
+  "current_outcome": {
+    "status": "NOT_EVALUABLE",
+    "reason_code": "unsupported_design"
+  },
+  "evidence": {
+    "source_archive_sha256": "829f654fc8075ac9d810574e8a8d4672e69e847c45fa2ce598d1ffbc30c7fe19",
+    "counts_sha256": "f5695854800790473e69a1801a748b510a6e610477cccc191e0f5b28981c0904",
+    "coldata_sha256": "74e6633fdaec9c47f48ef1f2f2461ce2971d4a9ecb645fcd0abcdd10871a72f5",
+    "annotation_sha256": "43edb0bc50bba9d598f75e5b96279de210315fb428cb8d6ba0999e13119806f4",
+    "exporter_sha256": "d613d8e3fc0c17bf580d909423f2d0cd3a720227e646d153eb1cbd8fcaf377dc",
+    "source_package": "airway 1.32.0",
+    "source_license": "LGPL",
+    "pair_count": 4,
+    "pair_column": "cell",
+    "formula_required": "~ pair_id + condition",
+    "exploratory_pydeseq2_baseline_allowed": false
+  },
+  "promotion_requirements": {
+    "source_url_and_retrieval_timestamp": "missing",
+    "license_redistribution_review": "missing",
+    "export_script_commit": "missing",
+    "batch_confounding_assessment": "missing",
+    "immutable_r_runtime_digest": "missing",
+    "r_deseq2_expected_values_human_review": "missing",
+    "paired_two_group_main_project": "pending",
+    "paired_two_group_adapter": "pending",
+    "fresh_real_adapter_numerical_l1": "pending"
+  },
+  "runtime_probe": {
+    "rscript": "absent",
+    "docker_daemon": "unavailable",
+    "conda_or_mamba": "absent",
+    "apptainer_or_singularity": "absent",
+    "immutable_image_or_sif": "absent"
+  },
+  "promotion_rule": "All promotion_requirements must be complete and independently reviewed before changing expected_outcome to numerical success."
+}
