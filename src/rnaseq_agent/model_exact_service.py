@@ -137,14 +137,18 @@ def build_disclosure_card(
     connection_store_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build the safe UI card for a pending/approved local disclosure grant."""
-    grant = load_grant(Path(project_dir), grant_id)
-    if tuple(grant.fields) != ("sample_ids",) or grant.remote_scan_ref_hash is not None:
-        raise DataGrantError(
-            "unsupported model data scope",
-            code=MODEL_DATA_SCOPE_UNSUPPORTED,
-            grant_id=grant.grant_id,
-        )
     with locked_model_disclosure_connection(store_dir=connection_store_dir) as snapshot:
+        # Keep the global lock order aligned with exact send: connection
+        # snapshot first, then the project/grant lock.  Reading the grant
+        # first here could deadlock a concurrent card build against a send
+        # that already holds the connection lock while claiming the grant.
+        grant = load_grant(Path(project_dir), grant_id)
+        if tuple(grant.fields) != ("sample_ids",) or grant.remote_scan_ref_hash is not None:
+            raise DataGrantError(
+                "unsupported model data scope",
+                code=MODEL_DATA_SCOPE_UNSUPPORTED,
+                grant_id=grant.grant_id,
+            )
         if snapshot.provider_identity.digest != grant.provider_identity:
             raise DataGrantError(
                 "model provider changed",

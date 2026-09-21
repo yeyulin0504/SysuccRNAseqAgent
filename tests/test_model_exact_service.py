@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import rnaseq_agent.model_exact_service as exact_service
 
 from rnaseq_agent.model_data_grants import DataGrantError, decide_grant, issue_grant_request
 from rnaseq_agent.model_disclosure import (
@@ -71,6 +73,37 @@ def test_disclosure_card_rejects_scopes_not_in_local_sample_id_slice(tmp_path: P
         build_disclosure_card(project, grant.grant_id)
 
     assert caught.value.code == MODEL_DATA_SCOPE_UNSUPPORTED
+
+
+def test_disclosure_card_acquires_connection_before_grant_lock(tmp_path: Path, monkeypatch) -> None:
+    project = _project(tmp_path)
+    grant = issue_grant_request(
+        project,
+        project_id="p1",
+        thread_id="t1",
+        fields=("sample_ids",),
+        purpose="核对样本命名",
+    )
+    events: list[str] = []
+    real_load_grant = exact_service.load_grant
+    real_locked_connection = exact_service.locked_model_disclosure_connection
+
+    def recording_load_grant(*args, **kwargs):
+        events.append("grant")
+        return real_load_grant(*args, **kwargs)
+
+    @contextmanager
+    def recording_locked_connection(*args, **kwargs):
+        events.append("connection")
+        with real_locked_connection(*args, **kwargs) as snapshot:
+            yield snapshot
+
+    monkeypatch.setattr(exact_service, "load_grant", recording_load_grant)
+    monkeypatch.setattr(exact_service, "locked_model_disclosure_connection", recording_locked_connection)
+
+    exact_service.build_disclosure_card(project, grant.grant_id)
+
+    assert events[:2] == ["connection", "grant"]
 
 
 def test_send_exact_disclosure_keeps_exact_values_request_local(tmp_path: Path, monkeypatch) -> None:
