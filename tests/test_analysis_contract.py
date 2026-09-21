@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import tempfile
 import unittest
 from copy import deepcopy
@@ -14,6 +15,34 @@ from rnaseq_agent.analysis_contract import (
     verify_analysis_contract,
     verify_project_contract,
 )
+
+
+def test_paired_contract_changes_when_canonical_pair_mapping_changes(tmp_path):
+    counts_path = tmp_path / "counts.tsv"
+    counts_path.write_text("gene\tp1_u\tp1_t\np1\t1\t2\n", encoding="utf-8")
+    config = {
+        "project": {"id": "paired-contract", "title": "paired"},
+        "study": {"design": "paired_two_group"},
+        "server": {"scheduler": "local", "threads": 1, "memory_gb": 1, "shell": "bash"},
+        "sequencing": {"layout": "paired"},
+        "samples": {"source": "counts_upload", "counts_path": str(counts_path), "items": [
+            {"sample_id": "p1_u", "condition": "untrt", "pair_id": "p1", "fastq_1": ""},
+            {"sample_id": "p1_t", "condition": "trt", "pair_id": "p1", "fastq_1": ""},
+            {"sample_id": "p2_u", "condition": "untrt", "pair_id": "p2", "fastq_1": ""},
+            {"sample_id": "p2_t", "condition": "trt", "pair_id": "p2", "fastq_1": ""},
+            {"sample_id": "p3_u", "condition": "untrt", "pair_id": "p3", "fastq_1": ""},
+            {"sample_id": "p3_t", "condition": "trt", "pair_id": "p3", "fastq_1": ""},
+        ]},
+        "pipeline": {"diffexp": {"enabled": True}},
+        "diffexp": {"formula": "~ pair_id + condition", "reference_condition": "untrt", "contrast_condition": "trt", "min_count_prefilter": 0},
+        "execution": {"mode": "free"},
+    }
+    first = build_analysis_contract(config)
+    changed = json.loads(json.dumps(config))
+    changed["samples"]["items"][0]["pair_id"] = "p9"
+    changed["samples"]["items"][1]["pair_id"] = "p9"
+    second = build_analysis_contract(changed)
+    assert first["contract_id"] != second["contract_id"]
 from rnaseq_agent.run_agent import run_project
 from rnaseq_agent.storage import load_json, save_json
 from rnaseq_agent.validation import validate_local_fastqs

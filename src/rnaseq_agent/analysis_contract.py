@@ -248,6 +248,7 @@ def _workflow_snapshot(config: dict[str, Any]) -> dict[str, Any]:
             {
                 "sample_id": sample.get("sample_id", ""),
                 "condition": sample.get("condition", ""),
+                "pair_id": str(sample.get("pair_id", "") or "").strip(),
                 "fastq_1": sample.get("fastq_1", ""),
                 "fastq_2": sample.get("fastq_2", ""),
                 "batch": str(sample.get("batch", "") or "").strip(),

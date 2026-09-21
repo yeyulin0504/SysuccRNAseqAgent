@@ -306,6 +306,59 @@ def test_project_template_server_uses_a_non_secret_allowlist(tmp_path: Path) -> 
     assert not ({"token", "api_token", "password", "passphrase", "private_key"} & set(config["server"]))
 
 
+def test_paired_preflight_canonicalizes_pair_column_and_refuses_before_project_or_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inputs = tmp_path / "paired-inputs"
+    inputs.mkdir()
+    (inputs / "counts.tsv").write_text(
+        "gene\tp1_u\tp1_t\tp2_u\tp2_t\tp3_u\tp3_t\nG1\t1\t2\t3\t4\t5\t6\n",
+        encoding="utf-8",
+    )
+    (inputs / "coldata.tsv").write_text(
+        "sample\tcondition\tcell\n"
+        "p1_u\tuntrt\tcell-b\n"
+        "p1_t\ttrt\tcell-b\n"
+        "p2_u\tuntrt\tcell-a\n"
+        "p2_t\ttrt\tcell-a\n"
+        "p3_u\tuntrt\tcell-c\n"
+        "p3_t\ttrt\tcell-c\n",
+        encoding="utf-8",
+    )
+    parsed = read_eval_inputs(inputs, condition_column="condition", pair_column="cell")
+    assert [sample["pair_id"] for sample in parsed.samples] == ["cell-b", "cell-b", "cell-a", "cell-a", "cell-c", "cell-c"]
+
+    def fail_transport(*args, **kwargs):
+        raise AssertionError("transport must not be reached by paired preflight")
+
+    monkeypatch.setattr("rnaseq_agent.bkbio_eval_adapter.create_remote_transport", fail_transport)
+    params = tmp_path / "params.json"
+    params.write_text(
+        json.dumps(
+            {
+                "condition_column": "condition",
+                "pair_column": "cell",
+                "design_template": "paired_two_group",
+                "design": "~ pair_id + condition",
+                "paired": True,
+                "reference_level": "untrt",
+                "contrast_level": "trt",
+                "min_count_prefilter": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "result.json"
+    # Break one pair after parsing: this must refuse before project creation.
+    (inputs / "coldata.tsv").write_text(
+        (inputs / "coldata.tsv").read_text(encoding="utf-8").replace("p3_t\ttrt\tcell-c", "p3_t\ttrt\tcell-b"),
+        encoding="utf-8",
+    )
+    with pytest.raises(AdapterNotEvaluableError, match="pair"):
+        run_case(inputs, params, out, case_id="paired-preflight", connection={})
+    assert not (out.parent / ".rnaseq-agent-eval").exists()
+
+
 def _write_case(
     tmp_path: Path,
     *,

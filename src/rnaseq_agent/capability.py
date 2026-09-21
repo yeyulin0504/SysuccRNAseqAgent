@@ -126,7 +126,7 @@ def register_builtin_capabilities() -> dict[str, Capability]:
                 "data_type": "bulk_rna_seq_fastq",
                 "layout": {"paired"},  # 框架 15.3：Illumina paired-end
                 "min_samples": 1,
-                "designs": {"independent_two_group", "single_group"},
+                "designs": {"independent_two_group", "paired_two_group", "single_group"},
                 "required_sample_fields": ["sample_id", "condition", "fastq_1"],
                 "cancer_types": bulk_profile.get("cancer_types", ["pan_cancer"]),
                 "sample_mode": bulk_profile.get("sample_mode", "cohort_or_single"),
@@ -204,7 +204,9 @@ def gate_a_check(
                 f"首期只接受非配对两组或单组队列设计，检测到 {len(conditions)} 个分组。"
             )
 
-    required_fields = capability.input_contract["required_sample_fields"]
+    required_fields = list(capability.input_contract["required_sample_fields"])
+    if design == "paired_two_group" and "pair_id" not in required_fields:
+        required_fields.append("pair_id")
     if is_counts_entry_config(config):
         # counts 直入没有 FASTQ：样本表只需 sample_id + condition，参考路径
         # 与 STAR/featureCounts 前置检查交给下游 counts 阶段，不在此要求。
@@ -278,12 +280,12 @@ def build_execution_plan(capability: Capability, config: dict[str, Any]) -> Exec
     # 框架 15.3 条件开放：启用 diffexp 时把冻结设计/对比写入计划。
     diffexp = config.get("pipeline", {}).get("diffexp", {}).get("enabled")
     if diffexp:
-        from .differential import DEG_DESIGN_FORMULA, diffexp_design_of
+        from .differential import diffexp_design_of
 
         design = diffexp_design_of(config)
         steps.append(
             f"差异表达：DESeq2 两组对比 {design['contrast']}"
-            f"（{DEG_DESIGN_FORMULA}，reference={design['reference_condition']}）"
+            f"（{design['formula']}，reference={design['reference_condition']}）"
         )
         summary += f" 条件开放：DESeq2 差异表达（{design['contrast']}）。"
 

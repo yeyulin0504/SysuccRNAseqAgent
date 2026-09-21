@@ -33,7 +33,7 @@ from .capability import PASS
 from .connection_store import SHARED_FIELDS, load_connection
 from .container import container_config, wrap_command
 from .defaults import DEFAULT_CMS, DEFAULT_CONTAINER, DEFAULT_DIFFEXP, DEFAULT_PIPELINE, DEFAULT_REFERENCE
-from .differential import DEG_MIN_REPLICATES_PER_GROUP
+from .differential import DEG_MIN_REPLICATES_PER_GROUP, PAIRED_DESIGN_FORMULA
 from .remote_transport import create_remote_transport
 from .session import ProjectSession
 from .shell import shell_quote
@@ -99,7 +99,12 @@ class EvalInputs:
         return len(self.sample_ids)
 
 
-def read_eval_inputs(inputs_dir: Path, *, condition_column: str) -> EvalInputs:
+def read_eval_inputs(
+    inputs_dir: Path,
+    *,
+    condition_column: str,
+    pair_column: str = "",
+) -> EvalInputs:
     """Read and validate the standard bkbio-eval counts/coldata boundary."""
     inputs_dir = Path(inputs_dir).resolve()
     counts_path = inputs_dir / "counts.tsv"
@@ -110,7 +115,11 @@ def read_eval_inputs(inputs_dir: Path, *, condition_column: str) -> EvalInputs:
         raise AdapterInputError(f"coldata.tsv not found: {coldata_path}")
 
     sample_ids, gene_ids, library_sizes = _scan_counts(counts_path)
-    samples_by_id = _read_coldata(coldata_path, condition_column=condition_column)
+    samples_by_id = _read_coldata(
+        coldata_path,
+        condition_column=condition_column,
+        pair_column=pair_column,
+    )
     count_set = set(sample_ids)
     coldata_set = set(samples_by_id)
     if count_set != coldata_set:
@@ -145,8 +154,23 @@ def run_case(
     params = _read_params(params_path)
     _validate_supported_design(params)
     condition_column = str(params.get("condition_column") or "condition").strip()
-    inputs = read_eval_inputs(Path(inputs_dir), condition_column=condition_column)
+    pair_column = str(params.get("pair_column") or "pair_id").strip()
+    try:
+        inputs = read_eval_inputs(
+            Path(inputs_dir),
+            condition_column=condition_column,
+            pair_column=pair_column if _is_paired_request(params) else "",
+        )
+    except AdapterInputError as exc:
+        if _is_paired_request(params) and pair_column and "missing columns" in str(exc):
+            raise AdapterNotEvaluableError(
+                "unsupported_design",
+                f"paired_two_group requires source pair column {pair_column!r}",
+            ) from exc
+        raise
     reference, contrast = _validate_groups(inputs, params, condition_column)
+    if _is_paired_request(params):
+        _validate_paired_inputs(inputs, params, reference=reference, contrast=contrast)
 
     project_id = _project_id(case_id)
     project_dir = out_path.parent / ".rnaseq-agent-eval" / project_id
@@ -349,11 +373,18 @@ def _raw_count(raw: str, *, line_no: int, sample_id: str) -> int:
     return int(value)
 
 
-def _read_coldata(coldata_path: Path, *, condition_column: str) -> dict[str, dict[str, str]]:
+def _read_coldata(
+    coldata_path: Path,
+    *,
+    condition_column: str,
+    pair_column: str = "",
+) -> dict[str, dict[str, str]]:
     with coldata_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         fields = reader.fieldnames or []
         required = {"sample", condition_column}
+        if pair_column:
+            required.add(pair_column)
         missing = sorted(required - set(fields))
         if missing:
             raise AdapterInputError(f"coldata.tsv is missing columns: {missing}")
@@ -368,6 +399,10 @@ def _read_coldata(coldata_path: Path, *, condition_column: str) -> dict[str, dic
             if sample_id in samples:
                 raise AdapterInputError(f"coldata.tsv contains duplicate sample: {sample_id}")
             sample = {"sample_id": sample_id, "condition": condition}
+            if pair_column:
+                pair_id = str(row.get(pair_column) or "").strip()
+                if pair_id:
+                    sample["pair_id"] = pair_id
             batch = str(row.get("batch") or "").strip()
             if batch:
                 sample["batch"] = batch
@@ -389,12 +424,28 @@ def _read_params(params_path: Path) -> dict[str, Any]:
     return payload
 
 
+def _is_paired_request(params: Mapping[str, Any]) -> bool:
+    return bool(params.get("paired", False)) or str(params.get("design_template") or "").strip() == "paired_two_group"
+
+
 def _validate_supported_design(params: Mapping[str, Any]) -> None:
     requested = str(params.get("design") or "~ condition").strip()
     paired = params.get("paired", False)
     if not isinstance(paired, bool):
         raise AdapterInputError("params.paired must be a JSON boolean")
-    if paired or re.sub(r"\s+", "", requested).lower() != "~condition":
+    paired_request = _is_paired_request(params)
+    if paired_request:
+        template = str(params.get("design_template") or "").strip()
+        if template and template != "paired_two_group":
+            raise AdapterNotEvaluableError("unsupported_design", "unknown paired design template")
+        if not paired:
+            raise AdapterNotEvaluableError("unsupported_design", "paired_two_group requires params.paired=true")
+        if re.sub(r"\s+", "", requested).lower() != "~pair_id+condition":
+            raise AdapterNotEvaluableError(
+                "unsupported_design",
+                f"paired_two_group generates {PAIRED_DESIGN_FORMULA}; arbitrary formulas are forbidden (independent fallback ~ condition is also forbidden)",
+            )
+    elif re.sub(r"\s+", "", requested).lower() != "~condition":
         raise AdapterNotEvaluableError(
             "unsupported_design",
             "the real SYSU RNA-seq Agent DESeq2 gate currently supports only "
@@ -455,6 +506,40 @@ def _validate_groups(
     _threshold(params, "fdr_threshold", 0.05, minimum=0.0, maximum=1.0)
     _threshold(params, "log2fc_threshold", 1.0, minimum=0.0)
     return reference, contrast
+
+
+def _validate_paired_inputs(
+    inputs: EvalInputs,
+    params: Mapping[str, Any],
+    *,
+    reference: str,
+    contrast: str,
+) -> None:
+    samples = inputs.samples
+    pair_groups: dict[str, list[dict[str, str]]] = {}
+    for sample in samples:
+        pair_id = str(sample.get("pair_id") or "").strip()
+        if not pair_id:
+            raise AdapterNotEvaluableError("unsupported_design", "paired_two_group requires a non-empty pair column")
+        pair_groups.setdefault(pair_id, []).append(sample)
+    mapping_count = 0
+    for pair_id, rows in sorted(pair_groups.items()):
+        by_condition: dict[str, list[dict[str, str]]] = {}
+        for row in rows:
+            by_condition.setdefault(row["condition"], []).append(row)
+        if len(rows) != 2 or len(by_condition.get(reference, [])) != 1 or len(by_condition.get(contrast, [])) != 1:
+            raise AdapterNotEvaluableError(
+                "unsupported_design",
+                f"pair {pair_id!r} must contain exactly one reference and one contrast sample",
+            )
+        mapping_count += 1
+    if mapping_count < 3:
+        raise AdapterNotEvaluableError("unsupported_design", "paired_two_group requires at least 3 complete pairs")
+    if any(str(sample.get("batch") or "").strip() for sample in samples):
+        raise AdapterNotEvaluableError("unsupported_design", "paired_two_group does not support a declared batch")
+    min_count = params.get("min_count_prefilter", 0)
+    if min_count not in (0, 0.0, None):
+        raise AdapterNotEvaluableError("unsupported_design", "paired_two_group requires min_count_prefilter=0")
 
 
 def _threshold(
@@ -542,10 +627,12 @@ def _build_project_config(
         "enabled": True,
         "version": DEFAULT_PIPELINE["diffexp"]["version"],
     }
+    paired = _is_paired_request(params)
     diffexp = {
         **deepcopy(DEFAULT_DIFFEXP),
-        "formula": "~ condition",
+        "formula": PAIRED_DESIGN_FORMULA if paired else "~ condition",
         "reference_condition": reference,
+        **({"contrast_condition": str(params.get("contrast_level") or "").strip(), "min_count_prefilter": 0} if paired else {}),
         "padj_cutoff": _threshold(params, "fdr_threshold", 0.05, minimum=0.0, maximum=1.0),
         "lfc_cutoff": _threshold(params, "log2fc_threshold", 1.0, minimum=0.0),
     }
@@ -574,7 +661,10 @@ def _build_project_config(
     config: dict[str, Any] = {
         "schema_version": 1,
         "project": {"id": project_id, "title": f"bkbio-eval {project_id}", "owner": "bkbio-eval"},
-        "study": {"cancer_type": "pan_cancer", "design": "independent_two_group"},
+        "study": {
+            "cancer_type": "pan_cancer",
+            "design": "paired_two_group" if paired else "independent_two_group",
+        },
         "server": server,
         "reference": deepcopy(template.get("reference") or DEFAULT_REFERENCE),
         "sequencing": {"layout": "paired", "reads_per_sample_million": 0, "strandedness": "unknown"},
@@ -833,7 +923,9 @@ def _build_result(
         "digest": container.get("digest") or container.get("image_digest") or None,
         "config_sha256": canonical_sha256(container),
     }
-    requested_design = str(params.get("design") or "~ condition").strip()
+    requested_design = str(
+        params.get("design") or (PAIRED_DESIGN_FORMULA if _is_paired_request(params) else "~ condition")
+    ).strip()
     created_at = str(contract.get("created_at") or "")
     release_mode = bool(config.get("evaluation", {}).get("release_mode", False))
 
@@ -847,7 +939,7 @@ def _build_result(
             "fdr_threshold": fdr,
             "log2fc_threshold": lfc,
             "design": requested_design,
-            "paired": False,
+            "paired": _is_paired_request(params),
         },
         "metrics": {
             "n_genes": inputs.n_genes,
@@ -948,9 +1040,11 @@ def _verify_summary(
     diffexp = config.get("diffexp", {})
     if not isinstance(diffexp, Mapping):
         raise AdapterExecutionError("frozen diffexp configuration is invalid")
-    if diffexp.get("formula") != "~ condition":
+    paired = str(config.get("study", {}).get("design", "")).strip() == "paired_two_group"
+    expected_formula = PAIRED_DESIGN_FORMULA if paired else "~ condition"
+    if diffexp.get("formula") != expected_formula:
         raise AdapterExecutionError(
-            "frozen diffexp formula must be exactly '~ condition'"
+            f"frozen diffexp formula must be exactly {expected_formula!r}"
         )
     configured_reference = diffexp.get("reference_condition")
     if configured_reference != reference:
@@ -958,7 +1052,7 @@ def _verify_summary(
             "frozen diffexp reference_condition differs from the evaluator request"
         )
     expected = {
-        "formula": diffexp.get("formula"),
+        "formula": expected_formula,
         "reference_condition": reference,
         "treatment_condition": contrast,
         "contrast": f"{contrast}_vs_{reference}",
@@ -971,6 +1065,9 @@ def _verify_summary(
                 f"DESeq2 summary {field} does not match the frozen analysis contract: "
                 f"expected {expected_value!r}, found {summary.get(field)!r}"
             )
+    if paired:
+        if summary.get("template") not in (None, "deseq2_paired_two_group"):
+            raise AdapterExecutionError("DESeq2 summary template does not match paired_two_group")
 
 
 def _verify_manifests(

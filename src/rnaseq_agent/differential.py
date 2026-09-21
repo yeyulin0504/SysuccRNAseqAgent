@@ -35,6 +35,9 @@ from .capability import GateResult, NOT_EVALUABLE, PASS
 DEG_MIN_REPLICATES_PER_GROUP = 3
 # 框架 8.2 / 15.3：冻结公式。
 DEG_DESIGN_FORMULA = "~ condition"
+PAIRED_DESIGN_FORMULA = "~ pair_id + condition"
+PAIRED_TEMPLATE = "deseq2_paired_two_group"
+PAIRED_MIN_COMPLETE_PAIRS = 3
 
 
 def _r_quote(value: str) -> str:
@@ -57,6 +60,9 @@ def diffexp_design_checks(config: dict[str, Any]) -> list[str]:
     intentionally separated from the boolean gate so the session layer can
     attach the same reasons to a refusal or to a plan note.
     """
+    if str(config.get("study", {}).get("design", "")).strip() == "paired_two_group":
+        return paired_design_checks(config)
+
     reasons: list[str] = []
     samples = config.get("samples", {}).get("items", [])
     design = str(config.get("study", {}).get("design", "")).strip()
@@ -146,6 +152,8 @@ def diffexp_is_requested(config: dict[str, Any]) -> bool:
 
 def diffexp_design_of(config: dict[str, Any]) -> dict[str, Any]:
     """Frozen design/contrast descriptor (framework: condition队列另含 design/contrast)."""
+    if str(config.get("study", {}).get("design", "")).strip() == "paired_two_group":
+        return paired_design_of(config)
     samples = config.get("samples", {}).get("items", [])
     conditions = sorted(
         {str(sample.get("condition", "")).strip() for sample in samples} - {""}
@@ -209,12 +217,25 @@ def _render_diffexp_script(
     trt_r = _r_quote(treatment)
     contrast_r = _r_quote(contrast)
     diffexp = config.get("diffexp", {})
+    formula = str(design.get("formula") or DEG_DESIGN_FORMULA)
+    template = str(design.get("template") or "deseq2_independent_two_group")
+    pair_levels = [str(row["pair_id"]) for row in design.get("pair_mapping", [])]
+    pair_factor = ""
+    rank_guard = ""
+    model_formula = formula
+    if template == PAIRED_TEMPLATE:
+        levels = ", ".join(_r_quote(value) for value in pair_levels)
+        pair_factor = f"coldata$pair_id <- factor(coldata$pair_id, levels = c({levels}))\n"
+        rank_guard = (
+            "model_matrix <- model.matrix(~ pair_id + condition, data = coldata)\n"
+            "if (qr(model_matrix)$rank != ncol(model_matrix)) stop('paired design matrix is rank deficient')\n"
+        )
     padj_cutoff = float(diffexp.get("padj_cutoff", 0.05))
     lfc_cutoff = float(diffexp.get("lfc_cutoff", 1.0))
 
     return f"""#!/usr/bin/env Rscript
-# 冻结模板 deseq2_independent_two_group（框架 15.3 条件开放）
-# design = {DEG_DESIGN_FORMULA}，contrast = {contrast}
+# 冻结模板 {template}（框架 15.3 条件开放）
+# design = {formula}，contrast = {contrast}
 suppressMessages({{ library(DESeq2) }})
 suppressMessages({{ library(jsonlite) }})
 
@@ -231,13 +252,15 @@ coldata <- read.delim(coldata_file, row.names = 1, check.names = FALSE)
 {counts_note}
 
 coldata$condition <- factor(coldata$condition, levels = c({ref_r}, {trt_r}))
+{pair_factor} 
 stopifnot(all(rownames(coldata) %in% colnames(counts)))
 counts <- counts[, rownames(coldata), drop = FALSE]
+{rank_guard}
 
 dds <- DESeqDataSetFromMatrix(
   countData = counts,
   colData = coldata,
-  design = ~ condition
+  design = {model_formula}
 )
 dds <- tryCatch(
   DESeq(dds, quiet = TRUE),
@@ -267,7 +290,7 @@ n_sig <- sum(res_df$padj < padj_cutoff & abs(res_df$log2FoldChange) >= lfc_cutof
 n_sig_default <- sum(res_df$padj < 0.05 & abs(res_df$log2FoldChange) >= 1, na.rm = TRUE)
 summary_json <- list(
   contrast = {contrast_r},
-  formula = {_r_quote(DEG_DESIGN_FORMULA)},
+  formula = {_r_quote(formula)},
   reference_condition = {ref_r},
   treatment_condition = {trt_r},
   tested_genes = nrow(res_df),
@@ -295,9 +318,142 @@ def render_colData(config: dict[str, Any]) -> str:
         lines.append(
             f"{sample['sample_id']}\t"
             f"{str(sample.get('condition', '')).strip()}\t"
-            f"{batch if batch else 'NA'}"
+            + (f"{str(sample.get('pair_id', '')).strip()}\t" if str(config.get("study", {}).get("design", "")).strip() == "paired_two_group" else "")
+            + f"{batch if batch else 'NA'}"
         )
+    if str(config.get("study", {}).get("design", "")).strip() == "paired_two_group":
+        lines[0] = "sample_id\tcondition\tpair_id\tbatch"
     return "\n".join(lines) + "\n"
+
+
+# -- paired template --------------------------------------------------------
+
+
+def paired_design_checks(config: dict[str, Any]) -> list[str]:
+    """Validate the named paired-two-group policy before planning or execution."""
+    reasons: list[str] = []
+    samples = config.get("samples", {}).get("items", [])
+    design = str(config.get("study", {}).get("design", "")).strip()
+    if design != "paired_two_group":
+        reasons.append("paired_two_group is required for the paired DESeq2 template.")
+
+    conditions = sorted({str(sample.get("condition", "")).strip() for sample in samples} - {""})
+    if len(conditions) != 2:
+        reasons.append(
+            f"paired_two_group requires exactly two condition levels; found {conditions or 'none'}."
+        )
+        return reasons
+
+    diffexp = config.get("diffexp", {})
+    formula = str(diffexp.get("formula") or PAIRED_DESIGN_FORMULA).strip()
+    if formula.replace(" ", "") != "~pair_id+condition":
+        reasons.append(f"paired_two_group formula is fixed to {PAIRED_DESIGN_FORMULA!r}; arbitrary formulas are forbidden.")
+
+    reference = str(diffexp.get("reference_condition", "")).strip()
+    contrast = str(diffexp.get("contrast_condition", "")).strip()
+    if not reference:
+        reasons.append("paired_two_group requires an explicit reference_condition.")
+    elif reference not in conditions:
+        reasons.append(f"reference_condition={reference!r} is not one of {conditions}.")
+    if not contrast:
+        contrast = next((condition for condition in conditions if condition != reference), "")
+    if contrast not in conditions or contrast == reference:
+        reasons.append("contrast_condition must be the condition level distinct from reference_condition.")
+
+    prefilter = diffexp.get("min_count_prefilter", 0)
+    try:
+        prefilter_value = float(prefilter)
+    except (TypeError, ValueError):
+        prefilter_value = None
+    if prefilter_value != 0:
+        reasons.append("paired_two_group requires min_count_prefilter=0; non-zero prefilters are unsupported.")
+    if any(str(sample.get("batch", "")).strip() for sample in samples):
+        reasons.append("paired_two_group does not support a declared batch field yet.")
+
+    sample_ids = [str(sample.get("sample_id", "")).strip() for sample in samples]
+    if any(not sample_id for sample_id in sample_ids):
+        reasons.append("paired samples require non-empty sample_id values.")
+    if len(set(sample_ids)) != len(sample_ids):
+        reasons.append("paired samples require globally unique sample_id values.")
+
+    pair_groups: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        pair_id = str(sample.get("pair_id", "")).strip()
+        if not pair_id:
+            reasons.append("every paired sample requires a non-empty pair_id.")
+            continue
+        pair_groups.setdefault(pair_id, []).append(sample)
+
+    mapping: list[dict[str, str]] = []
+    for pair_id in sorted(pair_groups):
+        rows = pair_groups[pair_id]
+        by_condition: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            by_condition.setdefault(str(row.get("condition", "")).strip(), []).append(row)
+        if len(rows) != 2 or any(len(by_condition.get(level, [])) != 1 for level in conditions):
+            reasons.append(
+                f"pair_id={pair_id!r} must contain exactly one reference and one contrast sample (missing mate, duplicate, or extra row)."
+            )
+            continue
+        mapping.append(
+            {
+                "pair_id": pair_id,
+                "reference_sample_id": str(by_condition[reference][0].get("sample_id", "")).strip(),
+                "contrast_sample_id": str(by_condition[contrast][0].get("sample_id", "")).strip(),
+            }
+        )
+    if len(mapping) < PAIRED_MIN_COMPLETE_PAIRS:
+        reasons.append(
+            f"paired_two_group requires at least {PAIRED_MIN_COMPLETE_PAIRS} complete pairs; found {len(mapping)}."
+        )
+
+    declared_rank = diffexp.get("model_matrix_rank")
+    declared_columns = diffexp.get("model_matrix_columns")
+    if declared_rank is not None and declared_columns is not None:
+        try:
+            if int(declared_rank) < int(declared_columns):
+                reasons.append("paired design matrix is rank deficient.")
+        except (TypeError, ValueError):
+            reasons.append("paired model matrix rank metadata is invalid.")
+    return reasons
+
+
+def paired_design_of(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the server-generated canonical descriptor for paired DESeq2."""
+    reasons = paired_design_checks(config)
+    if reasons:
+        raise ValueError("paired_two_group design is not evaluable: " + "; ".join(reasons))
+    samples = config.get("samples", {}).get("items", [])
+    diffexp = config.get("diffexp", {})
+    conditions = sorted({str(sample.get("condition", "")).strip() for sample in samples})
+    reference = str(diffexp.get("reference_condition", "")).strip()
+    contrast = str(diffexp.get("contrast_condition", "")).strip()
+    by_pair: dict[str, dict[str, str]] = {}
+    for sample in samples:
+        pair_id = str(sample["pair_id"]).strip()
+        by_pair.setdefault(pair_id, {})[str(sample["condition"]).strip()] = str(sample["sample_id"]).strip()
+    mapping = [
+        {
+            "pair_id": pair_id,
+            "reference_sample_id": by_pair[pair_id][reference],
+            "contrast_sample_id": by_pair[pair_id][contrast],
+        }
+        for pair_id in sorted(by_pair)
+    ]
+    return {
+        "template": PAIRED_TEMPLATE,
+        "formula": PAIRED_DESIGN_FORMULA,
+        "reference_condition": reference,
+        "treatment_condition": contrast,
+        "contrast_condition": contrast,
+        "contrast": f"{contrast}_vs_{reference}",
+        "conditions": conditions,
+        "pair_count": len(mapping),
+        "pair_mapping": mapping,
+        "min_complete_pairs": PAIRED_MIN_COMPLETE_PAIRS,
+        "min_count_prefilter": 0,
+        "batches_declared": False,
+    }
 
 
 # -- internal helpers -------------------------------------------------------
