@@ -20,6 +20,23 @@
 - local `sample_ids` 已有独立的结构化 Web API：创建元数据卡、布尔批准/拒绝、一次性 exact provider send；返回正文只存在当前请求，不写入 History、ChatState 或 grant JSON。
 - 当前发布门禁继续把 `sample_ids` 以外的字段在 issue/load/claim/send 边界 fail closed；底层字段枚举能力不表示对应 scope 已上线。
 
+### 2026-09-21 hardening closure
+
+本轮夜间加固已完成以下门禁，未扩大任何 exact scope：
+
+- `3971399`、`7154287`：local `sample_ids` 的 project binding、issue/load/claim/send fail-closed、Codex exact gateway 拒绝和 transient response 的 `no-store/private` 缓存头。
+- `869b15e`、`008f22b`：approved-root canonical/symlink/nested-root 边界、审计生命周期、策略竞态、scan replay/concurrency 和 denied browse 持久化隔离。
+- `d06a66c`：并发 send 单次 dispatch、竞争者 consumed、绑定竞态、malformed provider event、unsupported scope 和 sample/path/secret sentinel containment。
+
+新鲜验证证据：主项目 `1115 passed, 8 skipped, 1 warning, 6 subtests passed`；外部
+`bkbio-eval` `152 passed, 1 skipped`；预期拒绝 `32 passed`；`compileall` 和
+`git diff --check` 通过；unit/L0 mutation 命令退出码为 0。mutation harness 中的
+已知系统错误跳过和 L1 预期拒绝语义仍单独记录，不能当作真实 L1 数值能力已经完成。
+
+下一阶段仍按风险顺序推进：先补真正的独立样本正向 L1 和 `paired_two_group` 评测，
+再分别对本地 FASTQ basename、报告章节摘录做独立 spec/RED/回归门禁，最后才评估
+approved-root remote exact。任何阶段都不能通过普通工具确认卡间接扩大 `data_scope`。
+
 仍然明确关闭或未接通的部分：
 
 - exact grant 已接入独立的结构化 Web API 和真实 provider 请求；自然语言 ChatGraph 已接入只支持 `sample_ids` 的独立 disclosure intent/card，并在批准后通过 Graph → claim → dispatch 返回一次性 transient exact response。前端已有独立 disclosure card、transient exact panel 和安全终态元数据投影。
