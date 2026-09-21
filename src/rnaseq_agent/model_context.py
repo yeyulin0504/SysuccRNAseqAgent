@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .model_disclosure import (
+    ClaimedDataGrant,
     DisclosureManifest,
     ModelContext,
     ModelDataRevisions,
@@ -609,9 +610,9 @@ class ModelContextBuilder:
     """Construct provider-safe context without implicitly discovering projects.
 
     ``project_dir=None`` is the explicit context-free mode used by router and
-    connection-test calls.  It intentionally emits only the caller's fixed
-    system prompt and user-authored message.  A real, existing project may add
-    the bounded summary projection; no exact grant data is accepted here.
+    connection-test calls.  A real project may add the bounded summary
+    projection.  The first exact-data slice accepts only a claimed local
+    ``sample_ids`` grant and keeps those values in this request-local object.
     """
 
     @staticmethod
@@ -626,7 +627,6 @@ class ModelContextBuilder:
         durable_messages: Any,
         claimed_grant: Any = None,
     ) -> ModelContext:
-        del project_id, thread_id, claimed_grant
         messages: list[dict[str, Any]] = []
         revisions = _context_free_revisions(provider)
 
@@ -642,8 +642,43 @@ class ModelContextBuilder:
             })
             revisions = read_model_data_revisions(Path(project_dir), provider)
 
+        exact_fields: tuple[str, ...] = ()
+        exact_counts: dict[str, int] = {}
+        exact_byte_length = 0
+        exact_grant_hash: str | None = None
+        exact_message: dict[str, Any] | None = None
+        if claimed_grant is not None:
+            if not isinstance(claimed_grant, ClaimedDataGrant):
+                raise ValueError("MODEL_DATA_GRANT_INVALID")
+            if project_dir is None or not Path(project_dir).is_dir():
+                raise ValueError("MODEL_DATA_SCOPE_UNSUPPORTED")
+            if str(claimed_grant.bindings.project_id) != str(project_id) or str(claimed_grant.bindings.thread_id) != str(thread_id):
+                raise ValueError("MODEL_DATA_GRANT_INVALID")
+            if str(claimed_grant.bindings.provider_identity) != provider_identity(provider).digest:
+                raise ValueError("MODEL_PROVIDER_CHANGED")
+            if claimed_grant.bindings.remote_scan is not None:
+                raise ValueError("MODEL_DATA_SCOPE_UNSUPPORTED")
+            if tuple(claimed_grant.fields) != ("sample_ids",):
+                raise ValueError("MODEL_DATA_SCOPE_UNSUPPORTED")
+            if claimed_grant.bindings.revisions != revisions:
+                raise ValueError("MODEL_DATA_REVISION_CHANGED")
+            values = claimed_grant.exact_values.get("sample_ids")
+            if not isinstance(values, tuple) or not values or any(not isinstance(value, str) or not value for value in values):
+                raise ValueError("MODEL_DATA_GRANT_INVALID")
+            if set(claimed_grant.exact_values) != {"sample_ids"}:
+                raise ValueError("MODEL_DATA_SCOPE_UNSUPPORTED")
+            exact_block = {"data_scope": "exact", "sample_ids": list(values)}
+            exact_content = json.dumps(exact_block, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            exact_message = {"role": "system", "name": "model_exact_data_v1", "content": exact_content}
+            exact_fields = ("sample_ids",)
+            exact_counts = {"sample_ids": len(values)}
+            exact_byte_length = len(exact_content.encode("utf-8"))
+            exact_grant_hash = hashlib.sha256(str(claimed_grant.grant_id).encode("utf-8")).hexdigest()
+
         if str(system_prompt):
             messages.append({"role": "system", "content": str(system_prompt)})
+        if exact_message is not None:
+            messages.append(exact_message)
 
         for item in durable_messages or ():
             if not isinstance(item, Mapping):
@@ -656,10 +691,10 @@ class ModelContextBuilder:
 
         messages.append({"role": "user", "content": str(current_user_message)})
         manifest = DisclosureManifest(
-            grant_id_hash=None,
-            fields=(),
-            record_counts={},
-            byte_length=0,
+            grant_id_hash=exact_grant_hash,
+            fields=exact_fields,
+            record_counts=exact_counts,
+            byte_length=exact_byte_length,
             revisions=revisions,
         )
         return ModelContext(

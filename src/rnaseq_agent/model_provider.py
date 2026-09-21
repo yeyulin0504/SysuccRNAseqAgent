@@ -461,6 +461,7 @@ def context_free_prepared_request(
     response_schema: Mapping[str, Any] | None = None,
     codex_executable: Path | None = None,
     codex_home: Path | None = None,
+    exact_attempt: bool = False,
 ) -> PreparedModelRequest:
     """Prepare a provider request from an already-built safe context.
 
@@ -489,6 +490,8 @@ def context_free_prepared_request(
         if stream:
             payload["stream"] = True
         prompt = ""
+    if exact_attempt and not context.disclosure_manifest.fields:
+        raise ValueError("MODEL_DATA_GRANT_INVALID")
     return PreparedModelRequest(
         provider=config,
         identity=provider_identity(config),
@@ -501,5 +504,6 @@ def context_free_prepared_request(
         response_schema=response_schema,
         codex_executable=codex_executable,
         codex_home=codex_home,
-        disclosure_manifest=None,
+        disclosure_manifest=context.disclosure_manifest if exact_attempt else None,
+        exact_attempt=bool(exact_attempt),
     )
