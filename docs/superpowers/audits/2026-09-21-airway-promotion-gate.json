@@ -1,6 +1,6 @@
 {
   "schema": "sysucc-rnaseq/airway-promotion-gate@1",
-  "audited_at": "2026-09-21",
+  "audited_at": "2026-09-22",
   "case_id": "L1_airway_deseq2",
   "current_status": "blocked_expected_refusal",
   "current_outcome": {
@@ -27,8 +27,8 @@
     "batch_confounding_assessment": "missing",
     "immutable_r_runtime_digest": "missing",
     "r_deseq2_expected_values_human_review": "missing",
-    "paired_two_group_main_project": "pending",
-    "paired_two_group_adapter": "pending",
+    "paired_two_group_main_project": "complete_verified_by_78_focused_tests",
+    "paired_two_group_adapter": "complete_verified_by_78_focused_tests_and_real_refusal_run",
     "fresh_real_adapter_numerical_l1": "pending"
   },
   "runtime_probe": {
