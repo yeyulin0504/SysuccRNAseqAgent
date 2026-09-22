@@ -104,7 +104,7 @@
       <div><label>远程基础目录</label><input id="srvRemoteBase" placeholder="服务器上的工作根目录"></div>
     </div>
     <button onclick="saveServer()">保存 HPC 配置</button>
-    <button id="saveAndTestServer" class="secondary" onclick="saveAndTestServer()">保存并测试 SSH</button>
+    <button id="saveAndTestServer" class="secondary">保存并测试 SSH</button>
     <div id="serverTestResult" class="muted" style="margin-top:8px"></div>
   </div>
 
@@ -134,7 +134,7 @@
     </div>
     <button onclick="saveLlm()">保存 AI 配置</button>
     <button id="pullModels" class="secondary" onclick="pullModels()">拉取模型列表</button>
-    <button id="saveAndTestLlm" class="secondary" onclick="saveAndTestLlm()">保存并测试 API</button>
+    <button id="saveAndTestLlm" class="secondary">保存并测试 API</button>
     <button class="secondary" onclick="clearKey()">清除 API Key</button>
     <div id="llmTestResult" class="muted" style="margin-top:8px"></div>
     <div class="muted" style="margin-top:8px">未启用或请求失败时，对话自动回退本地规则路由。</div>
@@ -162,7 +162,7 @@
     </div>
     <label id="ctrPathLabel">服务器 SIF 路径（Docker 不需要）</label><input id="ctrPath" placeholder="/hwdata/home/user/containers/downstream.sif">
     <label>额外挂载目录 <span class="hint">每行一个绝对路径</span></label><textarea id="ctrBinds" rows="3" placeholder="/hwdata/home/user/projects"></textarea>
-    <button onclick="saveContainer()">保存容器配置</button>
+    <button id="saveContainer">保存容器配置</button>
     <button id="pullContainer" class="secondary" onclick="pullContainer()">在服务器拉取/构建 SIF</button>
     <button id="testContainer" class="secondary" onclick="testContainer()">测试容器</button>
     <div id="containerResult" class="muted" style="margin-top:8px"></div>
@@ -416,7 +416,19 @@ function clearKey() {
     if (d.error) alert(d.error); else { document.getElementById("llmKeyState").textContent = "（未设置）"; flash(); }
   });
 }
+// Make inline button handlers resolve reliably in the embedded browser.
+Object.assign(window, {
+  api, flash, setAuth, load, updateContainerFields, saveServer, saveLlm,
+  saveContainer, pullContainer, testContainer, saveAndTestServer,
+  saveAndTestLlm, pullModels, loadDemoConfig, runDemoTest, clearKey,
+  previewRemoteRoot, approveRemoteRoot, loadRemoteRoots, revokeRemoteRoot,
+});
 {% if session.config %}load();{% else %}loadRemoteRoots();{% endif %}
+// Also bind listeners directly. Some embedded browsers do not resolve inline
+// onclick names against the page script scope.
+document.querySelector('#saveAndTestServer').addEventListener('click', saveAndTestServer);
+document.querySelector('#saveAndTestLlm').addEventListener('click', saveAndTestLlm);
+document.querySelector('#saveContainer').addEventListener('click', saveContainer);
 </script>
 </body>
 </html>
