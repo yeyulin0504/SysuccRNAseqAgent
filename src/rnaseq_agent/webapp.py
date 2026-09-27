@@ -4032,6 +4032,12 @@ def create_app(
         counts_path = Path(counts_path)
 
         matrix_type = str(matrix_preview.get("matrix_type") or "")
+        for flag_name in ("enabled_diffexp", "enabled_cms"):
+            if flag_name in payload and not isinstance(payload[flag_name], bool):
+                return {
+                    "error_code": "INVALID_INPUT",
+                    "message": f"{flag_name} 必须是 JSON 布尔值。",
+                }
         enabled_diffexp = bool(payload.get("enabled_diffexp"))
         enabled_cms = bool(payload.get("enabled_cms"))
         if enabled_diffexp and matrix_type != "raw_counts":

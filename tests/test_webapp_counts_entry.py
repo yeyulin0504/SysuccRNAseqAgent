@@ -149,6 +149,34 @@ class TestCountsUploadEndpoint:
         assert de_body["error_code"] == "NOT_EVALUABLE"
         assert "raw counts" in de_body["message"]
 
+    def test_counts_session_rejects_non_boolean_cms_flag(self, client) -> None:
+        token = _token(client)
+        h = _headers(token)
+        _create_project(client, token, "cnt_cms_flag")
+        preview = client.post(
+            "/api/projects/cnt_cms_flag/counts/preview",
+            files={"file": ("counts.tsv", COUNT_MATRIX.encode(), "text/tab-separated-values")},
+            headers=h,
+        ).json()
+
+        body = client.post(
+            "/api/projects/cnt_cms_flag/counts/session",
+            json={
+                "upload_id": preview["upload_id"],
+                "enabled_cms": "false",
+                "samples": [
+                    {"sample_id": sample_id, "condition": condition}
+                    for sample_id, condition in zip(
+                        ["t1", "t2", "t3", "n1", "n2", "n3"],
+                        ["tumor", "tumor", "tumor", "normal", "normal", "normal"],
+                    )
+                ],
+            },
+            headers=h,
+        ).json()
+        assert body["error_code"] == "INVALID_INPUT"
+        assert "enabled_cms" in body["message"]
+
     def test_counts_upload_persists_pair_id_for_structured_samples(self, client) -> None:
         token = _token(client)
         h = _headers(token)
