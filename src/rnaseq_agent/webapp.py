@@ -4033,13 +4033,17 @@ def create_app(
 
         matrix_type = str(matrix_preview.get("matrix_type") or "")
         enabled_diffexp = bool(payload.get("enabled_diffexp"))
+        enabled_cms = bool(payload.get("enabled_cms"))
         if enabled_diffexp and matrix_type != "raw_counts":
             return {
                 "error_code": "NOT_EVALUABLE",
                 "message": "当前矩阵不是 raw counts，不能用于 DESeq2 raw counts 流程。",
             }
-        if not enabled_diffexp:
-            return {"error_code": "NOT_EVALUABLE", "message": "请至少启用差异表达（DE）。"}
+        if not enabled_diffexp and not enabled_cms:
+            return {
+                "error_code": "NOT_EVALUABLE",
+                "message": "请至少启用差异表达（DE）或 CMS 分型之一。",
+            }
 
         # -- build the counts 直入 session ------------------------------
         raw_samples = payload.get("samples") or []
@@ -4105,8 +4109,10 @@ def create_app(
             project_id,
             counts_path,
             samples,
-            enabled_diffexp=True,
+            enabled_diffexp=enabled_diffexp,
             reference_condition=reference_condition,
+            enabled_cms=enabled_cms,
+            cancer_type=str(payload.get("cancer_type") or "").strip(),
         )
         append_history(
             project_dir,

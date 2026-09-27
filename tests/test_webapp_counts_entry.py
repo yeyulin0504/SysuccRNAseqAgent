@@ -70,6 +70,85 @@ def _sample_rows() -> dict:
 
 
 class TestCountsUploadEndpoint:
+    def test_counts_session_accepts_cms_only_and_persists_cancer_type(self, client) -> None:
+        token = _token(client)
+        h = _headers(token)
+        _create_project(client, token, "cnt_cms_only")
+
+        preview = client.post(
+            "/api/projects/cnt_cms_only/counts/preview",
+            files={"file": ("expr.tsv", COUNT_MATRIX.encode(), "text/tab-separated-values")},
+            headers=h,
+        ).json()
+        assert preview["preview"]["matrix_type"] == "raw_counts"
+
+        body = client.post(
+            "/api/projects/cnt_cms_only/counts/session",
+            json={
+                "upload_id": preview["upload_id"],
+                "enabled_cms": True,
+                "cancer_type": "coad",
+                "samples": [
+                    {"sample_id": sample_id, "condition": condition}
+                    for sample_id, condition in zip(
+                        ["t1", "t2", "t3", "n1", "n2", "n3"],
+                        ["tumor", "tumor", "tumor", "normal", "normal", "normal"],
+                    )
+                ],
+            },
+            headers=h,
+        ).json()
+        assert "error_code" not in body, body
+
+        import json
+
+        project_json = json.loads(
+            (Path(client.get("/api/state?project=cnt_cms_only", headers=h).json()["project_dir"]) / "project.json").read_text(encoding="utf-8")
+        )
+        assert project_json["pipeline"]["diffexp"]["enabled"] is False
+        assert project_json["pipeline"]["cms"]["enabled"] is True
+        assert project_json["study"]["cancer_type"] == "coad"
+
+    def test_counts_session_rejects_normalized_matrix_only_when_de_enabled(self, client) -> None:
+        token = _token(client)
+        h = _headers(token)
+        _create_project(client, token, "cnt_cms_matrix")
+        normalized = "gene\tt1\tt2\tt3\tn1\tn2\tn3\nG1\t1.1\t2.2\t3.3\t4.4\t5.5\t6.6\n"
+
+        preview = client.post(
+            "/api/projects/cnt_cms_matrix/counts/preview",
+            files={"file": ("expr.tsv", normalized.encode(), "text/tab-separated-values")},
+            headers=h,
+        ).json()
+        assert preview["preview"]["matrix_type"] == "normalized_expression"
+        samples = [
+            {"sample_id": sample_id, "condition": condition}
+            for sample_id, condition in zip(
+                ["t1", "t2", "t3", "n1", "n2", "n3"],
+                ["tumor", "tumor", "tumor", "normal", "normal", "normal"],
+            )
+        ]
+
+        cms_body = client.post(
+            "/api/projects/cnt_cms_matrix/counts/session",
+            json={"upload_id": preview["upload_id"], "enabled_cms": True, "cancer_type": "coad", "samples": samples},
+            headers=h,
+        ).json()
+        assert "error_code" not in cms_body, cms_body
+
+        de_body = client.post(
+            "/api/projects/cnt_cms_matrix/counts/session",
+            json={
+                "upload_id": preview["upload_id"],
+                "enabled_diffexp": True,
+                "reference_condition": "normal",
+                "samples": samples,
+            },
+            headers=h,
+        ).json()
+        assert de_body["error_code"] == "NOT_EVALUABLE"
+        assert "raw counts" in de_body["message"]
+
     def test_counts_upload_persists_pair_id_for_structured_samples(self, client) -> None:
         token = _token(client)
         h = _headers(token)
