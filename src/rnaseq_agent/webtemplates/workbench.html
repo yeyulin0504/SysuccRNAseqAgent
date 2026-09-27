@@ -732,6 +732,21 @@ function renderInputSelection(d) {
   if (remoteDirEl) {
     remoteDirEl.value = typeof fastq.remote_fastq_dir === "string" ? fastq.remote_fastq_dir : "";
   }
+  const persistedSamples = Array.isArray(intake.samples) ? intake.samples : [];
+  const remoteRows = document.getElementById("fastqSampleRows");
+  if (remoteRows) {
+    remoteRows.innerHTML = "";
+    persistedSamples.forEach(sample => addFastqSampleRow(sample));
+  }
+  const groupEl = document.getElementById("fastqGroups");
+  if (groupEl) {
+    groupEl.value = persistedSamples
+      .filter(sample => sample && sample.sample_id)
+      .map(sample => sample.sample_id + "\t" + (sample.condition || ""))
+      .join("\n");
+  }
+  const sampleEditor = document.getElementById("fastqSampleEditor");
+  if (sampleEditor) sampleEditor.classList.toggle("hidden", !persistedSamples.length);
   void state; void mode;
 
   // 默认选中已登记输入，否则无选中。

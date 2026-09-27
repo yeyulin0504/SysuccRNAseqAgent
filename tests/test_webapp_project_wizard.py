@@ -424,6 +424,15 @@ def test_remote_scan_apply_persists_filename_only_group_and_rejects_replay(tmp_p
         headers=h,
     )
     assert body.status_code == 200, body.text
+    applied = body.json()
+    assert applied["intake"]["fastq"]["remote_fastq_dir"] == "/srv/team/run-a"
+    assert applied["intake"]["samples"] == [
+        {"sample_id": "S1", "fastq_1": "S1_R1.fastq.gz", "fastq_2": "S1_R2.fastq.gz"}
+    ]
+    refreshed = client.get("/api/projects/wiz_apply/intake", headers=h)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["intake"]["fastq"]["remote_fastq_dir"] == "/srv/team/run-a"
+    assert refreshed.json()["intake"]["samples"] == applied["intake"]["samples"]
     project = __import__("json").loads((project_dir / "project.json").read_text(encoding="utf-8"))
     assert project["samples"]["remote_data_dir"] == "/srv/team/run-a"
     assert project["samples"]["items"] == [{"sample_id": "S1", "condition": "", "fastq_1": "S1_R1.fastq.gz", "fastq_2": "S1_R2.fastq.gz"}]

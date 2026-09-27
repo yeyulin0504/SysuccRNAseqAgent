@@ -142,3 +142,7 @@ class TestWorkbenchPage:
         assert "intake.fastq" in render_input_selection
         assert "remote_fastq_dir" in render_input_selection
         assert "remoteFastqDir2" in render_input_selection
+        assert "Array.isArray(intake.samples)" in render_input_selection
+        assert "remoteRows.innerHTML = \"\"" in render_input_selection
+        assert "persistedSamples.forEach(sample => addFastqSampleRow(sample))" in render_input_selection
+        assert "sampleEditor.classList.toggle(\"hidden\", !persistedSamples.length)" in render_input_selection
