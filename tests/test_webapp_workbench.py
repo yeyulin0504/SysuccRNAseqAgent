@@ -129,3 +129,16 @@ class TestWorkbenchPage:
         assert resp.status_code == 200
         assert "SYSU" in resp.text
         assert "const TOKEN" in resp.text
+
+    def test_workbench_restores_persisted_remote_fastq_directory_on_intake_reload(self, client) -> None:
+        """The intake refresh must repopulate the remote FASTQ input field."""
+        resp = client.get("/workbench")
+        assert resp.status_code == 200
+        script = resp.text
+        start = script.index("function renderInputSelection(d) {")
+        end = script.index("\nfunction setInputPaneEnabled", start)
+        render_input_selection = script[start:end]
+
+        assert "intake.fastq" in render_input_selection
+        assert "remote_fastq_dir" in render_input_selection
+        assert "remoteFastqDir2" in render_input_selection

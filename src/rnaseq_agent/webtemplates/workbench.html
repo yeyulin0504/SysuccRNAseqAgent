@@ -727,6 +727,11 @@ function renderInputSelection(d) {
     return;
   }
   setInputPaneEnabled(true);
+  const fastq = intake.fastq || {};
+  const remoteDirEl = document.getElementById("remoteFastqDir2");
+  if (remoteDirEl) {
+    remoteDirEl.value = typeof fastq.remote_fastq_dir === "string" ? fastq.remote_fastq_dir : "";
+  }
   void state; void mode;
 
   // 默认选中已登记输入，否则无选中。
