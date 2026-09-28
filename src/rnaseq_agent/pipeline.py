@@ -16,6 +16,26 @@ STAGE_COUNTS = "counts"  # counts 直入：DESeq2 差异表达 / CMScaller CMS�
 ALL_STAGES = (STAGE_QC, STAGE_QUANT, STAGE_DE, STAGE_CMS, STAGE_COUNTS)
 
 
+def runner_lifecycle(stage: str | None = None) -> tuple[str, ...]:
+    """Return the common runner lifecycle for full and stage executions."""
+
+    if stage is not None and stage not in ALL_STAGES:
+        raise ValueError(f"Unsupported stage: {stage!r}. Allowed: {ALL_STAGES}")
+    return (
+        "load_contract",
+        "create_attempt",
+        "validate_inputs",
+        "write_preflight",
+        "dry_run",
+        "approval_contract_check",
+        "submit",
+        "poll",
+        "validate_output",
+        "write_manifest",
+        "register_artifacts",
+    )
+
+
 def pipeline_stages(config: dict[str, Any]) -> list[str]:
     """Deterministic stage list for the frozen pipeline config.
 

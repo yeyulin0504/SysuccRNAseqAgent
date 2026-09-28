@@ -21,6 +21,12 @@ class ResultManifestSummary:
     files_sha256: str
 
 
+def register_artifacts(attempt_dir: Path, records: list[dict[str, Any]]) -> Path:
+    """Persist the audited artifact index for one immutable attempt."""
+
+    return write_artifact_index(Path(attempt_dir), records)
+
+
 def create_result_manifest(
     config: dict[str, Any],
     extracted_dir: Path,
@@ -71,7 +77,7 @@ def create_result_manifest(
         "body": body,
     }
     save_json(output_path, manifest)
-    artifact_index_path = write_artifact_index(output_path.parent, files)
+    artifact_index_path = register_artifacts(output_path.parent, files)
     body["audit"] = {
         "schema_version": RESULT_MANIFEST_SCHEMA_VERSION,
         "artifact_index": artifact_index_path.name,

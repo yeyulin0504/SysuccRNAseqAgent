@@ -18,6 +18,30 @@ class CommandOutputLimitError(RuntimeError):
     """A bounded child process exceeded its combined capture limit."""
 
 
+LIFECYCLE_PHASES = (
+    "load_contract",
+    "create_attempt",
+    "validate_inputs",
+    "write_preflight",
+    "dry_run",
+    "approval_contract_check",
+    "submit",
+    "poll",
+    "validate_output",
+    "write_manifest",
+    "register_artifacts",
+)
+
+
+def dry_run_requested(config: dict[str, object], requested: bool | None = None) -> bool:
+    """Resolve the explicit runner dry-run flag without changing config semantics."""
+
+    if requested is not None:
+        return bool(requested)
+    execution = config.get("execution")
+    return isinstance(execution, dict) and bool(execution.get("dry_run"))
+
+
 _CLEANUP_GRACE_SECONDS = 1.0
 _WINDOWS_CREATE_SUSPENDED = 0x00000004
 

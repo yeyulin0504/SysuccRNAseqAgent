@@ -25,16 +25,17 @@ from .analysis_contract import (
 )
 from .configuration import is_remote_prestaged_config, normalize_config
 from .emailer import send_completion_email
-from .execution import CommandResult
+from .execution import CommandResult, dry_run_requested
 from .pipeline import (
     render_env_setup_script,
     render_remote_pipeline_script,
     render_stage_script,
     render_submit_script,
 )
+from .preflight_envelope import build_preflight_envelope
 from .remote import collect_local_fastq_paths
 from .remote_transport import RemoteTransport, create_remote_transport
-from .result_manifest import ResultManifestSummary, create_result_manifest
+from .result_manifest import ResultManifestSummary, create_result_manifest, register_artifacts
 from .run_audit import (
     default_environment,
     finalize_run_manifest,
@@ -106,11 +107,21 @@ def upload_project_fastqs(config_path: Path) -> RunOutcome:
         raise
 
 
-def run_project(config_path: Path, *, wait: bool = True) -> RunOutcome:
-    return _run_project_claimed(config_path, wait=wait)
+def run_project(
+    config_path: Path,
+    *,
+    wait: bool = True,
+    dry_run: bool | None = None,
+) -> RunOutcome:
+    return _run_project_claimed(config_path, wait=wait, dry_run=dry_run)
 
 
-def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
+def _run_project_claimed(
+    config_path: Path,
+    *,
+    wait: bool = True,
+    dry_run: bool | None = None,
+) -> RunOutcome:
     project_dir = config_path.parent
     claim_start = _begin_execution_claim(config_path, stage="full")
     conflict = claim_start.get("conflict")
@@ -120,6 +131,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
     config = claim_start["config"]
     run_id = claim_start["run_id"]
     claim_id = claim_start["claim_id"]
+    requested_dry_run = dry_run_requested(config, dry_run)
     attempt_dir = project_dir / "attempts" / run_id
     logs_dir = attempt_dir / "agent_logs"
     downloads_dir = attempt_dir / "downloads"
@@ -139,6 +151,8 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
                 "remote_run_workdir": run_config["server"]["remote_workdir"],
             },
         )
+        _record_lifecycle_phase(logs_dir, "load_contract", run_id=run_id, stage="full")
+        _record_lifecycle_phase(logs_dir, "create_attempt", run_id=run_id, stage="full")
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message)
@@ -173,6 +187,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
             raise RuntimeError(message)
 
         _update_status(config_path, "validated", "Local FASTQ validation passed.")
+        _record_lifecycle_phase(logs_dir, "validate_inputs", run_id=run_id, stage="full")
         try:
             policy = enforce_execution_policy(config_path, config)
         except ContractError as exc:
@@ -180,6 +195,9 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
             _log_event(logs_dir, "execution_policy_failed", {"run_id": run_id, "message": str(exc)})
             raise
         _record_policy_verification(config_path, policy)
+        preflight = _write_attempt_preflight(attempt_dir, run_config, logs_dir, stage="full")
+        run_config["preflight"] = preflight
+        _record_lifecycle_phase(logs_dir, "approval_contract_check", run_id=run_id, stage="full")
         run_config["execution"].update(
             {key: value for key, value in policy.items() if value}
         )
@@ -199,6 +217,20 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
             policy,
             attempt_dir,
         )
+        _record_lifecycle_phase(logs_dir, "write_manifest", run_id=run_id, stage="full")
+        if requested_dry_run:
+            message = "Dry-run completed; no remote job was submitted."
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={"started"},
+                claim_status="completed",
+                project_state="dry_run",
+                project_message=message,
+            )
+            _record_lifecycle_phase(logs_dir, "dry_run", run_id=run_id, stage="full")
+            _finalize_attempt_audit(attempt_dir, "dry_run", message)
+            return RunOutcome("dry_run", message, project_dir)
         support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
         _transition_execution_claim(
@@ -210,6 +242,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
             project_message="Remote analysis job submission started; retry is blocked pending reconciliation.",
         )
         submit_result = _submit_remote_job(run_config, logs_dir, transport)
+        _record_lifecycle_phase(logs_dir, "submit", run_id=run_id, stage="full")
         job_id = _parse_scheduler_job_id(run_config, submit_result.stdout)
         if not job_id:
             message = (
@@ -255,6 +288,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
             return RunOutcome("submitted", f"Job submitted: {job_id}", project_dir)
 
         final_state = _poll_until_finished(config_path, run_config, logs_dir, transport)
+        _record_lifecycle_phase(logs_dir, "poll", run_id=run_id, stage="full", state=final_state)
         if final_state == "completed":
             _update_status(config_path, "remote_completed", "Remote RNA-seq analysis completed.")
             try:
@@ -287,6 +321,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
                 result_files_sha256=result_summary.files_sha256,
                 result_validation_errors=result_summary.errors,
             )
+            _record_lifecycle_phase(logs_dir, "validate_output", run_id=run_id, stage="full", ok=result_summary.ok)
             if not result_summary.ok:
                 message = "Remote analysis reported completion, but result validation failed: " + "; ".join(
                     result_summary.errors
@@ -329,6 +364,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
             )
         _notify(run_config, final_state, message)
         _finalize_attempt_audit(attempt_dir, final_state, message)
+        _record_lifecycle_phase(logs_dir, "register_artifacts", run_id=run_id, stage="full")
         return RunOutcome(final_state, message, project_dir)
     except BaseException as exc:
         message = str(exc)
@@ -357,12 +393,13 @@ def run_stage_project(
     stage: str,
     *,
     wait: bool = True,
+    dry_run: bool | None = None,
 ) -> RunOutcome:
     from .pipeline import ALL_STAGES
 
     if stage not in ALL_STAGES:
         raise ValueError(f"Unsupported stage: {stage!r}. Allowed: {ALL_STAGES}")
-    return _run_stage_project_claimed(config_path, stage, wait=wait)
+    return _run_stage_project_claimed(config_path, stage, wait=wait, dry_run=dry_run)
 
 
 def _run_stage_project_claimed(
@@ -370,6 +407,7 @@ def _run_stage_project_claimed(
     stage: str,
     *,
     wait: bool = True,
+    dry_run: bool | None = None,
 ) -> RunOutcome:
     """Execute a single scientific stage for a frozen project.
 
@@ -398,6 +436,7 @@ def _run_stage_project_claimed(
     config = claim_start["config"]
     run_id = claim_start["run_id"]
     claim_id = claim_start["claim_id"]
+    requested_dry_run = dry_run_requested(config, dry_run)
     attempt_dir = project_dir / "attempts" / run_id
 
     logs_dir = attempt_dir / "agent_logs"
@@ -427,6 +466,8 @@ def _run_stage_project_claimed(
                 "remote_run_workdir": run_config["server"]["remote_workdir"],
             },
         )
+        _record_lifecycle_phase(logs_dir, "load_contract", run_id=run_id, stage=stage)
+        _record_lifecycle_phase(logs_dir, "create_attempt", run_id=run_id, stage=stage)
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message, stage=stage)
@@ -461,8 +502,8 @@ def _run_stage_project_claimed(
                     _log_event(logs_dir, "validation_failed", {"stage": stage, "message": message})
                     raise RuntimeError(message)
             _update_status(config_path, "validated", "Local FASTQ validation passed.", stage=stage)
-            transport = create_remote_transport(run_config)
-            if not _fastqs_prestaged(run_config):
+            transport = None if requested_dry_run else create_remote_transport(run_config)
+            if not _fastqs_prestaged(run_config) and not requested_dry_run:
                 _upload_fastqs(run_config, logs_dir, transport)
                 _update_status(config_path, "uploaded", "Local FASTQ files uploaded.", stage=stage)
             else:
@@ -475,10 +516,11 @@ def _run_stage_project_claimed(
         elif stage == "counts":
             # counts 直入（2026-09-08）：把上传的 counts_matrix.tsv 上传到
             # 远程工作区根目录，diffexp/cms R 脚本直接读它。
-            transport = create_remote_transport(run_config)
-            _upload_counts_matrix(run_config, config_path, logs_dir, transport)
+            transport = None if requested_dry_run else create_remote_transport(run_config)
+            if not requested_dry_run:
+                _upload_counts_matrix(run_config, config_path, logs_dir, transport)
         else:
-            transport = create_remote_transport(run_config)
+            transport = None if requested_dry_run else create_remote_transport(run_config)
 
         try:
             policy = enforce_execution_policy(config_path, config)
@@ -487,6 +529,9 @@ def _run_stage_project_claimed(
             _log_event(logs_dir, "execution_policy_failed", {"run_id": run_id, "stage": stage, "message": str(exc)})
             raise
         _record_policy_verification(config_path, policy)
+        _record_lifecycle_phase(logs_dir, "validate_inputs", run_id=run_id, stage=stage)
+        run_config["preflight"] = _write_attempt_preflight(attempt_dir, run_config, logs_dir, stage=stage)
+        _record_lifecycle_phase(logs_dir, "approval_contract_check", run_id=run_id, stage=stage)
         remote_scripts = _prepare_stage_scripts(run_config, config_path, attempt_dir, logs_dir, stage)
         manifest_path = attempt_dir / "run_manifest.json"
         if not manifest_path.is_file():
@@ -503,6 +548,21 @@ def _run_stage_project_claimed(
                 policy,
                 attempt_dir,
             )
+        _record_lifecycle_phase(logs_dir, "write_manifest", run_id=run_id, stage=stage)
+        if requested_dry_run:
+            message = f"Dry-run completed for stage {stage}; no remote job was submitted."
+            _transition_execution_claim(
+                config_path,
+                claim_id,
+                expected={"started"},
+                claim_status="completed",
+                project_state="dry_run",
+                project_message=message,
+                stage_status="dry_run",
+            )
+            _record_lifecycle_phase(logs_dir, "dry_run", run_id=run_id, stage=stage)
+            _finalize_attempt_audit(attempt_dir, "dry_run", message)
+            return RunOutcome("dry_run", message, project_dir)
         support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
 
@@ -516,6 +576,7 @@ def _run_stage_project_claimed(
             stage_status="submitting",
         )
         submit_result = _submit_stage_job(run_config, stage, logs_dir, transport)
+        _record_lifecycle_phase(logs_dir, "submit", run_id=run_id, stage=stage)
         job_id = _parse_scheduler_job_id(run_config, submit_result.stdout)
         if not job_id:
             message = (
@@ -556,6 +617,7 @@ def _run_stage_project_claimed(
             return RunOutcome("submitted", f"Stage {stage} submitted: {job_id}", project_dir)
 
         final_state = _poll_until_finished(config_path, run_config, logs_dir, transport)
+        _record_lifecycle_phase(logs_dir, "poll", run_id=run_id, stage=stage, state=final_state)
         if final_state == "completed":
             _update_status(config_path, "remote_completed", f"Stage {stage} completed.", stage=stage)
             try:
@@ -581,6 +643,7 @@ def _run_stage_project_claimed(
                 _finalize_attempt_audit(attempt_dir, "download_failed", message)
                 return RunOutcome("download_failed", message, project_dir)
             if not summary.ok:
+                _record_lifecycle_phase(logs_dir, "validate_output", run_id=run_id, stage=stage, ok=False)
                 message = f"Stage {stage} results are incomplete or invalid: " + "; ".join(summary.errors)
                 _transition_execution_claim(
                     config_path,
@@ -594,6 +657,7 @@ def _run_stage_project_claimed(
                 _notify(run_config, "result_validation_failed", message)
                 _finalize_attempt_audit(attempt_dir, "result_validation_failed", message)
                 return RunOutcome("result_validation_failed", message, project_dir)
+            _record_lifecycle_phase(logs_dir, "validate_output", run_id=run_id, stage=stage, ok=True)
             _transition_execution_claim(
                 config_path,
                 claim_id,
@@ -604,6 +668,7 @@ def _run_stage_project_claimed(
                 stage_status="completed",
             )
             _finalize_attempt_audit(attempt_dir, "stage_completed", f"Stage {stage} completed.")
+            _record_lifecycle_phase(logs_dir, "register_artifacts", run_id=run_id, stage=stage)
             return RunOutcome("stage_completed", f"Stage {stage} completed.", project_dir)
         if final_state == "timeout":
             message = f"Stage {stage} did not finish before the polling timeout."
@@ -1170,6 +1235,49 @@ def _best_effort_log_event(logs_dir: Path, event: str, payload: dict[str, Any]) 
         _log_event(logs_dir, event, payload)
     except BaseException:
         pass
+
+
+def _record_lifecycle_phase(logs_dir: Path, phase: str, **payload: Any) -> None:
+    if phase not in {
+        "load_contract",
+        "create_attempt",
+        "validate_inputs",
+        "write_preflight",
+        "dry_run",
+        "approval_contract_check",
+        "submit",
+        "poll",
+        "validate_output",
+        "write_manifest",
+        "register_artifacts",
+    }:
+        raise ValueError(f"Unknown runner lifecycle phase: {phase}")
+    _best_effort_log_event(logs_dir, "lifecycle", {"phase": phase, **payload})
+
+
+def _write_attempt_preflight(
+    attempt_dir: Path,
+    config: dict[str, Any],
+    logs_dir: Path,
+    *,
+    stage: str,
+) -> dict[str, Any]:
+    """Persist the Task 3 envelope before any submit side effect."""
+
+    supplied = config.get("preflight")
+    report = supplied if isinstance(supplied, dict) else {"overall": "pass"}
+    envelope = build_preflight_envelope(config, local=report)
+    path = attempt_dir / "preflight.json"
+    save_json(path, envelope)
+    _record_lifecycle_phase(
+        logs_dir,
+        "write_preflight",
+        run_id=str(config.get("run", {}).get("id", "")),
+        stage=stage,
+        path=str(path),
+        overall=envelope.get("overall"),
+    )
+    return envelope
 
 
 def _execution_contract_id(config_path: Path, config: dict[str, Any]) -> str:
@@ -1782,6 +1890,18 @@ def _best_effort_write_audit_manifest(
 def _finalize_attempt_audit(attempt_dir: Path, final_status: str, message: str) -> None:
     try:
         finalize_run_manifest(attempt_dir, final_status=final_status, error=message)
+        records: list[dict[str, Any]] = []
+        for path in sorted(attempt_dir.rglob("*")):
+            if not path.is_file() or path.name in {"artifact_index.json", "run_manifest.json"}:
+                continue
+            records.append(
+                {
+                    "path": path.relative_to(attempt_dir).as_posix(),
+                    "size_bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
+            )
+        register_artifacts(attempt_dir, records)
     except BaseException:
         return
 
