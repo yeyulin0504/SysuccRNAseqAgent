@@ -27,7 +27,9 @@ def summarize_container_preflight(
     result = {
         "enabled": True,
         "engine": engine,
-        "engine_available": report.get("engine_available", report.get("available", True)),
+        # An enabled container must be proven usable by the selected report.
+        # Missing probe fields are therefore unavailable, not optimistic.
+        "engine_available": report.get("engine_available", report.get("available", False)),
         "image_state": report.get("image_state", report.get("image", "not_reported")),
         "daemon_available": report.get(
             "daemon_available",

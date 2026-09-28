@@ -5,8 +5,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from rnaseq_agent.portable_preflight import _publish_fresh_report, _write_debug_log
+from rnaseq_agent import portable_preflight
+from rnaseq_agent.portable_preflight import (
+    _build_portable_report,
+    _publish_fresh_report,
+    _write_debug_log,
+)
 
 
 def _load_exporter():
@@ -20,6 +26,47 @@ def _load_exporter():
 
 
 class PortablePreflightTests(unittest.TestCase):
+    @patch("rnaseq_agent.portable_preflight.clear_ssh_credential")
+    @patch("rnaseq_agent.portable_preflight.set_ssh_credential")
+    @patch("rnaseq_agent.portable_preflight.getpass.getpass", return_value="temporary")
+    @patch("rnaseq_agent.portable_preflight._publish_fresh_report")
+    @patch("rnaseq_agent.portable_preflight.run_preflight_envelope")
+    @patch("rnaseq_agent.portable_preflight._load_identity")
+    def test_main_accepts_legacy_success_report_without_summary(
+        self,
+        mocked_identity,
+        mocked_run,
+        mocked_publish,
+        mocked_getpass,
+        mocked_set,
+        mocked_clear,
+    ) -> None:
+        mocked_identity.return_value = ({}, "hpc.example", "alice")
+        mocked_run.return_value = (Path("pending.json"), {"overall": "pass"})
+        mocked_publish.return_value = Path("server_preflight.json")
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "preflight_project.json"
+            config_path.write_text("{}", encoding="utf-8")
+            exit_code = portable_preflight.main(
+                ["--config", str(config_path), "--output", str(Path(temp_name) / "report.json")]
+            )
+
+        self.assertEqual(exit_code, 0)
+        mocked_clear.assert_called_once_with("hpc.example", "alice")
+
+    def test_portable_envelope_has_backward_compatible_summary(self) -> None:
+        pipeline = {
+            step: {"enabled": False}
+            for step in ("fastp", "star", "arriba", "featurecounts", "rsem", "diffexp", "cms")
+        }
+        report = _build_portable_report(
+            {"pipeline": pipeline, "container": {"enabled": False}},
+            {"overall": "pass", "tools": {}},
+        )
+
+        self.assertEqual(report["summary"], {"errors": 0, "warnings": 0})
+
     def test_export_excludes_fastq_samples_password_and_init_commands(self) -> None:
         exporter = _load_exporter()
         with tempfile.TemporaryDirectory() as temp_name:

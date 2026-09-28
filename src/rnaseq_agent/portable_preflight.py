@@ -175,13 +175,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if candidate.exists():
             candidate.unlink(missing_ok=True)
 
-    summary = report["summary"]
+    summary = report.get("summary") if isinstance(report, dict) else None
+    if not isinstance(summary, dict):
+        summary = {"errors": 0, "warnings": 0}
+    errors = int(summary.get("errors", 0) or 0)
+    warnings = int(summary.get("warnings", 0) or 0)
     print(f"Fresh sanitized report: {published}")
     print(
-        f"Result: {report['overall']}; errors: {summary['errors']}; "
-        f"warnings: {summary['warnings']}"
+        f"Result: {report.get('overall', 'unknown')}; errors: {errors}; "
+        f"warnings: {warnings}"
     )
-    return 0 if report["overall"] in {"pass", "warning"} else 1
+    return 0 if report.get("overall") in {"pass", "warning"} else 1
 
 
 if __name__ == "__main__":
