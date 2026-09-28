@@ -73,6 +73,8 @@ class Capability:
 class GateResult:
     verdict: str
     reasons: list[str] = field(default_factory=list)
+    code: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -84,6 +86,15 @@ class GateResult:
         prefix = "不适用" if self.verdict == NOT_EVALUABLE else "警告"
         return [f"{prefix}：{reason}" for reason in self.reasons]
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.verdict,
+            "verdict": self.verdict,
+            "code": self.code,
+            "reasons": list(self.reasons),
+            "details": deepcopy(self.details),
+        }
+
 
 @dataclass(frozen=True)
 class ExecutionPlan:
@@ -93,7 +104,7 @@ class ExecutionPlan:
     summary: str
 
 
-def register_builtin_capabilities() -> dict[str, Capability]:
+def register_legacy_capabilities() -> dict[str, dict[str, Any]]:
     """Return the versioned set of workflow capabilities available in this MVP.
 
     Capability IDs follow the frozen slots in framework section 15.2.
@@ -117,12 +128,18 @@ def register_builtin_capabilities() -> dict[str, Capability]:
 
     return {
         # 框架 15.2：workflow.bulk_rna.grch38_pe_expression_fusion 1.0.0
-        DEFAULT_WORKFLOW_PROFILE: Capability(
-            capability_id=DEFAULT_WORKFLOW_PROFILE,
-            title=bulk_profile["title"],
-            description=bulk_profile["description"],
-            version="1.0.0",
-            input_contract={
+        DEFAULT_WORKFLOW_PROFILE: {
+            "id": DEFAULT_WORKFLOW_PROFILE,
+            "version": "1.0.0",
+            "title": bulk_profile["title"],
+            "description": bulk_profile["description"],
+            "entry_stage": "qc",
+            "required_inputs": ["samples", "reference"],
+            "required_tools": ["fastp", "STAR", "featureCounts", "RSEM", "Arriba"],
+            "required_artifacts": list(output_artifacts),
+            "supports": {"data_type": ["bulk_rna_seq_fastq"], "layout": ["paired"]},
+            "gates": {},
+            "input_contract": {
                 "data_type": "bulk_rna_seq_fastq",
                 "layout": {"paired"},  # 框架 15.3：Illumina paired-end
                 "min_samples": 1,
@@ -131,16 +148,52 @@ def register_builtin_capabilities() -> dict[str, Capability]:
                 "cancer_types": bulk_profile.get("cancer_types", ["pan_cancer"]),
                 "sample_mode": bulk_profile.get("sample_mode", "cohort_or_single"),
             },
-            output_artifacts=output_artifacts,
-            requires_reference_keys=[
+            "output_artifacts": output_artifacts,
+            "requires_reference_keys": [
                 "star_index_dir",
                 "remote_gtf_path",
                 "remote_genome_fasta_path",
                 "rsem_index_prefix",
             ],
-            pipeline=pipeline,
-        ),
+            "pipeline": pipeline,
+        },
     }
+
+
+def _capability_from_record(record: dict[str, Any]) -> Capability:
+    input_contract = deepcopy(record.get("input_contract") or {})
+    supports = record.get("supports") or {}
+    gates = record.get("gates") or {}
+    input_contract.setdefault("data_type", (supports.get("data_type") or ["bulk_rna_seq_fastq"])[0])
+    input_contract.setdefault("layout", set(supports.get("layout") or ["paired"]))
+    if isinstance(input_contract["layout"], list):
+        input_contract["layout"] = set(input_contract["layout"])
+    input_contract.setdefault("min_samples", gates.get("min_samples", 1))
+    input_contract.setdefault("designs", set(supports.get("design") or ["independent_two_group", "paired_two_group", "single_group"]))
+    if isinstance(input_contract["designs"], list):
+        input_contract["designs"] = set(input_contract["designs"])
+    input_contract.setdefault("required_sample_fields", gates.get("required_sample_fields", ["sample_id", "condition"]))
+    input_contract.setdefault("cancer_types", supports.get("cancer_type") or ["pan_cancer"])
+    input_contract.setdefault("sample_mode", "cohort_or_single")
+    return Capability(
+        capability_id=record["id"],
+        title=record.get("title", record["id"]),
+        description=record.get("description", ""),
+        version=record["version"],
+        input_contract=input_contract,
+        output_artifacts=deepcopy(record.get("output_artifacts") or {item: item for item in record["required_artifacts"]}),
+        requires_reference_keys=list(record.get("requires_reference_keys") or gates.get("required_reference_keys", [])),
+        pipeline=deepcopy(record.get("pipeline") or DEFAULT_PIPELINE),
+        source="json" if record.get("id") else "workflow_profile",
+    )
+
+
+def register_builtin_capabilities() -> dict[str, Capability]:
+    """Return declarative capabilities, with the old Python registry as fallback."""
+    from .capability_registry import load_capability_registry
+
+    registry = load_capability_registry()
+    return {record["id"]: _capability_from_record(record) for record in registry.list_available()}
 
 
 def resolve_capability(capability_id: str) -> Capability:
@@ -150,6 +203,23 @@ def resolve_capability(capability_id: str) -> Capability:
         available = ", ".join(sorted(capabilities))
         raise ValueError(f"Unknown capability: {capability_id}. Available: {available}")
     return capabilities[capability_id]
+
+
+def discover_capability(capability_id: str, version: str | None = None) -> dict[str, Any]:
+    """Discover a declarative capability record without selecting an adapter."""
+    from .capability_registry import load_capability_registry
+
+    registry = load_capability_registry()
+    try:
+        return registry.get(capability_id, version=version)
+    except KeyError:
+        code = "INCOMPATIBLE_VERSION" if version is not None else "UNKNOWN_CAPABILITY"
+        reason = (
+            f"Capability {capability_id} is not compatible with version {version}."
+            if version is not None
+            else f"Unknown capability: {capability_id}"
+        )
+        return GateResult(verdict=NOT_EVALUABLE, reasons=[reason], code=code)
 
 
 def list_capabilities() -> list[Capability]:

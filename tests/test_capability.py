@@ -11,10 +11,12 @@ from rnaseq_agent.capability import (
     NOT_EVALUABLE,
     PASS,
     build_execution_plan,
+    discover_capability,
     gate_a_check,
     list_capabilities,
     resolve_capability,
 )
+from rnaseq_agent.capability_registry import load_capability_registry
 from rnaseq_agent.defaults import DEFAULT_REFERENCE
 
 
@@ -83,6 +85,26 @@ class TestCapabilityRegistry:
     def test_unknown_capability_raises(self) -> None:
         with pytest.raises(ValueError):
             resolve_capability("not_a_capability")
+
+    def test_default_discovery_uses_declarative_registry(self) -> None:
+        registry = load_capability_registry()
+        assert registry.source == "json"
+        assert {record["entry_stage"] for record in registry.list_available()} >= {
+            "qc",
+            "counts",
+            "de",
+            "cms",
+        }
+
+    def test_discovery_unknown_and_version_mismatch_are_structured(self) -> None:
+        unknown = discover_capability("missing")
+        incompatible = discover_capability(
+            "workflow.bulk_rna.grch38_pe_expression_fusion", version="9.0.0"
+        )
+        assert unknown.verdict == NOT_EVALUABLE
+        assert unknown.code == "UNKNOWN_CAPABILITY"
+        assert incompatible.verdict == NOT_EVALUABLE
+        assert incompatible.code == "INCOMPATIBLE_VERSION"
 
 
 class TestGateA:

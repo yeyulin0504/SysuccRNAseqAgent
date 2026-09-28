@@ -37,6 +37,24 @@ class AdapterError(RuntimeError):
     pass
 
 
+def discover_adapter(capability_id: str, version: str | None = None) -> dict[str, Any]:
+    """Return registry metadata used to select an existing adapter implementation."""
+    from .capability_registry import load_capability_registry
+    from .capability import GateResult, NOT_EVALUABLE
+
+    registry = load_capability_registry()
+    try:
+        return registry.get(capability_id, version=version)
+    except KeyError:
+        code = "INCOMPATIBLE_VERSION" if version is not None else "UNKNOWN_CAPABILITY"
+        reason = (
+            f"Adapter capability {capability_id} is not compatible with version {version}."
+            if version is not None
+            else f"Unknown adapter capability: {capability_id}"
+        )
+        return GateResult(verdict=NOT_EVALUABLE, reasons=[reason], code=code)
+
+
 class InspectResult:
     """Read-only pre-check result, mirroring the framework's Adapter.inspect."""
 

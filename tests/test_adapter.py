@@ -17,6 +17,7 @@ from rnaseq_agent.adapter import (
     adapter_inspect,
     adapter_materialize,
     adapter_plan,
+    discover_adapter,
 )
 from rnaseq_agent.capability import (
     ABSTAIN,
@@ -106,6 +107,14 @@ class TestAdapterInspect:
         result = adapter_inspect(cap, config)
         assert not result.ok
         assert any("参考设置" in f for f in result.findings)
+
+    def test_discovery_unknown_and_version_mismatch_are_structured(self) -> None:
+        unknown = discover_adapter("missing")
+        incompatible = discover_adapter(CAP_ID, version="9.0.0")
+        assert unknown.verdict == NOT_EVALUABLE
+        assert unknown.code == "UNKNOWN_CAPABILITY"
+        assert incompatible.verdict == NOT_EVALUABLE
+        assert incompatible.code == "INCOMPATIBLE_VERSION"
 
 
 class TestAdapterPlan:
