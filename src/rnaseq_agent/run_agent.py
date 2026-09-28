@@ -35,6 +35,12 @@ from .pipeline import (
 from .remote import collect_local_fastq_paths
 from .remote_transport import RemoteTransport, create_remote_transport
 from .result_manifest import ResultManifestSummary, create_result_manifest
+from .run_audit import (
+    default_environment,
+    write_artifact_index,
+    write_io_lineage,
+    write_run_manifest as write_audit_run_manifest,
+)
 from .shell import shell_quote
 from .storage import append_jsonl, load_json, project_state_lock, save_json
 from .validation import validate_local_fastqs
@@ -135,6 +141,14 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message)
+        _best_effort_write_audit_manifest(
+            attempt_dir,
+            config=config if "config" in locals() else {},
+            run_id=run_id,
+            attempt_id=run_id,
+            final_status="failed",
+            error=message,
+        )
         _best_effort_log_event(logs_dir, "run_failed", {"run_id": run_id, "message": message})
         raise
     try:
@@ -314,6 +328,14 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message)
+        _best_effort_write_audit_manifest(
+            attempt_dir,
+            config=run_config if "run_config" in locals() else config,
+            run_id=run_id,
+            attempt_id=run_id,
+            final_status="failed",
+            error=message,
+        )
         _best_effort_log_event(logs_dir, "run_failed", {"run_id": run_id, "message": message})
         try:
             _notify(run_config, "run_failed", message)
@@ -403,6 +425,14 @@ def _run_stage_project_claimed(
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message, stage=stage)
+        _best_effort_write_audit_manifest(
+            attempt_dir,
+            config=run_config if "run_config" in locals() else config,
+            run_id=run_id,
+            attempt_id=run_id,
+            final_status="failed",
+            error=message,
+        )
         _best_effort_log_event(
             logs_dir,
             "stage_run_failed",
@@ -1664,6 +1694,15 @@ def _write_run_manifest(
         "inputs": inputs,
         "scripts": script_artifacts,
     }
+    body["audit"] = {
+        "revision_id": project_config.get("revision_id") or project_config.get("revision", {}).get("id", ""),
+        "attempt_id": run_config.get("attempt_id") or run_config.get("run", {}).get("id", ""),
+        "parameter_sha256": canonical_sha256(run_config.get("parameters", run_config.get("pipeline", {}))),
+        "config_sha256": canonical_sha256(project_config),
+        "validation": {"status": "pass"},
+        "preflight": run_config.get("preflight", {}),
+        "final_status": "prepared",
+    }
     manifest = {
         "schema_version": 1,
         "manifest_id": f"sha256:{canonical_sha256(body)}",
@@ -1671,7 +1710,43 @@ def _write_run_manifest(
     }
     path = attempt_dir / "run_manifest.json"
     save_json(path, manifest)
+    write_io_lineage(attempt_dir, inputs, script_artifacts)
+    write_artifact_index(attempt_dir, script_artifacts)
     return path
+
+
+def _best_effort_write_audit_manifest(
+    attempt_dir: Path,
+    *,
+    config: dict[str, Any],
+    run_id: str,
+    attempt_id: str,
+    final_status: str,
+    error: str,
+) -> None:
+    """Persist failure evidence without replacing the original exception."""
+
+    try:
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        project = config.get("project", {})
+        execution = config.get("execution", {})
+        write_audit_run_manifest(
+            attempt_dir,
+            project_id=str(project.get("id", "")),
+            revision_id=str(config.get("revision_id") or config.get("revision", {}).get("id", "")),
+            run_id=run_id,
+            attempt_id=attempt_id,
+            contract_id=str(execution.get("verified_contract_id") or execution.get("contract_id") or ""),
+            parameters=config.get("parameters", config.get("pipeline", {})),
+            config=config,
+            tool_versions={"agent": __version__},
+            environment=default_environment(),
+            validation={"status": "failed", "error": error},
+            preflight=config.get("preflight", {}),
+            final_status=final_status,
+        )
+    except BaseException:
+        return
 
 
 def _log_event(logs_dir: Path, event: str, payload: dict[str, Any]) -> None:

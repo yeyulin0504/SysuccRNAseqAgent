@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .analysis_contract import canonical_sha256, sha256_file
+from .run_audit import write_artifact_index
 from .storage import save_json
 
 
@@ -69,6 +70,15 @@ def create_result_manifest(
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "body": body,
     }
+    save_json(output_path, manifest)
+    artifact_index_path = write_artifact_index(output_path.parent, files)
+    body["audit"] = {
+        "schema_version": RESULT_MANIFEST_SCHEMA_VERSION,
+        "artifact_index": artifact_index_path.name,
+        "final_status": "completed" if not errors else "invalid",
+        "validation": manifest["body"]["validation"],
+    }
+    manifest["manifest_id"] = f"sha256:{canonical_sha256(body)}"
     save_json(output_path, manifest)
     return ResultManifestSummary(output_path, not errors, errors, files_sha256)
 

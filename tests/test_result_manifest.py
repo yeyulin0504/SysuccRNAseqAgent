@@ -33,6 +33,23 @@ def _write(root: Path, relative_path: str, content: bytes) -> None:
 
 
 class ResultManifestTests(unittest.TestCase):
+    def test_result_manifest_contains_audited_envelope_and_artifact_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            extracted = root / "extracted"
+            _write(extracted, "status/completed.flag", b"")
+            _write(extracted, "status/state.txt", b"completed\n")
+            _write(extracted, "star/sample_1.Aligned.sortedByCoord.out.bam", b"bam")
+            _write(extracted, "star/sample_1.Log.final.out", b"mapped\n")
+            _write(extracted, "featurecounts/gene_counts.txt", b"gene\tcount\nA\t1\n")
+            _write(extracted, "featurecounts/gene_counts.txt.summary", b"Assigned\t1\n")
+
+            summary = create_result_manifest(_config(), extracted, root / "result_manifest.json")
+            payload = load_json(summary.path)
+
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertIn("audit", payload["body"])
+            self.assertTrue((root / "artifact_index.json").is_file())
     def test_counts_stage_requires_only_enabled_conditional_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
