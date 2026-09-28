@@ -153,6 +153,9 @@ def _run_project_claimed(
         )
         _record_lifecycle_phase(logs_dir, "load_contract", run_id=run_id, stage="full")
         _record_lifecycle_phase(logs_dir, "create_attempt", run_id=run_id, stage="full")
+        run_config["preflight"] = _write_attempt_preflight(
+            attempt_dir, run_config, logs_dir, stage="full"
+        )
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message)
@@ -184,6 +187,14 @@ def _run_project_claimed(
                     "errors": validation.errors,
                 },
             )
+            run_config["preflight"] = _write_failed_attempt_preflight(
+                attempt_dir,
+                run_config,
+                logs_dir,
+                message,
+                failure_kind="input",
+                stage="full",
+            )
             raise RuntimeError(message)
 
         _update_status(config_path, "validated", "Local FASTQ validation passed.")
@@ -193,20 +204,22 @@ def _run_project_claimed(
         except ContractError as exc:
             _update_status(config_path, "policy_failed", str(exc))
             _log_event(logs_dir, "execution_policy_failed", {"run_id": run_id, "message": str(exc)})
+            run_config["preflight"] = _write_failed_attempt_preflight(
+                attempt_dir,
+                run_config,
+                logs_dir,
+                str(exc),
+                failure_kind="policy",
+                stage="full",
+            )
             raise
         _record_policy_verification(config_path, policy)
-        preflight = _write_attempt_preflight(attempt_dir, run_config, logs_dir, stage="full")
-        run_config["preflight"] = preflight
         _record_lifecycle_phase(logs_dir, "approval_contract_check", run_id=run_id, stage="full")
         run_config["execution"].update(
             {key: value for key, value in policy.items() if value}
         )
         save_json(snapshot_path, run_config)
         _log_event(logs_dir, "execution_policy_verified", {"run_id": run_id, **policy})
-        transport = create_remote_transport(run_config)
-        _upload_fastqs(run_config, logs_dir, transport)
-        _update_status(config_path, "uploaded", "Local FASTQ files uploaded to the server.")
-
         remote_scripts = _prepare_remote_scripts(run_config, config_path, attempt_dir, logs_dir)
         manifest_path = _write_run_manifest(
             config,
@@ -231,6 +244,9 @@ def _run_project_claimed(
             _record_lifecycle_phase(logs_dir, "dry_run", run_id=run_id, stage="full")
             _finalize_attempt_audit(attempt_dir, "dry_run", message)
             return RunOutcome("dry_run", message, project_dir)
+        transport = create_remote_transport(run_config)
+        _upload_fastqs(run_config, logs_dir, transport)
+        _update_status(config_path, "uploaded", "Local FASTQ files uploaded to the server.")
         support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
         _transition_execution_claim(
@@ -468,6 +484,9 @@ def _run_stage_project_claimed(
         )
         _record_lifecycle_phase(logs_dir, "load_contract", run_id=run_id, stage=stage)
         _record_lifecycle_phase(logs_dir, "create_attempt", run_id=run_id, stage=stage)
+        run_config["preflight"] = _write_attempt_preflight(
+            attempt_dir, run_config, logs_dir, stage=stage
+        )
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message, stage=stage)
@@ -500,37 +519,37 @@ def _run_stage_project_claimed(
                     message = "Local FASTQ validation failed: " + ", ".join(parts)
                     _update_status(config_path, "validation_failed", message)
                     _log_event(logs_dir, "validation_failed", {"stage": stage, "message": message})
+                    run_config["preflight"] = _write_failed_attempt_preflight(
+                        attempt_dir,
+                        run_config,
+                        logs_dir,
+                        message,
+                        failure_kind="input",
+                        stage=stage,
+                    )
                     raise RuntimeError(message)
             _update_status(config_path, "validated", "Local FASTQ validation passed.", stage=stage)
-            transport = None if requested_dry_run else create_remote_transport(run_config)
-            if not _fastqs_prestaged(run_config) and not requested_dry_run:
-                _upload_fastqs(run_config, logs_dir, transport)
-                _update_status(config_path, "uploaded", "Local FASTQ files uploaded.", stage=stage)
-            else:
-                _update_status(
-                    config_path,
-                    "uploaded",
-                    "FASTQ 已存在于服务器（remote_path 数据源），跳过上传。",
-                    stage=stage,
-                )
         elif stage == "counts":
             # counts 直入（2026-09-08）：把上传的 counts_matrix.tsv 上传到
             # 远程工作区根目录，diffexp/cms R 脚本直接读它。
-            transport = None if requested_dry_run else create_remote_transport(run_config)
-            if not requested_dry_run:
-                _upload_counts_matrix(run_config, config_path, logs_dir, transport)
-        else:
-            transport = None if requested_dry_run else create_remote_transport(run_config)
+            pass
 
         try:
             policy = enforce_execution_policy(config_path, config)
         except ContractError as exc:
             _update_status(config_path, "policy_failed", str(exc), stage=stage)
             _log_event(logs_dir, "execution_policy_failed", {"run_id": run_id, "stage": stage, "message": str(exc)})
+            run_config["preflight"] = _write_failed_attempt_preflight(
+                attempt_dir,
+                run_config,
+                logs_dir,
+                str(exc),
+                failure_kind="policy",
+                stage=stage,
+            )
             raise
         _record_policy_verification(config_path, policy)
         _record_lifecycle_phase(logs_dir, "validate_inputs", run_id=run_id, stage=stage)
-        run_config["preflight"] = _write_attempt_preflight(attempt_dir, run_config, logs_dir, stage=stage)
         _record_lifecycle_phase(logs_dir, "approval_contract_check", run_id=run_id, stage=stage)
         remote_scripts = _prepare_stage_scripts(run_config, config_path, attempt_dir, logs_dir, stage)
         manifest_path = attempt_dir / "run_manifest.json"
@@ -563,6 +582,20 @@ def _run_stage_project_claimed(
             _record_lifecycle_phase(logs_dir, "dry_run", run_id=run_id, stage=stage)
             _finalize_attempt_audit(attempt_dir, "dry_run", message)
             return RunOutcome("dry_run", message, project_dir)
+        transport = create_remote_transport(run_config)
+        if stage == STAGE_QC:
+            if not _fastqs_prestaged(run_config):
+                _upload_fastqs(run_config, logs_dir, transport)
+                _update_status(config_path, "uploaded", "Local FASTQ files uploaded.", stage=stage)
+            else:
+                _update_status(
+                    config_path,
+                    "uploaded",
+                    "FASTQ 已存在于服务器（remote_path 数据源），跳过上传。",
+                    stage=stage,
+                )
+        elif stage == "counts":
+            _upload_counts_matrix(run_config, config_path, logs_dir, transport)
         support_files = [*remote_scripts, snapshot_path, manifest_path]
         _upload_support_files(run_config, support_files, logs_dir, transport)
 
@@ -722,16 +755,76 @@ def refresh_status(config_path: Path) -> dict[str, Any]:
     )
     observed_claim_status = str((observed_claim or {}).get("status") or "")
     active_config = _config_for_active_attempt(config)
-    state = _read_remote_state(active_config, create_remote_transport(active_config))
+    transport = create_remote_transport(active_config)
+    state = _read_remote_state(active_config, transport)
     if state:
-        _apply_refresh_observation(
+        applied = _apply_refresh_observation(
             config_path,
             observed_run_id=observed_run_id,
             observed_claim_id=observed_claim_id,
             observed_claim_status=observed_claim_status,
             remote_state=state,
         )
+        if applied:
+            _finalize_refresh_attempt(
+                config_path,
+                active_config,
+                transport,
+                remote_state=state,
+            )
     return normalize_config(load_json(config_path)).get("status", {})
+
+
+def _finalize_refresh_attempt(
+    config_path: Path,
+    active_config: dict[str, Any],
+    transport: RemoteTransport,
+    *,
+    remote_state: str,
+) -> None:
+    """Converge a refreshed attempt's local evidence after a wait=False submit."""
+
+    status = normalize_config(load_json(config_path)).get("status", {})
+    attempt_dir = Path(str(status.get("attempt_dir") or ""))
+    if not attempt_dir.is_dir():
+        return
+    logs_dir = attempt_dir / "agent_logs"
+    message = f"Remote state: {remote_state}"
+    final_status = remote_state
+    if remote_state == "completed":
+        try:
+            summary = _download_results(
+                active_config,
+                attempt_dir / "downloads",
+                logs_dir,
+                transport,
+                stage=(str(status.get("stage")) if status.get("stage") else None),
+            )
+            _update_status(
+                config_path,
+                "results_verified" if summary.ok else "result_validation_failed",
+                "Downloaded result manifest verified."
+                if summary.ok
+                else "Downloaded results are incomplete or invalid.",
+                result_manifest_file=str(summary.path),
+                result_files_sha256=summary.files_sha256,
+                result_validation_errors=summary.errors,
+            )
+            _record_lifecycle_phase(logs_dir, "validate_output", run_id=str(status.get("run_id") or ""), ok=summary.ok)
+            if not summary.ok:
+                final_status = "result_validation_failed"
+                message = "; ".join(summary.errors)
+        except BaseException as exc:
+            final_status = "download_failed"
+            message = f"Remote analysis completed, but downloading results failed: {exc}"
+            _update_status(config_path, final_status, message)
+    _finalize_attempt_audit(attempt_dir, final_status, message)
+    _record_lifecycle_phase(
+        logs_dir,
+        "register_artifacts",
+        run_id=str(status.get("run_id") or ""),
+        state=final_status,
+    )
 
 
 def _apply_refresh_observation(
@@ -1261,12 +1354,13 @@ def _write_attempt_preflight(
     logs_dir: Path,
     *,
     stage: str,
+    local: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist the Task 3 envelope before any submit side effect."""
 
     supplied = config.get("preflight")
     report = supplied if isinstance(supplied, dict) else {"overall": "pass"}
-    envelope = build_preflight_envelope(config, local=report)
+    envelope = build_preflight_envelope(config, local=local if local is not None else report)
     path = attempt_dir / "preflight.json"
     save_json(path, envelope)
     _record_lifecycle_phase(
@@ -1278,6 +1372,29 @@ def _write_attempt_preflight(
         overall=envelope.get("overall"),
     )
     return envelope
+
+
+def _write_failed_attempt_preflight(
+    attempt_dir: Path,
+    config: dict[str, Any],
+    logs_dir: Path,
+    message: str,
+    *,
+    failure_kind: str,
+    stage: str,
+) -> dict[str, Any]:
+    """Replace the initial envelope with a standard, redacted failure report."""
+
+    return _write_attempt_preflight(
+        attempt_dir,
+        config,
+        logs_dir,
+        stage=stage,
+        local={
+            "overall": "failed",
+            "diagnostics": {"failure_kind": failure_kind, "error": message},
+        },
+    )
 
 
 def _execution_contract_id(config_path: Path, config: dict[str, Any]) -> str:

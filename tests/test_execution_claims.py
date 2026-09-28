@@ -540,6 +540,38 @@ def test_stale_refresh_observation_cannot_overwrite_new_claim(
     assert live["execution_claims"][second_claim_id]["status"] == "submitted"
 
 
+@pytest.mark.parametrize("observed_state", ["queued", "running", "completed", "failed", "reconcile"])
+def test_refresh_status_finalizes_wait_false_attempt_manifest(
+    tmp_path, monkeypatch, observed_state
+) -> None:
+    config_path = _fastq_project(tmp_path)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+
+    outcome = run_project(config_path, wait=False)
+    assert outcome.state == "submitted"
+
+    if observed_state == "completed":
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "rnaseq_agent.run_agent._download_results",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                ok=True,
+                errors=[],
+                path=tmp_path / "result_manifest.json",
+                files_sha256="sha256:results",
+            ),
+        )
+    monkeypatch.setattr("rnaseq_agent.run_agent._read_remote_state", lambda *_args: observed_state)
+
+    status = refresh_status(config_path)
+    attempt_dir = Path(status["attempt_dir"])
+    manifest = load_json(attempt_dir / "run_manifest.json")
+    assert manifest["body"]["final_status"] == observed_state
+    assert load_json(attempt_dir / "artifact_index.json")["artifacts"] is not None
+
+
 def test_invalid_stage_failure_does_not_settle_foreign_started_claim(
     tmp_path, monkeypatch
 ) -> None:
