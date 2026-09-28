@@ -37,6 +37,7 @@ from .remote_transport import RemoteTransport, create_remote_transport
 from .result_manifest import ResultManifestSummary, create_result_manifest
 from .run_audit import (
     default_environment,
+    finalize_run_manifest,
     write_artifact_index,
     write_io_lineage,
     write_run_manifest as write_audit_run_manifest,
@@ -228,6 +229,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
                 "submission_reconcile_required",
                 {"run_id": run_id, "reason": "missing_or_invalid_job_id"},
             )
+            _finalize_attempt_audit(attempt_dir, "reconcile_required", message)
             return RunOutcome("reconcile_required", message, project_dir)
 
         _transition_execution_claim(
@@ -273,6 +275,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
                     project_message=message,
                 )
                 _notify(run_config, "download_failed", message)
+                _finalize_attempt_audit(attempt_dir, "download_failed", message)
                 return RunOutcome("download_failed", message, project_dir)
             _update_status(
                 config_path,
@@ -297,6 +300,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
                     project_message=message,
                 )
                 _notify(run_config, "result_validation_failed", message)
+                _finalize_attempt_audit(attempt_dir, "result_validation_failed", message)
                 return RunOutcome("result_validation_failed", message, project_dir)
             message = "RNA-seq analysis completed and results downloaded."
             final_state = "completed"
@@ -324,6 +328,7 @@ def _run_project_claimed(config_path: Path, *, wait: bool = True) -> RunOutcome:
                 project_message=message,
             )
         _notify(run_config, final_state, message)
+        _finalize_attempt_audit(attempt_dir, final_state, message)
         return RunOutcome(final_state, message, project_dir)
     except BaseException as exc:
         message = str(exc)
@@ -531,6 +536,7 @@ def _run_stage_project_claimed(
                 "stage_submission_reconcile_required",
                 {"run_id": run_id, "stage": stage, "reason": "missing_or_invalid_job_id"},
             )
+            _finalize_attempt_audit(attempt_dir, "reconcile_required", message)
             return RunOutcome("reconcile_required", message, project_dir)
         submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _transition_execution_claim(
@@ -572,6 +578,7 @@ def _run_stage_project_claimed(
                     stage_status="failed",
                 )
                 _notify(run_config, "download_failed", message)
+                _finalize_attempt_audit(attempt_dir, "download_failed", message)
                 return RunOutcome("download_failed", message, project_dir)
             if not summary.ok:
                 message = f"Stage {stage} results are incomplete or invalid: " + "; ".join(summary.errors)
@@ -585,6 +592,7 @@ def _run_stage_project_claimed(
                     stage_status="failed",
                 )
                 _notify(run_config, "result_validation_failed", message)
+                _finalize_attempt_audit(attempt_dir, "result_validation_failed", message)
                 return RunOutcome("result_validation_failed", message, project_dir)
             _transition_execution_claim(
                 config_path,
@@ -595,6 +603,7 @@ def _run_stage_project_claimed(
                 project_message=f"Stage {stage} completed and results verified.",
                 stage_status="completed",
             )
+            _finalize_attempt_audit(attempt_dir, "stage_completed", f"Stage {stage} completed.")
             return RunOutcome("stage_completed", f"Stage {stage} completed.", project_dir)
         if final_state == "timeout":
             message = f"Stage {stage} did not finish before the polling timeout."
@@ -610,10 +619,19 @@ def _run_stage_project_claimed(
             stage_status=final_state,
         )
         _notify(run_config, final_state, message)
+        _finalize_attempt_audit(attempt_dir, final_state, message)
         return RunOutcome(final_state, message, project_dir)
     except BaseException as exc:
         message = str(exc)
         _record_execution_exception(config_path, claim_id, message, stage=stage)
+        _best_effort_write_audit_manifest(
+            attempt_dir,
+            config=run_config if "run_config" in locals() else config,
+            run_id=run_id,
+            attempt_id=run_id,
+            final_status="failed",
+            error=message,
+        )
         _best_effort_log_event(
             logs_dir,
             "stage_run_failed",
@@ -1710,7 +1728,16 @@ def _write_run_manifest(
     }
     path = attempt_dir / "run_manifest.json"
     save_json(path, manifest)
-    write_io_lineage(attempt_dir, inputs, script_artifacts)
+    lineage_scripts = [
+        {
+            "logical_name": item["name"],
+            "path": str((attempt_dir / "generated_scripts" / item["name"]).relative_to(attempt_dir)),
+            "size_bytes": item["size_bytes"],
+            "sha256": item["sha256"],
+        }
+        for item in script_artifacts
+    ]
+    write_io_lineage(attempt_dir, inputs, lineage_scripts)
     write_artifact_index(attempt_dir, script_artifacts)
     return path
 
@@ -1730,6 +1757,9 @@ def _best_effort_write_audit_manifest(
         attempt_dir.mkdir(parents=True, exist_ok=True)
         project = config.get("project", {})
         execution = config.get("execution", {})
+        if (attempt_dir / "run_manifest.json").is_file():
+            finalize_run_manifest(attempt_dir, final_status=final_status, error=error)
+            return
         write_audit_run_manifest(
             attempt_dir,
             project_id=str(project.get("id", "")),
@@ -1745,6 +1775,13 @@ def _best_effort_write_audit_manifest(
             preflight=config.get("preflight", {}),
             final_status=final_status,
         )
+    except BaseException:
+        return
+
+
+def _finalize_attempt_audit(attempt_dir: Path, final_status: str, message: str) -> None:
+    try:
+        finalize_run_manifest(attempt_dir, final_status=final_status, error=message)
     except BaseException:
         return
 

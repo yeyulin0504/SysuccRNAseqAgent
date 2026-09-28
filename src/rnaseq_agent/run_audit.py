@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,12 @@ _SENSITIVE_KEY_PARTS = (
     "privatekey",
     "credential",
     "authorization",
+    "api_key",
+    "apikey",
+    "api-key",
+    "passphrase",
+    "client_secret",
+    "access_token",
 )
 _PATH_KEY_PARTS = (
     "path",
@@ -71,16 +78,29 @@ def flatten_declared_paths(value: Any, prefix: str = "") -> list[dict[str, str]]
     return records
 
 
-def write_io_lineage(attempt_dir: Path, inputs: Any, outputs: Any) -> Path:
+def write_io_lineage(
+    attempt_dir: Path,
+    inputs: Any,
+    outputs: Any,
+    *,
+    source_inputs: list[str] | None = None,
+) -> Path:
     path = Path(attempt_dir) / "io_lineage.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     for kind, values in (("input", inputs), ("output", outputs)):
-        declared = flatten_declared_paths(values)
-        if not declared and isinstance(values, list):
-            declared = [item for item in values if isinstance(item, dict)]
+        if isinstance(values, list) and all(isinstance(item, dict) for item in values):
+            declared = [dict(item) for item in values]
+        else:
+            declared = flatten_declared_paths(values)
         for record in declared:
-            lines.append(json.dumps({"kind": kind, **_redact(record)}, ensure_ascii=False, sort_keys=True))
+            lines.append(
+                json.dumps(
+                    {"kind": kind, **_lineage_record(Path(attempt_dir), record, kind, source_inputs)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return path
 
@@ -140,6 +160,42 @@ def write_run_manifest(
     return path
 
 
+def finalize_run_manifest(
+    attempt_dir: Path,
+    *,
+    final_status: str,
+    error: str | None = None,
+    validation: Any | None = None,
+    preflight: Any | None = None,
+) -> Path:
+    """Update terminal audit state without replacing the original envelope."""
+
+    path = Path(attempt_dir) / "run_manifest.json"
+    if path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        body = _load_manifest_body(payload)
+    else:
+        payload = {}
+        body = {"schema_version": RUN_AUDIT_SCHEMA_VERSION}
+    audit = dict(body.get("audit") or {})
+    audit.update({"final_status": final_status})
+    if error:
+        audit["error"] = error
+    if validation is not None:
+        audit["validation"] = _redact(validation)
+    if preflight is not None:
+        audit["preflight"] = _redact(preflight)
+    body["audit"] = _redact(audit)
+    body["final_status"] = final_status
+    result = {
+        "schema_version": payload.get("schema_version", RUN_AUDIT_SCHEMA_VERSION) if path.is_file() else RUN_AUDIT_SCHEMA_VERSION,
+        "manifest_id": f"sha256:{canonical_sha256(body)}",
+        "body": body,
+    }
+    save_json(path, result)
+    return path
+
+
 def validate_run_manifest(path: Path) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     _validate_manifest_payload(payload)
@@ -148,9 +204,25 @@ def validate_run_manifest(path: Path) -> dict[str, Any]:
 
 def _validate_manifest_payload(payload: dict[str, Any]) -> None:
     body = payload.get("body")
+    if not isinstance(body, dict) and "manifest_id" in payload:
+        body = {key: value for key, value in payload.items() if key not in {"manifest_id", "schema_version"}}
     expected = f"sha256:{canonical_sha256(body)}" if isinstance(body, dict) else ""
     if payload.get("manifest_id") != expected:
         raise ValueError("manifest ID does not match manifest body")
+
+
+def _load_manifest_body(payload: dict[str, Any]) -> dict[str, Any]:
+    """Load both the current envelope and the pre-envelope flat schema."""
+
+    _validate_manifest_payload(payload)
+    body = payload.get("body")
+    if isinstance(body, dict):
+        return dict(body)
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"manifest_id", "schema_version"}
+    }
 
 
 def _looks_like_declared_path(location: str, value: str) -> bool:
@@ -163,6 +235,8 @@ def _looks_like_declared_path(location: str, value: str) -> bool:
 def _redact(value: Any, key: str = "") -> Any:
     if any(part in key.lower() for part in _SENSITIVE_KEY_PARTS):
         return "[REDACTED]"
+    if isinstance(value, str):
+        return re.sub(r"(://)([^/@\s]+)@", r"\1[REDACTED]@", value)
     if isinstance(value, dict):
         return {str(k): _redact(v, str(k)) for k, v in value.items()}
     if isinstance(value, list):
@@ -172,3 +246,33 @@ def _redact(value: Any, key: str = "") -> Any:
 
 def default_environment() -> dict[str, str]:
     return {"python": sys.version.split()[0], "platform": platform.platform(), "cwd": os.getcwd()}
+
+
+def _lineage_record(
+    attempt_dir: Path,
+    record: dict[str, Any],
+    kind: str,
+    default_source_inputs: list[str] | None,
+) -> dict[str, Any]:
+    raw_path = str(record.get("path") or record.get("logical_name") or record.get("name") or "")
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = attempt_dir / candidate
+    exists = candidate.is_file()
+    metadata = sha256_file(candidate) if exists else {
+        "size_bytes": None,
+        "sha256": None,
+        "sha256_skipped_reason": "file_missing",
+    }
+    result = dict(record)
+    result.setdefault("logical_name", record.get("name") or raw_path)
+    result["path"] = raw_path.replace("\\", "/")
+    result["exists"] = exists
+    result["size_bytes"] = record.get("size_bytes", metadata.get("size_bytes"))
+    result["sha256"] = record.get("sha256", metadata.get("sha256"))
+    if "sha256_skipped_reason" in metadata:
+        result["sha256_skipped_reason"] = metadata["sha256_skipped_reason"]
+    if "source_inputs" not in result:
+        result["source_inputs"] = list(default_source_inputs or [])
+    result.pop("declared_at", None)
+    return _redact(result)
