@@ -4,6 +4,7 @@ recursive-include docs *.md
 recursive-include examples *.json
 recursive-include references capability-registry.json
 recursive-include src *.py
+recursive-include src/rnaseq_agent/resources *.json
 exclude .gitignore
 recursive-exclude .git *
 recursive-exclude .codex *

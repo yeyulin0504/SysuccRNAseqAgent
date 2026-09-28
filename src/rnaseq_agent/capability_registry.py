@@ -10,6 +10,7 @@ plan, and materialize behavior.
 from __future__ import annotations
 
 import json
+from importlib.resources import files as resource_files
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,11 +111,18 @@ class CapabilityRegistry:
     def validate_capability(
         self,
         capability_id: str,
-        request: dict[str, Any],
+        request: Any,
         *,
         version: str | None = None,
     ):
         from .capability import GateResult, NOT_EVALUABLE, PASS
+
+        if not isinstance(request, dict):
+            return GateResult(
+                verdict=NOT_EVALUABLE,
+                reasons=["Capability validation request must be an object."],
+                code="MALFORMED_REQUEST",
+            )
 
         record = self._records.get(capability_id)
         if record is None:
@@ -200,6 +208,9 @@ def _artifact_matches(pattern: str, artifact: str) -> bool:
 
 
 def _default_registry_path() -> Path:
+    packaged = resource_files("rnaseq_agent").joinpath("resources", "capability-registry.json")
+    if packaged.is_file():
+        return Path(str(packaged))
     return Path(__file__).resolve().parents[2] / "references" / "capability-registry.json"
 
 

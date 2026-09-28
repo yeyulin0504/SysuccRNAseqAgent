@@ -130,6 +130,19 @@ def test_registry_gate_applies_declared_sample_gate(tmp_path: Path) -> None:
     assert result.code == "GATE_NOT_MET"
 
 
+@pytest.mark.parametrize("malformed_request", [None, [], "not-a-request", 42])
+def test_malformed_request_returns_structured_not_evaluable(tmp_path: Path, malformed_request) -> None:
+    path = tmp_path / "capability-registry.json"
+    path.write_text(json.dumps(_registry_payload()), encoding="utf-8")
+    registry = load_capability_registry(path)
+
+    result = registry.validate_capability("workflow.test.qc", malformed_request)
+
+    assert result.verdict == NOT_EVALUABLE
+    assert result.code == "MALFORMED_REQUEST"
+    assert result.to_dict()["status"] == NOT_EVALUABLE
+
+
 def test_capability_loader_can_use_legacy_python_registry_when_json_missing() -> None:
     registry = load_capability_registry(Path("does-not-exist.json"))
 

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "capabilities": [
+    {
+      "id": "workflow.bulk_rna.grch38_pe_expression_fusion",
+      "version": "1.0.0",
+      "title": "Bulk RNA-seq expression + fusion (GRCh38 paired-end) v1",
+      "description": "Versioned bulk RNA-seq expression and fusion workflow.",
+      "entry_stage": "qc",
+      "required_inputs": ["samples", "reference"],
+      "required_tools": ["fastp", "STAR", "featureCounts", "RSEM", "Arriba"],
+      "required_artifacts": ["fastp/*.json", "star/*.Log.final.out", "featurecounts/gene_counts.txt", "rsem/*.genes.results", "arriba/*.fusions.tsv"],
+      "supports": {"data_type": ["bulk_rna_seq_fastq"], "layout": ["paired"], "design": ["independent_two_group", "paired_two_group", "single_group"], "cancer_type": ["pan_cancer"]},
+      "gates": {"min_samples": 1, "required_sample_fields": ["sample_id", "condition", "fastq_1"], "required_reference_keys": ["star_index_dir", "remote_gtf_path", "remote_genome_fasta_path", "rsem_index_prefix"]},
+      "input_contract": {"data_type": "bulk_rna_seq_fastq", "layout": ["paired"], "min_samples": 1, "designs": ["independent_two_group", "paired_two_group", "single_group"], "required_sample_fields": ["sample_id", "condition", "fastq_1"], "cancer_types": ["pan_cancer"], "sample_mode": "cohort_or_single"},
+      "requires_reference_keys": ["star_index_dir", "remote_gtf_path", "remote_genome_fasta_path", "rsem_index_prefix"],
+      "output_artifacts": {"featurecounts/gene_counts.txt": "gene-level count matrix", "rsem/*.genes.results": "per-sample RSEM gene-level quantification", "arriba/*.fusions.tsv": "fusion candidate calls (manual review required)", "fastp/*.json": "per-sample fastp QC JSON", "star/*.Log.final.out": "per-sample STAR alignment summary"},
+      "pipeline": {"fastp": {"enabled": true, "version": "0.24.1"}, "star": {"enabled": true, "version": "2.7.11b"}, "arriba": {"enabled": true, "version": "2.5.0"}, "featurecounts": {"enabled": true, "version": "Subread 2.1.1"}, "rsem": {"enabled": true, "version": "1.2.28"}, "diffexp": {"enabled": false, "version": "DESeq2 1.40+ (R 4.2+)"}, "cms": {"enabled": false, "version": "CMScaller 2.0"}}
+    },
+    {"id": "workflow.bulk_rna.qc", "version": "1.0.0", "title": "Bulk RNA-seq QC", "description": "Existing fastp and STAR quality-control stage.", "entry_stage": "qc", "required_inputs": ["samples", "reference"], "required_tools": ["fastp", "STAR"], "required_artifacts": ["fastp/*.json", "star/*.Log.final.out"], "supports": {"data_type": ["bulk_rna_seq_fastq"], "layout": ["paired"]}, "gates": {"min_samples": 1, "required_sample_fields": ["sample_id", "fastq_1"]}},
+    {"id": "workflow.bulk_rna.counts", "version": "1.0.0", "title": "Bulk RNA-seq counts", "description": "Existing featureCounts/counts-input stage.", "entry_stage": "counts", "required_inputs": ["samples"], "required_tools": ["featureCounts"], "required_artifacts": ["featurecounts/gene_counts.txt"], "supports": {"data_type": ["bulk_rna_seq_fastq", "bulk_rna_counts"]}, "gates": {"min_samples": 1, "required_sample_fields": ["sample_id", "condition"]}},
+    {"id": "workflow.bulk_rna.de", "version": "1.0.0", "title": "Bulk RNA-seq differential expression", "description": "Existing guarded DESeq2 stage.", "entry_stage": "de", "required_inputs": ["counts", "design"], "required_tools": ["DESeq2"], "required_artifacts": ["diffexp/deseq2_results.tsv", "diffexp/deseq2_summary.json"], "supports": {"data_type": ["bulk_rna_counts"], "design": ["independent_two_group", "paired_two_group"]}, "gates": {"min_samples": 6, "min_replicates_per_group": 3, "required_sample_fields": ["sample_id", "condition"]}},
+    {"id": "workflow.bulk_rna.cms", "version": "1.0.0", "title": "Bulk RNA-seq CMS", "description": "Existing guarded CMScaller CMS classification stage.", "entry_stage": "cms", "required_inputs": ["counts", "cancer_type"], "required_tools": ["CMScaller"], "required_artifacts": ["cms/cms_result.csv", "cms/cms_summary.json"], "supports": {"data_type": ["bulk_rna_counts"], "cancer_type": ["CRC"]}, "gates": {"min_samples": 30, "required_sample_fields": ["sample_id"]}}
+  ]
+}
