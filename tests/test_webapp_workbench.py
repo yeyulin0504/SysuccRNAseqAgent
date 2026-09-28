@@ -146,6 +146,40 @@ class TestWorkbenchPage:
         response = client.get("/api/projects/missing/graph/state", headers=_headers(token))
         assert response.json()["durable"]["status"] == "result_missing"
 
+    def test_graph_state_results_verified_requires_manifest_and_maps_completed(self, client) -> None:
+        token = _token(client)
+        _create_project(client, token, "verified")
+        project_dir = Path(client.get("/api/state?project=verified", headers=_headers(token)).json()["project_dir"])
+        (project_dir / "project.json").write_text(json.dumps({"status": {"state": "results_verified", "run_id": "run-3"}}), encoding="utf-8")
+        response = client.get("/api/projects/verified/graph/state", headers=_headers(token))
+        assert response.json()["durable"]["status"] == "result_missing"
+        attempt = project_dir / "attempts" / "run-3"
+        attempt.mkdir(parents=True)
+        (attempt / "result_manifest.json").write_text(json.dumps({"body": {"validation": {"status": "valid"}}}), encoding="utf-8")
+        response = client.get("/api/projects/verified/graph/state", headers=_headers(token))
+        durable = response.json()["durable"]
+        assert durable["status"] == "completed"
+        assert durable["result_manifest"]["validation"]["status"] == "valid"
+
+    def test_graph_state_does_not_read_attempt_manifest_outside_project(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _create_project(client, token, "bounded")
+        project_dir = Path(client.get("/api/state?project=bounded", headers=_headers(token)).json()["project_dir"])
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "result_manifest.json").write_text(json.dumps({"body": {"validation": {"status": "valid"}}}), encoding="utf-8")
+        (project_dir / "project.json").write_text(json.dumps({"status": {"state": "results_verified", "attempt_dir": str(outside)}}), encoding="utf-8")
+        durable = client.get("/api/projects/bounded/graph/state", headers=_headers(token)).json()["durable"]
+        assert durable["result_manifest"]["available"] is False
+
+    def test_graph_state_malformed_project_json_returns_unavailable(self, client) -> None:
+        token = _token(client)
+        _create_project(client, token, "corrupt")
+        project_dir = Path(client.get("/api/state?project=corrupt", headers=_headers(token)).json()["project_dir"])
+        (project_dir / "project.json").write_text("{broken", encoding="utf-8")
+        durable = client.get("/api/projects/corrupt/graph/state", headers=_headers(token)).json()["durable"]
+        assert durable["status"] == "unavailable"
+
     def test_workbench_renders_with_project(self, client) -> None:
         token = _token(client)
         h = _headers(token)

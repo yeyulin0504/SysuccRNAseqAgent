@@ -1099,12 +1099,36 @@ def create_app(
 
     def _durable_project_snapshot(project_dir: Path) -> dict[str, Any]:
         """Project-owned status and artifacts used by the workbench panels."""
-        config = load_json(project_dir / "project.json") if (project_dir / "project.json").is_file() else {}
+        def _safe_json(path: Path) -> dict[str, Any]:
+            try:
+                value = load_json(path) if path.is_file() else {}
+            except (OSError, ValueError, TypeError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        project_root = project_dir.resolve()
+        project_file = project_root / "project.json"
+        project_corrupt = False
+        try:
+            config = load_json(project_file) if project_file.is_file() else {}
+            if not isinstance(config, dict):
+                config = {}
+        except (OSError, ValueError, TypeError):
+            config = {}
+            project_corrupt = True
         status = config.get("status") if isinstance(config.get("status"), dict) else {}
         raw_state = str(status.get("state") or "").strip().lower()
         attempt_dir = Path(str(status.get("attempt_dir") or "")) if status.get("attempt_dir") else None
-        if attempt_dir is not None and not attempt_dir.is_absolute():
-            attempt_dir = project_dir / attempt_dir
+        if attempt_dir is None and status.get("run_id"):
+            attempt_dir = project_root / "attempts" / str(status.get("run_id"))
+        if attempt_dir is not None:
+            if not attempt_dir.is_absolute():
+                attempt_dir = project_root / attempt_dir
+            try:
+                attempt_dir = attempt_dir.resolve()
+                attempt_dir.relative_to(project_root)
+            except (OSError, ValueError):
+                attempt_dir = None
         manifest_path = attempt_dir / "result_manifest.json" if attempt_dir else None
         manifest_available = bool(manifest_path and manifest_path.is_file())
         report_path = project_dir / "report.md"
@@ -1120,17 +1144,26 @@ def create_app(
             visible_state = "unavailable"
         else:
             visible_state = raw_state or "idle"
-        manifest = load_json(manifest_path) if manifest_available else None
+        manifest = _safe_json(manifest_path) if manifest_available else None
+        session = _safe_json(project_root / "session.json")
+        try:
+            history = history_items(project_root)
+        except (OSError, ValueError, TypeError):
+            history = []
+        if project_corrupt:
+            visible_state = "unavailable"
+        elif raw_state in {"results_verified", "completed", "remote_completed"}:
+            visible_state = "completed" if manifest_available else "result_missing"
         return {
             "status": visible_state,
             "raw_status": raw_state,
             "message": str(status.get("message") or ""),
             "run_id": str(status.get("run_id") or ""),
-            "session_state": str(load_json(project_dir / "session.json").get("state") or "") if (project_dir / "session.json").is_file() else "",
+            "session_state": str(session.get("state") or ""),
             "attempt_dir": str(attempt_dir) if attempt_dir else None,
-            "result_manifest": {"available": manifest_available, "path": str(manifest_path) if manifest_path else None, "summary": (manifest.get("summary") if isinstance(manifest, dict) else None)},
+            "result_manifest": {"available": manifest_available, "path": str(manifest_path) if manifest_path else None, "summary": (manifest.get("summary") if isinstance(manifest, dict) else None), "validation": ((manifest.get("body") or {}).get("validation") if isinstance(manifest, dict) and isinstance(manifest.get("body"), dict) else None)},
             "report": {"available": report_path.is_file(), "path": str(report_path) if report_path.is_file() else None},
-            "history": history_items(project_dir),
+            "history": history,
         }
 
     # -- pages -----------------------------------------------------------
