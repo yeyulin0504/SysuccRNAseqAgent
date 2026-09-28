@@ -754,6 +754,10 @@ def refresh_status(config_path: Path) -> dict[str, Any]:
         else None
     )
     observed_claim_status = str((observed_claim or {}).get("status") or "")
+    observed_stage = str(
+        observed_status.get("stage") or (observed_claim or {}).get("stage") or ""
+    )
+    observed_attempt_dir = str(observed_status.get("attempt_dir") or "")
     active_config = _config_for_active_attempt(config)
     transport = create_remote_transport(active_config)
     state = _read_remote_state(active_config, transport)
@@ -771,6 +775,10 @@ def refresh_status(config_path: Path) -> dict[str, Any]:
                 active_config,
                 transport,
                 remote_state=state,
+                observed_claim_id=observed_claim_id,
+                observed_run_id=observed_run_id,
+                observed_stage=observed_stage,
+                observed_attempt_dir=observed_attempt_dir,
             )
     return normalize_config(load_json(config_path)).get("status", {})
 
@@ -781,50 +789,97 @@ def _finalize_refresh_attempt(
     transport: RemoteTransport,
     *,
     remote_state: str,
+    observed_claim_id: str,
+    observed_run_id: str,
+    observed_stage: str,
+    observed_attempt_dir: str,
 ) -> None:
     """Converge a refreshed attempt's local evidence after a wait=False submit."""
 
-    status = normalize_config(load_json(config_path)).get("status", {})
-    attempt_dir = Path(str(status.get("attempt_dir") or ""))
-    if not attempt_dir.is_dir():
+    if remote_state in {"queued", "running"}:
         return
-    logs_dir = attempt_dir / "agent_logs"
-    message = f"Remote state: {remote_state}"
-    final_status = remote_state
-    if remote_state == "completed":
-        try:
-            summary = _download_results(
-                active_config,
-                attempt_dir / "downloads",
-                logs_dir,
-                transport,
-                stage=(str(status.get("stage")) if status.get("stage") else None),
-            )
-            _update_status(
-                config_path,
-                "results_verified" if summary.ok else "result_validation_failed",
-                "Downloaded result manifest verified."
-                if summary.ok
-                else "Downloaded results are incomplete or invalid.",
-                result_manifest_file=str(summary.path),
-                result_files_sha256=summary.files_sha256,
-                result_validation_errors=summary.errors,
-            )
-            _record_lifecycle_phase(logs_dir, "validate_output", run_id=str(status.get("run_id") or ""), ok=summary.ok)
-            if not summary.ok:
-                final_status = "result_validation_failed"
-                message = "; ".join(summary.errors)
-        except BaseException as exc:
-            final_status = "download_failed"
-            message = f"Remote analysis completed, but downloading results failed: {exc}"
-            _update_status(config_path, final_status, message)
-    _finalize_attempt_audit(attempt_dir, final_status, message)
-    _record_lifecycle_phase(
-        logs_dir,
-        "register_artifacts",
-        run_id=str(status.get("run_id") or ""),
-        state=final_status,
-    )
+
+    # Hold the project lock across the final validation and audit writes.  A new
+    # claim cannot become current between this check and finalization.
+    with project_state_lock(config_path):
+        config = normalize_config(load_json(config_path))
+        status = config.get("status", {})
+        if str(status.get("run_id") or "") != observed_run_id:
+            return
+        if str(status.get("execution_claim_id") or "") != observed_claim_id:
+            return
+        current_stage = str(status.get("stage") or "")
+        if current_stage and current_stage != observed_stage:
+            return
+        if str(status.get("attempt_dir") or "") != observed_attempt_dir:
+            return
+        claims = status.get("execution_claims")
+        claim = claims.get(observed_claim_id) if isinstance(claims, dict) else None
+        if not isinstance(claim, dict):
+            return
+        if str(claim.get("run_id") or "") != observed_run_id:
+            return
+        if str(claim.get("stage") or "") != observed_stage:
+            return
+
+        attempt_dir = Path(observed_attempt_dir)
+        if not attempt_dir.is_dir():
+            return
+        logs_dir = attempt_dir / "agent_logs"
+        message = f"Remote state: {remote_state}"
+        final_status = remote_state
+        if remote_state == "completed":
+            try:
+                summary = _download_results(
+                    active_config,
+                    attempt_dir / "downloads",
+                    logs_dir,
+                    transport,
+                    stage=observed_stage or None,
+                )
+                status_state = "results_verified" if summary.ok else "result_validation_failed"
+                final_status = "completed" if summary.ok else status_state
+                message = (
+                    "Downloaded result manifest verified."
+                    if summary.ok
+                    else "Downloaded results are incomplete or invalid."
+                )
+                status.update(
+                    {
+                        "state": status_state,
+                        "message": message,
+                        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "result_manifest_file": str(summary.path),
+                        "result_files_sha256": summary.files_sha256,
+                        "result_validation_errors": summary.errors,
+                    }
+                )
+                config["status"] = status
+                save_json(config_path, config)
+                _record_lifecycle_phase(
+                    logs_dir, "validate_output", run_id=observed_run_id, ok=summary.ok
+                )
+                if not summary.ok:
+                    message = "; ".join(summary.errors)
+            except BaseException as exc:
+                final_status = "download_failed"
+                message = f"Remote analysis completed, but downloading results failed: {exc}"
+                status.update(
+                    {
+                        "state": final_status,
+                        "message": message,
+                        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }
+                )
+                config["status"] = status
+                save_json(config_path, config)
+        _finalize_attempt_audit(attempt_dir, final_status, message)
+        _record_lifecycle_phase(
+            logs_dir,
+            "register_artifacts",
+            run_id=observed_run_id,
+            state=final_status,
+        )
 
 
 def _apply_refresh_observation(

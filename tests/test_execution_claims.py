@@ -540,6 +540,52 @@ def test_stale_refresh_observation_cannot_overwrite_new_claim(
     assert live["execution_claims"][second_claim_id]["status"] == "submitted"
 
 
+def test_refresh_finalize_is_discarded_when_new_claim_is_created_after_observation(
+    tmp_path, monkeypatch
+) -> None:
+    """A new claim created after the observation must not receive the old finalize."""
+    import rnaseq_agent.run_agent as run_agent
+    from types import SimpleNamespace
+
+    config_path = _fastq_project(tmp_path)
+    transport = CountingTransport()
+    monkeypatch.setattr("rnaseq_agent.run_agent.create_remote_transport", lambda _config: transport)
+    first = run_project(config_path, wait=False)
+    assert first.state == "submitted"
+    first_status = load_json(config_path)["status"]
+    first_attempt_dir = Path(first_status["attempt_dir"])
+
+    monkeypatch.setattr(
+        "rnaseq_agent.run_agent._download_results",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ok=True,
+            errors=[],
+            path=tmp_path / "result_manifest.json",
+            files_sha256="sha256:results",
+        ),
+    )
+    original_apply = run_agent._apply_refresh_observation
+
+    def apply_then_start_new_claim(*args, **kwargs):
+        applied = original_apply(*args, **kwargs)
+        if applied:
+            second = run_project(config_path, wait=False)
+            assert second.state == "submitted"
+        return applied
+
+    monkeypatch.setattr(run_agent, "_apply_refresh_observation", apply_then_start_new_claim)
+    monkeypatch.setattr("rnaseq_agent.run_agent._read_remote_state", lambda *_args: "completed")
+
+    status = refresh_status(config_path)
+
+    assert status["execution_claim_id"] != first_status["execution_claim_id"]
+    first_manifest = load_json(first_attempt_dir / "run_manifest.json")
+    assert "final_status" not in first_manifest["body"]
+    second_attempt_dir = Path(status["attempt_dir"])
+    second_manifest = load_json(second_attempt_dir / "run_manifest.json")
+    assert "final_status" not in second_manifest["body"]
+
+
 @pytest.mark.parametrize("observed_state", ["queued", "running", "completed", "failed", "reconcile"])
 def test_refresh_status_finalizes_wait_false_attempt_manifest(
     tmp_path, monkeypatch, observed_state
@@ -568,8 +614,11 @@ def test_refresh_status_finalizes_wait_false_attempt_manifest(
     status = refresh_status(config_path)
     attempt_dir = Path(status["attempt_dir"])
     manifest = load_json(attempt_dir / "run_manifest.json")
-    assert manifest["body"]["final_status"] == observed_state
-    assert load_json(attempt_dir / "artifact_index.json")["artifacts"] is not None
+    if observed_state in {"queued", "running"}:
+        assert "final_status" not in manifest["body"]
+    else:
+        assert manifest["body"]["final_status"] == observed_state
+        assert load_json(attempt_dir / "artifact_index.json")["artifacts"] is not None
 
 
 def test_invalid_stage_failure_does_not_settle_foreign_started_claim(
