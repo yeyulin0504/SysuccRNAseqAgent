@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,49 @@ REQUIRED_FIELDS = (
     "supports",
     "gates",
 )
+ALLOWED_ENTRY_STAGES = {"qc", "counts", "de", "cms"}
+ALLOWED_SUPPORT_KEYS = {"data_type", "layout", "design", "cancer_type", "input_kind"}
+ALLOWED_GATE_KEYS = {
+    "min_samples",
+    "min_replicates_per_group",
+    "required_sample_fields",
+    "required_reference_keys",
+}
 
 
 class CapabilityRegistryError(ValueError):
     """Raised when a declarative registry is present but invalid."""
+
+
+@dataclass(frozen=True)
+class CapabilityDiscoveryResult:
+    """Stable result returned by every capability/adapter discovery boundary."""
+
+    status: str
+    capability: dict[str, Any] | None = None
+    code: str = ""
+    reasons: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        from .capability import PASS
+
+        return self.status == PASS and self.capability is not None
+
+    @property
+    def verdict(self) -> str:
+        return self.status
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "verdict": self.status,
+            "capability": deepcopy(self.capability),
+            "code": self.code,
+            "reasons": list(self.reasons),
+            "details": deepcopy(self.details),
+        }
 
 
 class CapabilityRegistry:
@@ -43,6 +83,26 @@ class CapabilityRegistry:
         if version is not None and str(record["version"]) != str(version):
             raise KeyError(f"{capability_id}@{version}")
         return deepcopy(record)
+
+    def discover(self, capability_id: str, version: str | None = None) -> CapabilityDiscoveryResult:
+        from .capability import NOT_EVALUABLE, PASS
+
+        record = self._records.get(capability_id)
+        if record is None:
+            return CapabilityDiscoveryResult(
+                status=NOT_EVALUABLE,
+                code="UNKNOWN_CAPABILITY",
+                reasons=[f"Unknown capability: {capability_id}"],
+            )
+        if version is not None and str(record["version"]) != str(version):
+            return CapabilityDiscoveryResult(
+                status=NOT_EVALUABLE,
+                code="INCOMPATIBLE_VERSION",
+                reasons=[
+                    f"Capability {capability_id} requires version {record['version']}, requested {version}."
+                ],
+            )
+        return CapabilityDiscoveryResult(status=PASS, capability=deepcopy(record))
 
     def list_available(self) -> list[dict[str, Any]]:
         return [deepcopy(self._records[key]) for key in sorted(self._records)]
@@ -165,12 +225,33 @@ def _validate_payload(payload: Any) -> list[dict[str, Any]]:
         seen.add(capability_id)
         if not isinstance(record["version"], str) or not record["version"].strip():
             raise CapabilityRegistryError(f"{capability_id}.version must be a non-empty string")
+        if record["entry_stage"] not in ALLOWED_ENTRY_STAGES:
+            raise CapabilityRegistryError(f"{capability_id}.entry_stage is unsupported")
         for field in ("required_inputs", "required_tools", "required_artifacts"):
             if not isinstance(record[field], list) or not all(isinstance(item, str) for item in record[field]):
                 raise CapabilityRegistryError(f"{capability_id}.{field} must be a list of strings")
         for field in ("supports", "gates"):
             if not isinstance(record[field], dict):
                 raise CapabilityRegistryError(f"{capability_id}.{field} must be an object")
+        unknown_supports = set(record["supports"]) - ALLOWED_SUPPORT_KEYS
+        if unknown_supports:
+            raise CapabilityRegistryError(f"{capability_id}.supports has unknown keys: {sorted(unknown_supports)}")
+        for key, value in record["supports"].items():
+            if not isinstance(value, list) or not value or not all(isinstance(item, str) and item.strip() for item in value):
+                raise CapabilityRegistryError(f"{capability_id}.supports.{key} must be a non-empty list of strings")
+        unknown_gates = set(record["gates"]) - ALLOWED_GATE_KEYS
+        if unknown_gates:
+            raise CapabilityRegistryError(f"{capability_id}.gates has unknown keys: {sorted(unknown_gates)}")
+        gates = record["gates"]
+        for key in ("min_samples", "min_replicates_per_group"):
+            if key in gates and (not isinstance(gates[key], int) or isinstance(gates[key], bool) or gates[key] < 1):
+                raise CapabilityRegistryError(f"{capability_id}.gates.{key} must be a positive integer")
+        for key in ("required_sample_fields", "required_reference_keys"):
+            if key in gates and (not isinstance(gates[key], list) or not gates[key] or not all(isinstance(item, str) and item.strip() for item in gates[key])):
+                raise CapabilityRegistryError(f"{capability_id}.gates.{key} must be a non-empty list of strings")
+        for field in ("required_inputs", "required_tools", "required_artifacts"):
+            if not record[field] or any(not item.strip() for item in record[field]):
+                raise CapabilityRegistryError(f"{capability_id}.{field} must not contain empty strings")
         validated.append(deepcopy(record))
     return validated
 

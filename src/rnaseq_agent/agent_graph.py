@@ -94,6 +94,12 @@ def _session(state: BulkRNAState) -> ProjectSession:
 def node_gate_a(state: BulkRNAState) -> BulkRNAState:
     """Gate-A: metadata-level suitability check (framework 5.2)."""
     session = _session(state)
+    if not session.capability_discovery.ok:
+        return {
+            "status": NOT_EVALUABLE,
+            "message": "Capability discovery 未通过：" + "; ".join(session.capability_discovery.reasons),
+            "reason_codes": [session.capability_discovery.code],
+        }
     try:
         gate = session.gate_check()
     except SessionError as exc:

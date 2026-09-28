@@ -42,6 +42,7 @@ from .capability import (
     list_capabilities,
     resolve_capability,
 )
+from .capability_registry import CapabilityDiscoveryResult
 from .output_validator import mark_stale_downstream, register_artifacts
 from .run_agent import run_project
 from .storage import append_jsonl, load_json, project_state_lock, save_json
@@ -85,7 +86,14 @@ class ProjectSession:
         self.config: dict[str, Any] | None = None
         self.execution_plan: ExecutionPlan | None = None
         self.state = IDLE
-        self.capability = resolve_capability(capability_id)
+        self.capability_discovery: CapabilityDiscoveryResult = self._discover_capability(capability_id)
+        self.capability = resolve_capability(capability_id) if self.capability_discovery.ok else None
+
+    @staticmethod
+    def _discover_capability(capability_id: str) -> CapabilityDiscoveryResult:
+        from .capability import discover_capability
+
+        return discover_capability(capability_id)
 
     def _project_id_for_dir(self) -> str:
         return self.project_dir.name
@@ -132,7 +140,8 @@ class ProjectSession:
         payload = load_json(self.session_path)
         self.state = str(payload.get("state", IDLE))
         self.capability_id = str(payload.get("capability_id", DEFAULT_CAPABILITY_ID))
-        self.capability = resolve_capability(self.capability_id)
+        self.capability_discovery = self._discover_capability(self.capability_id)
+        self.capability = resolve_capability(self.capability_id) if self.capability_discovery.ok else None
         config_path = Path(str(payload.get("config_path", "")))
         if config_path.is_file():
             self.config_path = config_path.resolve()
@@ -165,8 +174,16 @@ class ProjectSession:
 
     def gate_check(self) -> GateResult:
         """Run the metadata-level Gate-A check against the current draft."""
+        if not self.capability_discovery.ok:
+            return GateResult(
+                verdict=NOT_EVALUABLE,
+                reasons=list(self.capability_discovery.reasons),
+                code=self.capability_discovery.code,
+                details=self.capability_discovery.to_dict(),
+            )
         self._require_project()
         assert self.config is not None
+        assert self.capability is not None
         config, validation = validate_project(self.config_path)
         gate = gate_a_check(
             self.capability,

@@ -101,9 +101,9 @@ class TestCapabilityRegistry:
         incompatible = discover_capability(
             "workflow.bulk_rna.grch38_pe_expression_fusion", version="9.0.0"
         )
-        assert unknown.verdict == NOT_EVALUABLE
+        assert unknown.status == NOT_EVALUABLE
         assert unknown.code == "UNKNOWN_CAPABILITY"
-        assert incompatible.verdict == NOT_EVALUABLE
+        assert incompatible.status == NOT_EVALUABLE
         assert incompatible.code == "INCOMPATIBLE_VERSION"
 
 

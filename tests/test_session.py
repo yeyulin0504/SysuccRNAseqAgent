@@ -22,11 +22,21 @@ from rnaseq_agent.session import (
     _load_changesets,
 )
 from rnaseq_agent.storage import load_json
+from rnaseq_agent.capability import NOT_EVALUABLE
 
 
 def _write_fastq(path: Path, sequence: str = "ACGT") -> None:
     with gzip.open(path, "wt", encoding="ascii") as handle:
         handle.write(f"@read1\n{sequence}\n+\n{'I' * len(sequence)}\n")
+
+
+def test_session_routes_unknown_capability_to_structured_not_evaluable(tmp_path: Path) -> None:
+    session = ProjectSession(tmp_path, capability_id="missing.capability")
+
+    assert not session.capability_discovery.ok
+    assert session.capability_discovery.status == NOT_EVALUABLE
+    assert session.capability_discovery.code == "UNKNOWN_CAPABILITY"
+    assert session.gate_check().verdict == NOT_EVALUABLE
 
 
 def _write_config(project_dir: Path, config: dict) -> Path:

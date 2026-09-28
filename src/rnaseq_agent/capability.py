@@ -205,21 +205,11 @@ def resolve_capability(capability_id: str) -> Capability:
     return capabilities[capability_id]
 
 
-def discover_capability(capability_id: str, version: str | None = None) -> dict[str, Any]:
+def discover_capability(capability_id: str, version: str | None = None) -> "CapabilityDiscoveryResult":
     """Discover a declarative capability record without selecting an adapter."""
-    from .capability_registry import load_capability_registry
+    from .capability_registry import CapabilityDiscoveryResult, load_capability_registry
 
-    registry = load_capability_registry()
-    try:
-        return registry.get(capability_id, version=version)
-    except KeyError:
-        code = "INCOMPATIBLE_VERSION" if version is not None else "UNKNOWN_CAPABILITY"
-        reason = (
-            f"Capability {capability_id} is not compatible with version {version}."
-            if version is not None
-            else f"Unknown capability: {capability_id}"
-        )
-        return GateResult(verdict=NOT_EVALUABLE, reasons=[reason], code=code)
+    return load_capability_registry().discover(capability_id, version=version)
 
 
 def list_capabilities() -> list[Capability]:

@@ -111,9 +111,9 @@ class TestAdapterInspect:
     def test_discovery_unknown_and_version_mismatch_are_structured(self) -> None:
         unknown = discover_adapter("missing")
         incompatible = discover_adapter(CAP_ID, version="9.0.0")
-        assert unknown.verdict == NOT_EVALUABLE
+        assert unknown.status == NOT_EVALUABLE
         assert unknown.code == "UNKNOWN_CAPABILITY"
-        assert incompatible.verdict == NOT_EVALUABLE
+        assert incompatible.status == NOT_EVALUABLE
         assert incompatible.code == "INCOMPATIBLE_VERSION"
 
 
