@@ -12,6 +12,7 @@ These cover the two upgrades on top of M1.4:
 from __future__ import annotations
 
 import re
+import json
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,37 @@ class TestProjectBoundEndpoints:
 
 
 class TestWorkbenchPage:
+    def test_graph_state_projects_durable_session_attempt_and_report(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _create_project(client, token, "durable")
+        project_dir = Path(client.get("/api/state?project=durable", headers=_headers(token)).json()["project_dir"])
+        (project_dir / "project.json").write_text(json.dumps({
+            "status": {"state": "submitted", "run_id": "run-1", "attempt_dir": str(project_dir / "attempts" / "run-1")}
+        }), encoding="utf-8")
+        (project_dir / "session.json").write_text(json.dumps({"state": "confirmed"}), encoding="utf-8")
+        attempt = project_dir / "attempts" / "run-1"
+        attempt.mkdir(parents=True)
+        (attempt / "result_manifest.json").write_text(json.dumps({"summary": {"status": "pass"}}), encoding="utf-8")
+        (project_dir / "report.md").write_text("# report", encoding="utf-8")
+        (project_dir / "history.json").write_text(json.dumps({"items": [{"type": "contract", "state": "confirmed"}]}), encoding="utf-8")
+
+        response = client.get("/api/projects/durable/graph/state", headers=_headers(token))
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["durable"]["status"] == "queued"
+        assert data["durable"]["session_state"] == "confirmed"
+        assert data["durable"]["result_manifest"]["available"] is True
+        assert data["durable"]["report"]["available"] is True
+        assert data["durable"]["history"][0]["type"] == "contract"
+
+    def test_graph_state_completed_without_manifest_is_result_missing(self, client, tmp_path: Path) -> None:
+        token = _token(client)
+        _create_project(client, token, "missing")
+        project_dir = Path(client.get("/api/state?project=missing", headers=_headers(token)).json()["project_dir"])
+        (project_dir / "project.json").write_text(json.dumps({"status": {"state": "completed", "run_id": "run-2"}}), encoding="utf-8")
+        response = client.get("/api/projects/missing/graph/state", headers=_headers(token))
+        assert response.json()["durable"]["status"] == "result_missing"
+
     def test_workbench_renders_with_project(self, client) -> None:
         token = _token(client)
         h = _headers(token)

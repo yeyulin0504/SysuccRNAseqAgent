@@ -1052,6 +1052,7 @@ def create_app(
 
     def _graph_snapshot(project_id: str, project_dir: Path) -> dict[str, Any]:
         """Read the durable graph state from the per-project checkpointer."""
+        durable = _durable_project_snapshot(project_dir)
         with _graph_lock:
             in_flight = _graph_runs.get(project_id)
         if in_flight is not None:
@@ -1060,6 +1061,7 @@ def create_app(
                 "state": in_flight.get("state", "running"),
                 "in_flight": True,
                 "error": in_flight.get("error"),
+                "durable": durable,
             }
         try:
             with sqlite_checkpointer_for(project_dir) as checkpointer:
@@ -1067,9 +1069,9 @@ def create_app(
                     config={"configurable": {"thread_id": project_id}}
                 )
         except Exception as exc:  # noqa: BLE001
-            return {"project_id": project_id, "state": "error", "error": str(exc)}
+            return {"project_id": project_id, "state": "error", "error": str(exc), "durable": durable}
         if tup is None:
-            return {"project_id": project_id, "state": "idle", "in_flight": False}
+            return {"project_id": project_id, "state": "idle", "in_flight": False, "durable": durable}
 
         checkpoint = tup.checkpoint or {}
         channels = dict(checkpoint.get("channel_values", {}) or {})
@@ -1092,6 +1094,43 @@ def create_app(
             "in_flight": False,
             "graph_state": graph_state,
             "interrupt": interrupts[0] if interrupts else None,
+            "durable": durable,
+        }
+
+    def _durable_project_snapshot(project_dir: Path) -> dict[str, Any]:
+        """Project-owned status and artifacts used by the workbench panels."""
+        config = load_json(project_dir / "project.json") if (project_dir / "project.json").is_file() else {}
+        status = config.get("status") if isinstance(config.get("status"), dict) else {}
+        raw_state = str(status.get("state") or "").strip().lower()
+        attempt_dir = Path(str(status.get("attempt_dir") or "")) if status.get("attempt_dir") else None
+        if attempt_dir is not None and not attempt_dir.is_absolute():
+            attempt_dir = project_dir / attempt_dir
+        manifest_path = attempt_dir / "result_manifest.json" if attempt_dir else None
+        manifest_available = bool(manifest_path and manifest_path.is_file())
+        report_path = project_dir / "report.md"
+        if raw_state in {"queued", "submitted", "submitting"}:
+            visible_state = "queued"
+        elif raw_state in {"running", "executing", "remote_running"}:
+            visible_state = "running"
+        elif raw_state in {"failed", "run_failed", "validation_failed", "policy_failed", "download_failed", "result_validation_failed"}:
+            visible_state = "failed"
+        elif raw_state in {"completed", "remote_completed"}:
+            visible_state = "completed" if manifest_available else "result_missing"
+        elif raw_state in {"unavailable", "environment_unavailable"}:
+            visible_state = "unavailable"
+        else:
+            visible_state = raw_state or "idle"
+        manifest = load_json(manifest_path) if manifest_available else None
+        return {
+            "status": visible_state,
+            "raw_status": raw_state,
+            "message": str(status.get("message") or ""),
+            "run_id": str(status.get("run_id") or ""),
+            "session_state": str(load_json(project_dir / "session.json").get("state") or "") if (project_dir / "session.json").is_file() else "",
+            "attempt_dir": str(attempt_dir) if attempt_dir else None,
+            "result_manifest": {"available": manifest_available, "path": str(manifest_path) if manifest_path else None, "summary": (manifest.get("summary") if isinstance(manifest, dict) else None)},
+            "report": {"available": report_path.is_file(), "path": str(report_path) if report_path.is_file() else None},
+            "history": history_items(project_dir),
         }
 
     # -- pages -----------------------------------------------------------

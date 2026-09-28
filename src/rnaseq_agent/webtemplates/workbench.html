@@ -1424,9 +1424,13 @@ function loadRuns() {
   if (!currentProject) { el.innerHTML = "<div class='muted'>请先选择一个项目。</div>"; return; }
   api("GET", graphStatePath()).then(d => {
     if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
+    const durable = d.durable || {};
     el.innerHTML =
-      `<div class="step">状态：<b>${escapeHtml(d.state)}</b></div>`
+      `<div class="step">状态：<b>${escapeHtml(durable.status || d.state)}</b></div>`
+      + (durable.raw_status && durable.raw_status !== durable.status ? `<div class="muted">远程原始状态：${escapeHtml(durable.raw_status)}</div>` : "")
       + `<div class="step">运行中：${d.in_flight ? "是" : "否"}</div>`
+      + (durable.run_id ? `<div class="muted">运行：${escapeHtml(durable.run_id)}</div>` : "")
+      + (durable.message ? `<div class="step">${escapeHtml(durable.message)}</div>` : "")
       + (d.error ? `<div class="step err">${escapeHtml(d.error)}</div>` : "");
   });
 }
@@ -1438,11 +1442,15 @@ function loadResults() {
   api("GET", graphStatePath()).then(d => {
     if (d.error) { el.innerHTML = `<div class="err">${escapeHtml(d.error)}</div>`; return; }
     const gs = d.graph_state || {};
-    const status = gs.status || d.state;
+    const durable = d.durable || {};
+    const status = durable.status || gs.status || d.state;
+    const manifest = durable.result_manifest || {};
+    const report = durable.report || {};
     el.innerHTML =
       `<div class="step">运行结果：<b>${escapeHtml(status)}</b></div>`
-      + (gs.message ? `<div class="step">${escapeHtml(gs.message)}</div>` : "")
-      + `<div class="muted" style="margin-top:8px">结果产物由运行面板提供（result_manifest）。</div>`;
+      + (durable.message || gs.message ? `<div class="step">${escapeHtml(durable.message || gs.message)}</div>` : "")
+      + (manifest.available ? `<div class="step ok">result_manifest 已生成</div>` : `<div class="muted" style="margin-top:8px">result_manifest 尚未生成。</div>`)
+      + (report.available ? `<div class="step ok">报告已生成：<span class="mono">${escapeHtml(report.path)}</span></div>` : "");
   });
 }
 
