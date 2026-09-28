@@ -92,6 +92,31 @@ def run_preflight(
     return requested_destination, report
 
 
+def run_preflight_envelope(
+    config_path: Path,
+    *,
+    output_path: Path | None = None,
+    transport: RemoteTransport | None = None,
+    local: dict[str, Any] | None = None,
+    install_plan: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """Run the existing remote probe and persist its unified envelope."""
+
+    from .preflight_envelope import build_preflight_envelope
+
+    config = normalize_config(load_json(config_path))
+    _, remote = run_preflight(config_path, output_path=output_path, transport=transport)
+    envelope = build_preflight_envelope(
+        config,
+        local=local,
+        remote=remote,
+        install_plan=install_plan,
+    )
+    destination = (output_path or config_path.parent / "preflight.json").resolve()
+    save_json(destination, envelope)
+    return destination, envelope
+
+
 def build_read_only_probe(config: dict[str, Any]) -> str:
     """Build the single POSIX-shell probe used by :func:`run_preflight`.
 
@@ -110,6 +135,12 @@ def build_read_only_probe(config: dict[str, Any]) -> str:
         "if [ -n \"$probe_command_path\" ]; then "
         "probe_emit command \"$probe_command_name\" \"$probe_command_path\"; "
         "else probe_emit command \"$probe_command_name\" missing; fi; "
+        "}",
+        "probe_container_daemon() { "
+        "probe_container_engine=$1; "
+        "if probe_container_output=$(\"$probe_container_engine\" info); then "
+        "probe_emit container daemon available; "
+        "else probe_emit container daemon unavailable; fi; "
         "}",
         "probe_tool() { "
         "probe_tool_key=$1; probe_tool_command=$2; probe_tool_flag=$3; "
@@ -167,6 +198,8 @@ def build_read_only_probe(config: dict[str, Any]) -> str:
                 "probe_file container_image \"$probe_container_image\"",
             ]
         )
+        if container["engine"] == "docker":
+            lines.append("probe_container_daemon \"$probe_container_engine\"")
 
     all_scheduler_commands = sorted(
         {
@@ -306,6 +339,7 @@ def _parse_probe_output(stdout: str) -> dict[str, Any]:
             "reference",
             "workdir",
             "storage",
+            "container",
         }:
             continue
         values.setdefault(category, {})[key] = value.strip()
@@ -601,6 +635,7 @@ def _container_report(
     engine_path = str(command_values.get(container["engine"], "missing"))
     engine_available = engine_path not in {"", "missing"}
     image_state = str(parsed.get("reference", {}).get("container_image", "not_reported"))
+    daemon_state = str(parsed.get("container", {}).get("daemon", "not_reported"))
     if not engine_available:
         findings.append(
             {
@@ -609,11 +644,23 @@ def _container_report(
                 "message": f"Container engine {container['engine']} is not available.",
             }
         )
+    daemon_available: bool | None = None
+    if container["engine"] == "docker":
+        daemon_available = daemon_state == "available"
+        if daemon_state == "unavailable":
+            findings.append(
+                {
+                    "severity": "error",
+                    "code": "container_docker_daemon_unavailable",
+                    "message": "Docker is installed but its daemon is not available.",
+                }
+            )
     return {
         "enabled": True,
         "engine": container["engine"],
         "engine_available": engine_available,
         "image_state": image_state,
+        "daemon_available": daemon_available,
         "bind_paths_count": len(container.get("bind_paths", [])),
     }
 

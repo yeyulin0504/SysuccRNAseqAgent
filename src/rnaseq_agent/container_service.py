@@ -12,6 +12,34 @@ class ContainerSettingsError(ValueError):
     """Raised when container settings cannot be represented safely."""
 
 
+def summarize_container_preflight(
+    settings: dict[str, Any] | None,
+    report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize existing container probe findings; never starts a runtime."""
+
+    settings = settings or {}
+    report = report or {}
+    enabled = bool(settings.get("enabled", report.get("enabled", False)))
+    engine = str(settings.get("engine") or report.get("engine") or "apptainer")
+    if not enabled:
+        return {"enabled": False, "engine": engine}
+    result = {
+        "enabled": True,
+        "engine": engine,
+        "engine_available": report.get("engine_available", report.get("available", True)),
+        "image_state": report.get("image_state", report.get("image", "not_reported")),
+        "daemon_available": report.get(
+            "daemon_available",
+            report.get("docker_daemon", report.get("daemon")) if engine == "docker" else True,
+        ),
+        "bind_paths_count": len(settings.get("bind_paths", []) or []),
+    }
+    if result["daemon_available"] is None and engine == "docker":
+        result["daemon_available"] = False
+    return result
+
+
 def validate_image_settings(raw: dict[str, Any]) -> dict[str, Any]:
     engine = str(raw.get("engine") or "apptainer").strip()
     uri = str(raw.get("image_uri") or "").strip()

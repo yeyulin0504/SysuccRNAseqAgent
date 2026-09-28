@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Sequence
 
 from .configuration import normalize_config
-from .preflight import PreflightError, build_read_only_probe, run_preflight
+from .preflight import PreflightError, build_read_only_probe, run_preflight_envelope
+from .preflight_envelope import build_preflight_envelope
 from .ssh_auth import clear_ssh_credential, set_ssh_credential
 from .storage import load_json
 
@@ -120,6 +121,12 @@ def _write_debug_log(destination: Path, message: str) -> Path:
     return debug_path
 
 
+def _build_portable_report(config: dict, remote_report: dict) -> dict:
+    """Wrap the existing sanitized remote probe in the standard envelope."""
+
+    return build_preflight_envelope(config, remote=remote_report)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config_path = _resolve_path(args.config, "preflight_project.json")
@@ -148,7 +155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             password=temporary_password,
         )
         identity = (host, user)
-        _, report = run_preflight(
+        _, report = run_preflight_envelope(
             config_path,
             output_path=candidate,
         )
