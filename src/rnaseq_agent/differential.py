@@ -146,6 +146,44 @@ def deg_gate(config: dict[str, Any]) -> GateResult:
     return GateResult(verdict=PASS)
 
 
+def de_readiness_gate(qc_verdict: dict[str, Any] | None, *, confirmed: bool = False) -> GateResult:
+    """Gate DE on the standardized QC readiness state.
+
+    ``caution`` is never silently treated as ready: a caller must provide an
+    explicit confirmation before the existing design gate can proceed.
+    """
+    verdict = qc_verdict or {}
+    status = str(verdict.get("status", "abstain")).strip()
+    readiness = str(verdict.get("de_readiness", "blocked")).strip()
+    expected_readiness = {
+        "pass": "ready",
+        "warn": "caution",
+        "fail": "blocked",
+        "abstain": "blocked",
+    }.get(status, "blocked")
+    if readiness != expected_readiness:
+        return GateResult(
+            verdict=NOT_EVALUABLE,
+            reasons=[
+                f"QC verdict 不一致：status={status or 'abstain'}，"
+                f"de_readiness={readiness or 'blocked'}。"
+            ],
+        )
+    if readiness == "ready" and status == "pass":
+        return GateResult(verdict=PASS)
+    if readiness == "caution" and status == "warn" and confirmed:
+        return GateResult(verdict=PASS, reasons=["QC readiness=caution，已获得显式确认。"])
+    if readiness == "caution" and status == "warn":
+        return GateResult(
+            verdict=NOT_EVALUABLE,
+            reasons=["QC readiness=caution；差异表达前需要显式确认。"],
+        )
+    return GateResult(
+        verdict=NOT_EVALUABLE,
+        reasons=[f"QC readiness={readiness or 'blocked'}；差异表达已阻断。"],
+    )
+
+
 def diffexp_is_requested(config: dict[str, Any]) -> bool:
     """Whether the user asked for the conditional DE stage."""
     return bool(config.get("pipeline", {}).get("diffexp", {}).get("enabled"))

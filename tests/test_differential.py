@@ -21,6 +21,7 @@ from rnaseq_agent.differential import (
     render_colData,
     render_diffexp_counts_script,
     render_diffexp_script,
+    de_readiness_gate,
 )
 from rnaseq_agent.capability import NOT_EVALUABLE, PASS
 
@@ -83,6 +84,29 @@ def _config(
 
 
 class TestDegGate:
+    def test_de_readiness_caution_requires_confirmation(self) -> None:
+        gate = de_readiness_gate({"status": "warn", "de_readiness": "caution"})
+        assert not gate.ok
+        assert gate.verdict == NOT_EVALUABLE
+        assert any("caution" in reason for reason in gate.reasons)
+
+    def test_de_readiness_ready_passes(self) -> None:
+        gate = de_readiness_gate({"status": "pass", "de_readiness": "ready"})
+        assert gate.ok
+        assert gate.verdict == PASS
+
+    def test_de_readiness_cannot_be_forged_ready_by_inconsistent_verdict(self) -> None:
+        gate = de_readiness_gate({"status": "fail", "de_readiness": "ready"})
+        assert not gate.ok
+        assert gate.verdict == NOT_EVALUABLE
+
+    def test_de_readiness_caution_requires_explicit_confirmation(self) -> None:
+        gate = de_readiness_gate(
+            {"status": "warn", "de_readiness": "caution"}, confirmed=True
+        )
+        assert gate.ok
+        assert gate.verdict == PASS
+
     def test_two_group_valid_design_passes(self) -> None:
         gate = deg_gate(_config())
         assert gate.ok

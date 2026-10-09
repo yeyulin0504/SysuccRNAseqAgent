@@ -6,8 +6,10 @@ from pathlib import Path
 from typing import Any
 
 from .analysis_contract import canonical_sha256, sha256_file
+from .qc_verdict import bind_qc_verdict
 from .run_audit import write_artifact_index
 from .storage import save_json
+from .storage import load_json
 
 
 RESULT_MANIFEST_SCHEMA_VERSION = 1
@@ -33,6 +35,7 @@ def create_result_manifest(
     output_path: Path,
     *,
     stage: str | None = None,
+    qc_verdict: dict[str, Any] | None = None,
 ) -> ResultManifestSummary:
     """Inventory downloaded artifacts and validate required workflow outputs.
 
@@ -70,6 +73,12 @@ def create_result_manifest(
         },
         "files": files,
     }
+    if qc_verdict is not None:
+        body["qc_verdict"] = bind_qc_verdict(
+            qc_verdict,
+            run_id=str(body["run_id"] or ""),
+            attempt_id=str(body["run_id"] or ""),
+        )
     manifest = {
         "schema_version": RESULT_MANIFEST_SCHEMA_VERSION,
         "manifest_id": f"sha256:{canonical_sha256(body)}",
@@ -87,6 +96,36 @@ def create_result_manifest(
     manifest["manifest_id"] = f"sha256:{canonical_sha256(body)}"
     save_json(output_path, manifest)
     return ResultManifestSummary(output_path, not errors, errors, files_sha256)
+
+
+def write_qc_verdict(
+    manifest_path: Path,
+    qc_verdict: dict[str, Any],
+    *,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Attach an attempt-bound QC verdict to an existing result manifest."""
+
+    manifest_path = Path(manifest_path)
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        raise ValueError("QC verdict persistence requires a non-empty run_id.")
+    manifest = load_json(manifest_path)
+    body = manifest.setdefault("body", {})
+    manifest_run_id = str(body.get("run_id") or "").strip()
+    if manifest_run_id and manifest_run_id != normalized_run_id:
+        raise ValueError("QC verdict run_id does not match result manifest attempt.")
+    bound_verdict = bind_qc_verdict(
+        qc_verdict,
+        run_id=normalized_run_id,
+        attempt_id=manifest_run_id or normalized_run_id,
+    )
+    body["qc_verdict"] = bound_verdict
+    if not manifest_run_id:
+        body["run_id"] = normalized_run_id
+    manifest["manifest_id"] = f"sha256:{canonical_sha256(body)}"
+    save_json(manifest_path, manifest)
+    return manifest
 
 
 def _artifact_category(relative_path: str) -> str:

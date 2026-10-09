@@ -17,6 +17,7 @@ import pytest
 
 from rnaseq_agent.agent_graph import (
     build_bulk_rna_graph,
+    node_diffexp_gate,
     node_validate_output,
     node_wait_qc,
     sqlite_checkpointer_for,
@@ -191,9 +192,49 @@ class TestM1RealizedCheckpointNodes:
         result = node_wait_qc(self._state(project_dir))
 
         assert shown["evidence"]["run_id"] == "run-1"
+        assert shown["evidence"]["qc_verdict"]["run_id"] == "run-1"
+        assert shown["evidence"]["qc_verdict"]["attempt_id"] == "run-1"
         assert result["status"] == PASS
         assert result["qc_decision"]["approved"] is True
         assert result["qc_decision"]["expected_run_id"] == "run-1"
+        assert result["qc_verdict"]["status"] == "abstain"
+        persisted = json.loads(
+            (project_dir / "attempts" / "run-1" / "result_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert persisted["body"]["qc_verdict"]["de_readiness"] == "blocked"
+        assert persisted["body"]["qc_verdict"]["run_id"] == "run-1"
+
+    def test_wait_qc_manifest_binding_failure_fails_closed(self, tmp_path, monkeypatch) -> None:
+        project_dir = _minimal_project_dir(tmp_path)
+        _write_attempt_manifest(project_dir, ok=True)
+        manifest_path = project_dir / "attempts" / "run-1" / "result_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["body"] = {"run_id": "run-2"}
+        _write_json(manifest_path, manifest)
+        monkeypatch.setattr(
+            "rnaseq_agent.agent_graph.interrupt",
+            lambda _payload: pytest.fail("must not interrupt when verdict binding fails"),
+        )
+
+        result = node_wait_qc(self._state(project_dir))
+
+        assert result["status"] == FAIL
+        assert "绑定" in result["message"] or "match" in result["message"]
+
+    def test_diffexp_gate_consumes_caution_readiness(self, tmp_path) -> None:
+        project_dir = _counts_project_dir(tmp_path)
+        result = node_diffexp_gate(
+            {
+                "project_dir": str(project_dir),
+                "capability_id": "workflow.bulk_rna.grch38_pe_expression_fusion",
+                "qc_verdict": {"status": "warn", "de_readiness": "caution"},
+            }
+        )
+
+        assert result["status"] == NOT_EVALUABLE
+        assert "caution" in result["message"]
 
     @pytest.mark.parametrize(
         "decision",

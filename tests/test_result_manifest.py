@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 from rnaseq_agent.pipeline import STAGE_COUNTS
-from rnaseq_agent.result_manifest import create_result_manifest
+import pytest
+
+from rnaseq_agent.result_manifest import create_result_manifest, write_qc_verdict
 from rnaseq_agent.storage import load_json
 
 
@@ -33,6 +35,54 @@ def _write(root: Path, relative_path: str, content: bytes) -> None:
 
 
 class ResultManifestTests(unittest.TestCase):
+    def test_write_qc_verdict_requires_and_persists_attempt_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            manifest_path = root / "result_manifest.json"
+            manifest_path.write_text(
+                '{"schema_version": 1, "body": {"run_id": "run-1"}}\n',
+                encoding="utf-8",
+            )
+
+            verdict = {"status": "abstain", "de_readiness": "blocked", "dimensions": {}}
+            payload = write_qc_verdict(manifest_path, verdict, run_id="run-1")
+
+            self.assertEqual(payload["body"]["qc_verdict"]["run_id"], "run-1")
+            self.assertEqual(payload["body"]["qc_verdict"]["attempt_id"], "run-1")
+
+    def test_write_qc_verdict_rejects_missing_or_mismatched_attempt_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            manifest_path = root / "result_manifest.json"
+            manifest_path.write_text(
+                '{"schema_version": 1, "body": {"run_id": "run-1"}}\n',
+                encoding="utf-8",
+            )
+            verdict = {"status": "pass", "de_readiness": "ready", "dimensions": {}}
+
+            with pytest.raises(ValueError, match="run_id"):
+                write_qc_verdict(manifest_path, verdict)
+            with pytest.raises(ValueError, match="does not match"):
+                write_qc_verdict(manifest_path, verdict, run_id="run-2")
+
+    def test_result_manifest_records_qc_verdict_without_changing_audit_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            extracted = root / "extracted"
+            _write(extracted, "status/completed.flag", b"")
+            _write(extracted, "status/state.txt", b"completed\n")
+            verdict = {"status": "warn", "de_readiness": "caution"}
+
+            summary = create_result_manifest(
+                _config(), extracted, root / "result_manifest.json", qc_verdict=verdict
+            )
+            payload = load_json(summary.path)
+
+            self.assertEqual(payload["body"]["qc_verdict"]["status"], verdict["status"])
+            self.assertEqual(payload["body"]["qc_verdict"]["run_id"], "run-1")
+            self.assertEqual(payload["body"]["qc_verdict"]["attempt_id"], "run-1")
+            self.assertIn("audit", payload["body"])
+
     def test_result_manifest_contains_audited_envelope_and_artifact_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)

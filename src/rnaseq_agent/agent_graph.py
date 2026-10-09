@@ -53,6 +53,8 @@ from .capability import (
     WAITING_USER,
 )
 from .output_validator import ValidationFailure, validate_output_contract, post_run_gate
+from .qc_verdict import bind_qc_verdict, compute_qc_verdict
+from .result_manifest import write_qc_verdict
 from .session import (
     CONFIRMED,
     DRAFTING,
@@ -79,6 +81,7 @@ class BulkRNAState(TypedDict, total=False):
     attempt_dir: str
     qc_evidence: dict[str, Any]  # {sample_id, files, summary, ok}
     qc_decision: dict[str, Any]  # {approved, user, decided_at, thread_id}
+    qc_verdict: dict[str, Any]
 
 
 def _session(state: BulkRNAState) -> ProjectSession:
@@ -135,13 +138,19 @@ def node_diffexp_gate(state: BulkRNAState) -> BulkRNAState:
     condition 不混杂）。不通过时返回 NOT_EVALUABLE 并附可解释原因；
     未启用 diffexp 时该节点直接放行（PASS）。
     """
-    from .differential import deg_gate, diffexp_is_requested
+    from .differential import de_readiness_gate, deg_gate, diffexp_is_requested
 
     session = _session(state)
     if session.config is None:
         return {"status": FAIL, "message": "会话尚无项目配置。"}
     if not diffexp_is_requested(session.config):
         return {"status": PASS, "message": "diffexp 未启用，跳过差异表达门禁。"}
+    readiness_gate = de_readiness_gate(
+        state.get("qc_verdict"),
+        confirmed=bool(state.get("qc_readiness_confirmed")),
+    )
+    if not readiness_gate.ok:
+        return {"status": NOT_EVALUABLE, "message": "DE QC readiness 未通过：" + "; ".join(readiness_gate.reasons)}
     gate = deg_gate(session.config)
     if not gate.ok:
         return {"status": NOT_EVALUABLE, "message": "DEG 设计门禁未通过：" + "; ".join(gate.reasons)}
@@ -220,6 +229,44 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
             "qc_evidence": evidence,
         }
 
+    qc_source = evidence.get("summary", {}) or {}
+    if isinstance(qc_source, dict):
+        qc_source = qc_source.get("qc_inputs", qc_source.get("qc", qc_source))
+    verdict = compute_qc_verdict(qc_source if isinstance(qc_source, dict) else {})
+    try:
+        verdict = bind_qc_verdict(
+            verdict,
+            run_id=str(evidence.get("run_id") or ""),
+            attempt_id=Path(str(evidence.get("attempt_dir") or "")).name,
+        )
+    except ValueError as exc:
+        evidence["qc_verdict_persistence_error"] = str(exc)
+        return {
+            "status": FAIL,
+            "message": f"QC verdict 绑定失败，流程已终止：{exc}",
+            "qc_evidence": evidence,
+            "qc_verdict": verdict,
+        }
+    evidence["qc_verdict"] = verdict
+    manifest_path = Path(str(evidence.get("attempt_dir", ""))) / "result_manifest.json"
+    if not manifest_path.is_file():
+        return {
+            "status": FAIL,
+            "message": "QC verdict 无法写入 result manifest，流程已终止。",
+            "qc_evidence": evidence,
+            "qc_verdict": verdict,
+        }
+    try:
+        write_qc_verdict(manifest_path, verdict, run_id=str(evidence.get("run_id") or ""))
+    except (OSError, ValueError) as exc:
+        evidence["qc_verdict_persistence_error"] = str(exc)
+        return {
+            "status": FAIL,
+            "message": f"QC verdict 持久化失败，流程已终止：{exc}",
+            "qc_evidence": evidence,
+            "qc_verdict": verdict,
+        }
+
     decision = interrupt(
         {
             "checkpoint": "fastp_qc",
@@ -229,6 +276,7 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
                 "attempt_dir": evidence.get("attempt_dir", ""),
                 "files": [item.get("name") for item in evidence.get("files", [])],
                 "summary": evidence.get("summary", {}),
+                "qc_verdict": verdict,
             },
             "downstream": "validate_output -> post_run_gate -> report",
         }
@@ -286,6 +334,7 @@ def node_wait_qc(state: BulkRNAState) -> BulkRNAState:
         "status": PASS if approved else FAIL,
         "message": message,
         "qc_evidence": evidence,
+        "qc_verdict": verdict,
         "qc_decision": decided,
         "run_id": evidence.get("run_id", ""),
         "attempt_dir": evidence.get("attempt_dir", ""),
